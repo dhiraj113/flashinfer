@@ -22,6 +22,8 @@ from typing import List, Literal, Optional, Tuple
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
 
+import os
+
 from ..api_logging import flashinfer_api
 from ..autotuner import (
     AutoTuner,
@@ -1636,7 +1638,11 @@ def _get_cudnn_handle(device, stream: torch.cuda.Stream):
     if _cudnn_handles.get(device_id) is None:
         _check_cudnn_availability()
         _cudnn_handles[device_id] = cudnn.create_handle()
-        print("cudnn_handle created for device_id = {}\n".format(device_id))
+        print(
+            "(PID:{} Parent PID:{} - cudnn_handle created for device_id = {}\n".format(
+                os.getpid(), os.getppid(), device_id
+            )
+        )
     cudnn.set_stream(_cudnn_handles[device_id], stream.cuda_stream)
 
     return _cudnn_handles[device_id]
