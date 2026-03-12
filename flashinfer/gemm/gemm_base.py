@@ -1643,22 +1643,22 @@ def _old_get_cudnn_handle(stream: torch.cuda.Stream):
     return _cudnn_handle
 
 
-def _get_cudnn_handle(device, stream: torch.cuda.Stream):
-    """Create and return a cached cuDNN handle."""
-    global _cudnn_handles
-    device_id = device.index
+# def _get_cudnn_handle(device, stream: torch.cuda.Stream):
+#     """Create and return a cached cuDNN handle."""
+#     global _cudnn_handles
+#     device_id = device.index
 
-    if _cudnn_handles.get(device_id) is None:
-        _check_cudnn_availability()
-        _cudnn_handles[device_id] = cudnn.create_handle()
-        # print(
-        #     "(PID:{} Parent PID:{} - cudnn_handle created for device_id = {}\n".format(
-        #         os.getpid(), os.getppid(), device_id
-        #     )
-        # )
-    cudnn.set_stream(_cudnn_handles[device_id], stream.cuda_stream)
+#     if _cudnn_handles.get(device_id) is None:
+#         _check_cudnn_availability()
+#         _cudnn_handles[device_id] = cudnn.create_handle()
+#         # print(
+#         #     "(PID:{} Parent PID:{} - cudnn_handle created for device_id = {}\n".format(
+#         #         os.getpid(), os.getppid(), device_id
+#         #     )
+#         # )
+#     cudnn.set_stream(_cudnn_handles[device_id], stream.cuda_stream)
 
-    return _cudnn_handles[device_id]
+#     return _cudnn_handles[device_id]
 
 
 def _validate_fp8_output_dtype(dtype: torch.dtype):
@@ -1697,7 +1697,7 @@ def create_cudnn_execution_plans_fp4_gemm(
     use_nvfp4,
 ):
     stream = torch.cuda.current_stream(device)
-    with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
+    with cudnn.graph(_old_get_cudnn_handle(stream)) as (graph, _):
         scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
 
         a_cudnn_tensor = graph.tensor(
@@ -1855,14 +1855,14 @@ def execute_cudnn_gemm_fp4_graph(
 
     if tactic == -1:
         graph.execute(
-            variant_pack, workspace_buffer, handle=_get_cudnn_handle(a.device, stream)
+            variant_pack, workspace_buffer, handle=_old_get_cudnn_handle(stream)
         )
     else:
         graph.execute_plan_at_index(
             variant_pack,
             workspace_buffer,
             tactic,
-            handle=_get_cudnn_handle(a.device, stream),
+            handle=_old_get_cudnn_handle(stream),
         )
 
 
