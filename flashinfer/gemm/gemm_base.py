@@ -1626,8 +1626,21 @@ def _is_cublas_fp4_available_in_cudnn():
     )
 
 
+# Global cudnn handle. need to make it per device in future
+_cudnn_handle = None
+
 # One cudnn handle per each GPU
 _cudnn_handles: dict[int, int] = {}
+
+
+def _old_get_cudnn_handle(stream: torch.cuda.Stream):
+    """Create and return a cached cuDNN handle."""
+    global _cudnn_handle
+    if _cudnn_handle is None:
+        _check_cudnn_availability()
+        _cudnn_handle = cudnn.create_handle()
+    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
+    return _cudnn_handle
 
 
 def _get_cudnn_handle(device, stream: torch.cuda.Stream):
@@ -1882,14 +1895,14 @@ def execute_cudnn_gemm_mxfp8_graph(
 
     if tactic == -1:
         graph.execute(
-            variant_pack, workspace_buffer, handle=_get_cudnn_handle(a.device, stream)
+            variant_pack, workspace_buffer, handle=_old_get_cudnn_handle(stream)
         )
     else:
         graph.execute_plan_at_index(
             variant_pack,
             workspace_buffer,
             tactic,
-            handle=_get_cudnn_handle(a.device, stream),
+            handle=_old_get_cudnn_handle(stream),
         )
 
 
@@ -1916,7 +1929,7 @@ def build_cudnn_gemm_with_per_tensor_q_graph(
     _check_cudnn_availability()
 
     stream = torch.cuda.current_stream(device)
-    with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
+    with cudnn.graph(_old_get_cudnn_handle(stream)) as (graph, _):
         a_cudnn_tensor = graph.tensor(
             name="a", dim=a_shape, stride=a_stride, data_type=a_type
         )
@@ -1986,7 +1999,7 @@ def execute_cudnn_gemm_with_per_tensor_q_graph(
     }
 
     stream = torch.cuda.current_stream(a.device)
-    cudnn_handle = _get_cudnn_handle(a.device, stream)
+    cudnn_handle = _old_get_cudnn_handle(stream)
 
     if workspace.numel() < graph.get_workspace_size():
         workspace = torch.empty(
@@ -4396,7 +4409,7 @@ def create_cudnn_execution_plans_mxfp8_gemm(
     scale_type = cudnn.data_type.FP8_E8M0
 
     stream = torch.cuda.current_stream(device)
-    with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
+    with cudnn.graph(_old_get_cudnn_handle(stream)) as (graph, _):
         a_cudnn_tensor = graph.tensor(
             name="a",
             dim=tuple(a_shape),  # [b, m, k]
