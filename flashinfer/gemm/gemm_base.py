@@ -5225,7 +5225,7 @@ def mm_fp4(
         Block scale tensor for A, shape (m, k // block_size), float8_e4m3fn or uint8.
 
     b_descale: torch.Tensor
-        Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
+        Block scale tensor for B, shape (k // block_size, n), float8_e4m3fn or uint8.
 
     alpha: Optional[torch.Tensor]
         Global scale tensor, float scalar.
