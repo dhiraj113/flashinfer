@@ -206,3 +206,7 @@ docs/sg_execution_times.rst
 build_nvep/
 flashinfer/moe_ep/*/_libs/
 flashinfer/moe_ep/*/_vendored/
+
+# Claude Code project settings (symlinks into claude-memory repo)
+.claude/settings.json
+.claude/settings.local.json
