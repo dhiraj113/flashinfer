@@ -1,0 +1,34 @@
+services:
+  fi_dn:
+    build:
+      context: ../..
+      dockerfile: docker/cu132-venv/Dockerfile
+    container_name: ${CONTAINER_NAME}
+    image: flashinfer:cu132
+    hostname: inside_docker
+    user: "${HOST_UID}:${HOST_GID}"
+    environment:
+      VIRTUAL_ENV: ${PYTHON_VENV_PATH}/${PYTHON_VENV_NAME}
+      PATH: ${PYTHON_VENV_PATH}/${PYTHON_VENV_NAME}/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      LD_LIBRARY_PATH: ${PYTHON_VENV_PATH}/${PYTHON_VENV_NAME}/lib/python3.12/site-packages/nvidia/cu13/lib/:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
+      GIT_REPO_PATH: ${GIT_REPO_PATH}
+      FLASHINFER_JIT_CACHE_PATH: ${FLASHINFER_JIT_CACHE_PATH}
+      FLASHINFER_WORKSPACE_BASE: ${FLASHINFER_JIT_CACHE_PATH}
+      TRITON_PTXAS_PATH: /usr/local/cuda/bin/ptxas
+      HOST_MOUNT_PATH: ${HOST_MOUNT_PATH}
+      HOST_USERNAME: ${HOST_USERNAME}
+    volumes:
+      # Single mount covering all sub-paths. HOST_MOUNT_PATH must exist on the host.
+      - ${HOST_MOUNT_PATH}:${HOST_MOUNT_PATH}
+    working_dir: ${GIT_REPO_PATH}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: sleep infinity
+    stdin_open: true
+    tty: true
+    network_mode: host
