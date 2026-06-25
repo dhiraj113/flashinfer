@@ -20,7 +20,7 @@ if [ ! -f "$VIRTUAL_ENV/bin/python" ]; then
     pip install --upgrade 'setuptools>=77' 'pip>=24'
     pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/nightly/cu132
     pip install -r "$GIT_REPO_PATH/requirements.txt"
-    pip install responses pytest scipy build cuda-python nvshmem4py-cu12
+    pip install responses pytest pytest-xdist scipy build cuda-python nvshmem4py-cu12
     pip install --upgrade cuda-python==13.0 nvidia-cudnn-cu13 'nvidia-cutlass-dsl[cu13]>=4.5.0'
     pip install tilelang cuda-tile
     pip install mpi4py
