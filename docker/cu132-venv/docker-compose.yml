@@ -14,6 +14,7 @@ services:
       GIT_REPO_PATH: ${GIT_REPO_PATH}
       FLASHINFER_JIT_CACHE_PATH: ${FLASHINFER_JIT_CACHE_PATH}
       FLASHINFER_WORKSPACE_BASE: ${FLASHINFER_JIT_CACHE_PATH}
+      PIP_CACHE_DIR: ${PIP_CACHE_DIR}
       TRITON_PTXAS_PATH: /usr/local/cuda/bin/ptxas
       HOST_MOUNT_PATH: ${HOST_MOUNT_PATH}
       HOST_USERNAME: ${HOST_USERNAME}
@@ -28,6 +29,12 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "test", "-f", "${PYTHON_VENV_PATH}/${PYTHON_VENV_NAME}/.ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
     command: sleep infinity
     stdin_open: true
     tty: true

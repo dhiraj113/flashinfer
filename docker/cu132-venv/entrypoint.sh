@@ -3,7 +3,7 @@ set -e
 
 # Validate that all key paths are under HOST_MOUNT_PATH (which is the single
 # mounted volume). Fails fast if .env is misconfigured.
-for _path in "$VIRTUAL_ENV" "$GIT_REPO_PATH" "$FLASHINFER_JIT_CACHE_PATH"; do
+for _path in "$VIRTUAL_ENV" "$GIT_REPO_PATH" "$FLASHINFER_JIT_CACHE_PATH" "$PIP_CACHE_DIR"; do
     case $_path in
         "$HOST_MOUNT_PATH"/*) ;;
         *) echo "ERROR: $_path is not under HOST_MOUNT_PATH ($HOST_MOUNT_PATH)"; exit 1 ;;
@@ -11,6 +11,7 @@ for _path in "$VIRTUAL_ENV" "$GIT_REPO_PATH" "$FLASHINFER_JIT_CACHE_PATH"; do
 done
 
 mkdir -p "$FLASHINFER_JIT_CACHE_PATH"
+mkdir -p "$PIP_CACHE_DIR"
 
 # Create and populate the venv on first run; skip if it already exists.
 if [ ! -f "$VIRTUAL_ENV/bin/python" ]; then
@@ -27,5 +28,9 @@ if [ ! -f "$VIRTUAL_ENV/bin/python" ]; then
 else
     echo "Virtual environment already exists, skipping setup."
 fi
+
+# Written after both first-run install and fast restart so the HEALTHCHECK
+# always has a consistent ready signal regardless of which path ran.
+touch "$VIRTUAL_ENV/.ready"
 
 exec "$@"

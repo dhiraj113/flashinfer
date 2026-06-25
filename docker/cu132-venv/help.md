@@ -26,16 +26,11 @@ vi .env
 | `PYTHON_VENV_NAME` | Name of the venv directory, created inside `PYTHON_VENV_PATH` by the container on first run. |
 | `GIT_REPO_PATH` | Absolute path to this repo on the host. |
 | `FLASHINFER_JIT_CACHE_PATH` | Where FlashInfer stores compiled JIT kernels. Persists across container restarts. Must exist before `docker compose up`. |
+| `PIP_CACHE_DIR` | pip download cache. Persists across venv rebuilds so packages aren't re-downloaded. Must exist before `docker compose up`. |
 
-**Constraint:** `PYTHON_VENV_PATH`, `GIT_REPO_PATH`, and `FLASHINFER_JIT_CACHE_PATH` must all be subdirectories of `HOST_MOUNT_PATH`. The startup script validates this and exits with an error if not.
+**Constraint:** `PYTHON_VENV_PATH`, `GIT_REPO_PATH`, `FLASHINFER_JIT_CACHE_PATH`, and `PIP_CACHE_DIR` must all be subdirectories of `HOST_MOUNT_PATH` and must exist on the host before starting the container (`GIT_REPO_PATH` must also already be cloned). The startup script validates this and exits with an error if not.
 
-## Step 2 — Ensure required directories exist on the host
-
-`PYTHON_VENV_PATH`, `GIT_REPO_PATH`, and `FLASHINFER_JIT_CACHE_PATH` must all exist on the host before starting the container.
-
-`GIT_REPO_PATH` (the repo) must also already exist.
-
-## Step 3 — Build the image
+## Step 2 — Build the image
 
 ```bash
 docker compose build
@@ -43,17 +38,19 @@ docker compose build
 
 Installs system packages only. Python packages are installed at first startup, not during build.
 
-## Step 4 — Start the container
+## Step 3 — Start the container
 
 ```bash
-docker compose up -d
+docker compose up -d && docker logs -f fi_dn
 ```
 
-**First run:** creates the venv and installs torch and all Python dependencies (~5–10 min depending on network), then goes idle.
+Starts the container detached, then streams its output. Press Ctrl+C to stop following logs — the container keeps running. On a first run this takes ~5–10 min; on restarts the setup is skipped and you'll see "skipping setup" immediately.
 
-**Subsequent runs:** venv already exists, validation passes, setup is skipped, goes idle immediately.
+**First run:** creates the venv and installs torch and all Python dependencies, then goes idle.
 
-## Step 5 — Open a shell
+**Subsequent runs:** venv already exists, `.ready` sentinel is present, health check passes immediately.
+
+## Step 4 — Open a shell
 
 ```bash
 docker exec -it <CONTAINER_NAME> bash
@@ -72,8 +69,8 @@ python -c "import flashinfer; print(flashinfer.__version__)"
 # Stop (venv and cache on host are unaffected)
 docker compose down
 
-# Restart later — setup is skipped, goes idle in seconds
-docker compose up -d
+# Restart later — setup is skipped, ready in seconds
+docker compose up -d && docker logs -f fi_dn
 ```
 
 ## Resetting the venv
@@ -83,5 +80,5 @@ If the venv becomes broken or you want a clean reinstall:
 ```bash
 docker compose down
 rm -rf $PYTHON_VENV_PATH/$PYTHON_VENV_NAME
-docker compose up -d   # triggers full reinstall on next start
+docker compose up -d && docker logs -f fi_dn   # triggers full reinstall on next start
 ```
