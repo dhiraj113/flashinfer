@@ -121,9 +121,25 @@ def _test_mm_fp4(
 @pytest.mark.parametrize("n", [128, 256, 512])
 @pytest.mark.parametrize("k", [128, 256, 512])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["trtllm", "cudnn", "cutlass", "cute-dsl", "b12x"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("trtllm", marks=pytest.mark.trtllm),
+        pytest.param("cudnn", marks=pytest.mark.cudnn),
+        pytest.param("cutlass", marks=pytest.mark.cutlass),
+        pytest.param("cute-dsl", marks=pytest.mark.cute_dsl),
+        pytest.param("b12x", marks=pytest.mark.b12x),
+        pytest.param("auto", marks=pytest.mark.auto)
+    ],
+)
 @pytest.mark.parametrize("use_128x4_sf_layout", [False, True])
-@pytest.mark.parametrize("auto_tuning", [False, True])
+@pytest.mark.parametrize(
+    "auto_tuning",
+    [
+        pytest.param(False, marks=pytest.mark.no_autotuning),
+        pytest.param(True, marks=pytest.mark.autotuning),
+    ],
+)
 @pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])
 def test_mm_fp4(
     m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
