@@ -21,6 +21,8 @@ vi .env
 |---|---|
 | `CONTAINER_NAME` | Name of the container, used with `docker exec -it <CONTAINER_NAME> bash` |
 | `HOST_UID` / `HOST_GID` | Your host user and group IDs (`id -u` / `id -g`). The container runs as this user to write to NFS. |
+| `HOST_USERNAME` | Your host username. Used to create the user inside the container so VS Code can locate its home directory. |
+| `VSCODE_SERVER_DIR` | Real path of `~/.vscode-server` on the host — run `readlink -f ~/.vscode-server`. Mounted into the container so VS Code extensions are shared and install only once. If `~/.vscode-server` is a plain directory (not a symlink), set this to `~/.vscode-server`. |
 | `HOST_MOUNT_PATH` | Single NFS directory mounted into the container. All other paths must be subdirectories of this. |
 | `PYTHON_VENV_PATH` | Directory on the host where the venv lives. Must exist before `docker compose up`. |
 | `PYTHON_VENV_NAME` | Name of the venv directory, created inside `PYTHON_VENV_PATH` by the container on first run. |

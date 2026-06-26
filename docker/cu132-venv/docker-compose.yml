@@ -3,6 +3,10 @@ services:
     build:
       context: ../..
       dockerfile: docker/cu132-venv/Dockerfile
+      args:
+        HOST_USERNAME: ${HOST_USERNAME}
+        HOST_UID: ${HOST_UID}
+        HOST_GID: ${HOST_GID}
     container_name: ${CONTAINER_NAME}
     image: flashinfer:cu132
     hostname: inside_docker
@@ -21,6 +25,11 @@ services:
     volumes:
       # Single mount covering all sub-paths. HOST_MOUNT_PATH must exist on the host.
       - ${HOST_MOUNT_PATH}:${HOST_MOUNT_PATH}
+      # Share ~/.vscode-server from the host so VS Code extensions install once
+      # and are reused in the container. Avoids marketplace download failures
+      # caused by SSL inspection proxies mangling gzip Content-Encoding.
+      # Uses the real path (not the symlink) so Docker can bind-mount it.
+      - ${VSCODE_SERVER_DIR}:/home/${HOST_USERNAME}/.vscode-server
     working_dir: ${GIT_REPO_PATH}
     deploy:
       resources:
