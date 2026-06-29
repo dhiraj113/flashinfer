@@ -2431,18 +2431,28 @@ def testGemmBias(args):
     """
     Benchmark gemm_bias: fused GEMM + bias addition (cuDNN backend).
 
-    Supports dense (bfloat16/float16/float32) and FP8 (float8_e4m3fn) inputs.
-    The bias is always 1-D [N] and dtype matches out_dtype.
+    Supports all five input dtype paths:
+      bfloat16 / float16 / float32 — dense tensor inputs
+      fp8_e4m3 / fp8_e5m2          — FP8 with per-tensor a_scale / b_scale
+      nvfp4                         — NVFP4 packed uint8, block_size=16, requires SM100+
+      mxfp4                         — MXFP4 packed uint8, block_size=32, requires SM100+
 
+    The bias is always 1-D [N]; its dtype matches out_dtype.
     FLOP count: 2*M*N*K (matmul) + M*N (bias addition).
 
-    Example::
+    Example commands::
 
-        python benchmarks/flashinfer_benchmark.py \\
-            --routine gemm_bias \\
-            --m 64 --n 4096 --k 4096 \\
-            --input_dtype bfloat16 --out_dtype bfloat16 \\
-            --backends cudnn --autotune --refcheck -v
+        # BF16 with autotuning
+        python benchmarks/flashinfer_benchmark.py --routine gemm_bias --m 64 --n 4096 --k 4096 --input_dtype bfloat16 --out_dtype bfloat16 --backends cudnn --autotune --refcheck -v
+
+        # FP8
+        python benchmarks/flashinfer_benchmark.py --routine gemm_bias --m 16 --n 4096 --k 4096 --input_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn --refcheck
+
+        # NVFP4 (requires SM100+)
+        python benchmarks/flashinfer_benchmark.py --routine gemm_bias --m 64 --n 4096 --k 4096 --input_dtype nvfp4 --out_dtype bfloat16 --backends cudnn --refcheck
+
+        # MXFP4 (requires SM100+)
+        python benchmarks/flashinfer_benchmark.py --routine gemm_bias --m 64 --n 4096 --k 4096 --input_dtype mxfp4 --out_dtype bfloat16 --backends cudnn --refcheck
     """
     if args.verbose >= 1:
         print("[INFO] Running testGemmBias")
@@ -2479,22 +2489,65 @@ def testGemmBias(args):
             f"gemm_bias out_dtype must be bfloat16/float16/float32, got {args.out_dtype}."
         )
 
-    fp8_dtypes = {"fp8_e4m3": torch.float8_e4m3fn, "fp8_e5m2": torch.float8_e5m2}
-    is_fp8 = input_dtype_str in fp8_dtypes
-    input_dtype = fp8_dtypes.get(input_dtype_str) or dtype_str_to_torch_dtype(input_dtype_str)
+    # ── Classify input dtype path ─────────────────────────────────────────────
+    _FP8_MAP = {"fp8_e4m3": torch.float8_e4m3fn, "fp8_e5m2": torch.float8_e5m2}
+    is_fp8 = input_dtype_str in _FP8_MAP
+    is_nvfp4 = input_dtype_str == "nvfp4"
+    is_mxfp4 = input_dtype_str == "mxfp4"
+    is_fp4 = is_nvfp4 or is_mxfp4
 
-    # Build input tensors
     if is_fp8:
-        a_fp32 = torch.randn(m, k, device=device)
-        b_fp32 = torch.randn(k, n, device=device)
+        input_dtype = _FP8_MAP[input_dtype_str]
+    elif is_fp4:
+        input_dtype = torch.uint8  # packed representation
+    else:
+        input_dtype = dtype_str_to_torch_dtype(input_dtype_str)
+
+    # ── Build input tensors ───────────────────────────────────────────────────
+    a_fp32 = torch.randn(m, k, device=device)
+    b_fp32 = torch.randn(k, n, device=device)
+
+    a_scale = b_scale = None
+    a_descale = b_descale = alpha = None
+    fp4_type = None
+
+    if is_fp8:
         a, a_scale = to_float8(a_fp32, input_dtype)
         b, b_scale = to_float8(b_fp32, input_dtype)
         a_scale = a_scale.to(torch.float32)
         b_scale = b_scale.to(torch.float32)
-    else:
-        a = torch.randn(m, k, device=device, dtype=input_dtype)
-        b = torch.randn(k, n, device=device, dtype=input_dtype)
-        a_scale = b_scale = None
+
+    elif is_nvfp4:
+        fp8_max, fp4_max = 448.0, 6.0
+        a_fp = a_fp32.to(torch.bfloat16)
+        b_fp = b_fp32.to(torch.bfloat16)
+        gsf_a = (fp8_max * fp4_max) / a_fp.float().abs().nan_to_num().max()
+        gsf_b = (fp8_max * fp4_max) / b_fp.float().abs().nan_to_num().max()
+        gsf_a_t = torch.tensor(float(gsf_a), device=device, dtype=torch.float32)
+        gsf_b_t = torch.tensor(float(gsf_b), device=device, dtype=torch.float32)
+        a, a_descale = flashinfer.nvfp4_quantize(
+            a_fp, gsf_a_t, sfLayout=flashinfer.SfLayout.layout_128x4, do_shuffle=False
+        )
+        b_packed, b_descale = flashinfer.nvfp4_quantize(
+            b_fp, gsf_b_t, sfLayout=flashinfer.SfLayout.layout_128x4, do_shuffle=False
+        )
+        b = b_packed.T
+        b_descale = b_descale.T
+        alpha = torch.tensor(1.0 / (float(gsf_a) * float(gsf_b)), device=device, dtype=torch.float32)
+        fp4_type = flashinfer.FP4Type.NVFP4
+
+    elif is_mxfp4:
+        a_fp = a_fp32.to(torch.bfloat16)
+        b_fp = b_fp32.to(torch.bfloat16)
+        a, a_descale = flashinfer.mxfp4_quantize(a_fp)
+        b_packed, b_descale = flashinfer.mxfp4_quantize(b_fp)
+        b = b_packed.T
+        b_descale = b_descale.T
+        fp4_type = flashinfer.FP4Type.MXFP4
+
+    else:  # dense
+        a = a_fp32.to(input_dtype)
+        b = b_fp32.to(input_dtype)
 
     bias = torch.randn(n, device=device, dtype=out_dtype)
 
@@ -2503,25 +2556,33 @@ def testGemmBias(args):
         print(f"[VVERBOSE] b: {b.shape} {b.dtype}")
         print(f"[VVERBOSE] bias: {bias.shape} {bias.dtype}")
         print(f"[VVERBOSE] out_dtype: {out_dtype}")
+        if is_fp4:
+            print(f"[VVERBOSE] a_descale: {a_descale.shape} {a_descale.dtype}")
+            print(f"[VVERBOSE] b_descale: {b_descale.shape} {b_descale.dtype}")
+            if alpha is not None:
+                print(f"[VVERBOSE] alpha: {alpha.item():.6g}")
 
-    def run_backend(backend, a, b, bias, a_scale, b_scale, out_dtype):
+    # ── Backend call ──────────────────────────────────────────────────────────
+    def run_backend(backend, a, b, bias, a_scale, b_scale, a_descale, b_descale, alpha, fp4_type, out_dtype):
         return flashinfer.gemm_bias(
-            a=a,
-            b=b,
-            bias=bias,
-            a_scale=a_scale,
-            b_scale=b_scale,
+            a=a, b=b, bias=bias,
+            a_scale=a_scale, b_scale=b_scale,
+            a_descale=a_descale, b_descale=b_descale,
+            alpha=alpha,
+            fp4_dtype=fp4_type if fp4_type is not None else flashinfer.FP4Type.NVFP4,
             out_dtype=out_dtype,
             backend=backend,
         )
+
+    call_args = (a, b, bias, a_scale, b_scale, a_descale, b_descale, alpha, fp4_type, out_dtype)
 
     # Validate all backends before timing
     backends_to_remove = []
     for backend in backends:
         try:
-            run_backend(backend, a, b, bias, a_scale, b_scale, out_dtype)
+            run_backend(backend, *call_args)
         except Exception as e:
-            print(f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}")
+            print(f"[INFO] {backend} does not support this configuration: {type(e).__name__}: {e}")
             backends_to_remove.append(backend)
     for backend in backends_to_remove:
         backends.remove(backend)
@@ -2529,15 +2590,17 @@ def testGemmBias(args):
         print("[ERROR] No backends passed validation. Exiting.")
         return res
 
-    # Reference output for correctness check
+    # Reference output
     has_reference_output = False
     reference_output = None
     if run_refcheck:
-        if is_fp8:
-            reference_output = (a_fp32 @ b_fp32 + bias.float()).to(out_dtype)
+        if is_fp4:
+            # Dequantize: FP4 ops done in BF16 space
+            reference_output = (a_fp32.to(torch.bfloat16) @ b_fp32.to(torch.bfloat16).T + bias.float()).to(out_dtype)
         else:
-            reference_output = (a.float() @ b.float() + bias.float()).to(out_dtype)
+            reference_output = (a_fp32 @ b_fp32 + bias.float()).to(out_dtype)
         has_reference_output = True
+        refcheck_threshold = 0.95 if is_fp4 else 0.99
 
     # Autotuning warmup
     if getattr(args, "autotune", False):
@@ -2547,16 +2610,14 @@ def testGemmBias(args):
         with autotune(True):
             for _ in range(warmup_iters):
                 for backend in backends:
-                    run_backend(backend, a, b, bias, a_scale, b_scale, out_dtype)
+                    run_backend(backend, *call_args)
 
-    # Timing + refcheck
+    # Timing
     backend_times = {backend: [] for backend in backends}
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend(
-                cur_backend, a, b, bias, a_scale, b_scale, out_dtype
-            ).detach()
+            outputs[cur_backend] = run_backend(cur_backend, *call_args).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -2565,7 +2626,7 @@ def testGemmBias(args):
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
-            input_args=(cur_backend, a, b, bias, a_scale, b_scale, out_dtype),
+            input_args=(cur_backend, *call_args),
         )
 
     if run_refcheck and has_reference_output:
@@ -2575,7 +2636,7 @@ def testGemmBias(args):
                 out.reshape(-1).float(),
                 dim=0,
             )
-            if cos_sim < 0.99:
+            if cos_sim < refcheck_threshold:
                 print(f"[ERROR] {backend} output mismatch: cos_sim={cos_sim:.4f}")
                 if not args.allow_output_mismatch:
                     raise AssertionError(f"[ERROR] {backend} output mismatch: cos_sim={cos_sim:.4f}")
@@ -2590,9 +2651,17 @@ def testGemmBias(args):
         std_time = np.std(times)
         # FLOPs: matmul (2*M*N*K) + bias addition (M*N)
         problem_flops = 2 * m * n * k + m * n
-        # Bytes: a + b + bias (read) + out (write)
-        a_bytes = m * k * (1 if is_fp8 else input_dtype.itemsize)
-        b_bytes = k * n * (1 if is_fp8 else input_dtype.itemsize)
+        # Bytes: a + b (4-bit = 0.5 B/elem for FP4, 1 B/elem for FP8, else itemsize)
+        # + descales (negligible but included) + bias + output
+        if is_fp4:
+            a_bytes = m * k * 0.5
+            b_bytes = k * n * 0.5
+        elif is_fp8:
+            a_bytes = m * k * 1
+            b_bytes = k * n * 1
+        else:
+            a_bytes = m * k * input_dtype.itemsize
+            b_bytes = k * n * input_dtype.itemsize
         problem_bytes = a_bytes + b_bytes + n * out_dtype.itemsize + m * n * out_dtype.itemsize
         tflops = problem_flops / (10**9 * median_time)
         tb_per_sec = problem_bytes / (10**9 * median_time)
