@@ -4,7 +4,9 @@ import torch
 from flashinfer.utils import (
     supported_compute_capability,
     backend_requirement,
-    BackendSupportedError,
+    ComputeCapabilityNotSupportedError,
+    NoSuitableAutoBackendsFoundError,
+    ProblemSizeNotSupportedError,
 )
 
 
@@ -162,7 +164,7 @@ def test_backend_requirement_empty_backends_with_common_check_cc():
 
     # Error: no real compute capability is supported
     with pytest.raises(
-        BackendSupportedError, match="does not support compute capability"
+        ComputeCapabilityNotSupportedError, match="does not support compute capability"
     ):
         unsupported_kernel(x)
 
@@ -278,7 +280,7 @@ def test_backend_requirement_wrapped_function():
     # Test unsupported backend raises error
     # The error message may include capability info, so use a flexible pattern
     with pytest.raises(
-        BackendSupportedError, match="does not support backend 'trtllm'"
+        ComputeCapabilityNotSupportedError, match="does not support backend 'trtllm'"
     ):
         my_kernel(x, backend="trtllm")
 
@@ -323,7 +325,7 @@ def test_common_check():
     assert result.shape == x_2d.shape
 
     # 3D should fail validation
-    with pytest.raises(ValueError, match="Problem size is not supported"):
+    with pytest.raises(ProblemSizeNotSupportedError, match="does not support the given problem size"):
         my_kernel(x_3d, backend="cudnn")
 
 
@@ -378,7 +380,7 @@ def test_suitable_auto_backends():
     assert result.shape == x.shape
 
     with pytest.raises(
-        BackendSupportedError, match="No suitable auto backends found for my_kernel"
+        NoSuitableAutoBackendsFoundError, match="found no suitable auto backends for compute capability"
     ):
         x = torch.randn(1, 1, device="cuda")
         my_kernel(x, backend="auto")

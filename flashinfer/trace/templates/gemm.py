@@ -1916,3 +1916,62 @@ trtllm_ragged_attention_deepseek_trace = TraceTemplate(
     reference=_trtllm_ragged_attention_deepseek_reference,
     init=_trtllm_ragged_attention_deepseek_init,
 )
+
+
+# ── GEMM + Bias (mm_bias) ─────────────────────────────────────────────────────
+
+
+def _mm_bias_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+    dtype: str = "bfloat16",
+):
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    dt = dtype_map.get(dtype, torch.bfloat16)
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, device=device, dtype=dt)
+    b = torch.randn(N, K, device=device, dtype=dt).transpose(-2, -1).contiguous()
+    bias = torch.randn(N, device=device, dtype=dt)
+    return {"a": a, "b": b, "bias": bias}
+
+
+def _mm_bias_reference(a, b, bias):
+    return a @ b + bias
+
+
+mm_bias_trace = TraceTemplate(
+    op_type="mm_bias",
+    description=(
+        "Fused GEMM + bias: out = a @ b + bias. "
+        "b is column-major [K, N]. Supports bf16, fp16, fp32, and fp8 inputs."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "a": Tensor(["M", "K"], param="a"),
+        "b": Tensor(
+            ["K", "N"],
+            param="b",
+            description="Weight matrix in column-major layout (physical shape [K, N]).",
+        ),
+        "bias": Tensor(["N"], param="bias"),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype_from="a"),
+    },
+    tags=["status:verified"],
+    reference=_mm_bias_reference,
+    init=_mm_bias_init,
+)
+

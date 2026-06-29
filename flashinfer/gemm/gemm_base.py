@@ -25,6 +25,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import (
     batch_deepgemm_fp8_nt_groupwise_trace,
+    mm_bias_trace,
     bmm_bf16_trace,
     bmm_fp8_trace,
     bmm_mxfp8_trace,
@@ -2292,6 +2293,8 @@ def clear_cudnn_graph_cache() -> None:
         build_cudnn_gemm_fp8_graph_override_shape,
         build_cudnn_gemm_bf16_graph,
         build_cudnn_gemm_bf16_graph_override_shape,
+        build_cudnn_gemm_bias_graph,
+        build_cudnn_gemm_fp8_bias_graph,
     )
     for fn in cached_builders:
         if hasattr(fn, "cache_clear"):
@@ -6217,7 +6220,7 @@ _MM_MXFP8_TUNING_CONFIG = TuningConfig(
 
 
 @backend_requirement(
-    {
+    backend_checks={
         "cudnn": _cudnn_gemm_fp4_requirement,
         "trtllm": _trtllm_gemm_fp4_requirement,
         "cutlass": _cutlass_gemm_fp4_requirement,
@@ -8868,3 +8871,681 @@ def bmm_mxfp8(
         return out
 
     raise ValueError(f"Invalid backend: {backend}")
+
+
+# ---------------------------------------------------------------------------
+# mm_bias: fused GEMM + bias (cuDNN backend, all float dtypes)
+# ---------------------------------------------------------------------------
+
+_MM_BIAS_DENSE_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+_MM_BIAS_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+_MM_BIAS_OUTPUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def _is_fp8(dtype: torch.dtype) -> bool:
+    return dtype in _MM_BIAS_FP8_DTYPES
+
+
+_MM_BIAS_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (-2,),  # M dimension
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            5,  # out tensor at index 5 in [a, b, bias, a_scale, b_scale, out, workspace]
+            -2,
+            lambda shapes: shapes[0][-2],
+        ),
+    ),
+)
+
+
+def _get_3d_bias_shape_stride(bias: torch.Tensor):
+    """Expand bias tensor to 3D for use in cuDNN graphs.
+
+    Supports:
+    - 1D [N]       → (1, 1, N)
+    - 3D [B, 1, N] → unchanged
+    """
+    if bias.dim() == 1:
+        n = bias.shape[0]
+        p = bias.stride(0)
+        return (1, 1, n), (1, 1, p)
+    elif bias.dim() == 3:
+        return tuple(bias.shape), tuple(bias.stride())
+    else:
+        raise ValueError(
+            f"bias must be 1D [N] or 3D [B, 1, N], got {bias.dim()}D with shape {bias.shape}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# cuDNN graph: dense GEMM + bias (BF16 / FP16 / FP32)
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=1024)
+def build_cudnn_gemm_bias_graph(
+    a_shape,
+    a_stride,
+    b_shape,
+    b_stride,
+    bias_shape,
+    bias_stride,
+    ab_dtype,
+    o_dtype,
+    device,
+    policy=None,
+):
+    """Build cuDNN graph for: out = a @ b + bias (dense float dtypes)."""
+    _check_cudnn_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+
+    stream = torch.cuda.current_stream(device)
+    with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
+        a_cudnn_tensor = graph.tensor(
+            name="a", dim=list(a_shape), stride=list(a_stride), data_type=ab_dtype
+        )
+        b_cudnn_tensor = graph.tensor(
+            name="b", dim=list(b_shape), stride=list(b_stride), data_type=ab_dtype
+        )
+        c_cudnn_tensor = graph.matmul(
+            name="matmul",
+            A=a_cudnn_tensor,
+            B=b_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        c_cudnn_tensor.set_data_type(cudnn.data_type.FLOAT)
+
+        bias_cudnn_tensor = graph.tensor(
+            name="bias",
+            dim=list(bias_shape),
+            stride=list(bias_stride),
+            data_type=o_dtype,
+        )
+        out_cudnn_tensor = graph.add(
+            name="bias_add",
+            a=c_cudnn_tensor,
+            b=bias_cudnn_tensor,
+        )
+        out_cudnn_tensor.set_name("out").set_output(True).set_data_type(o_dtype)
+
+        a_cudnn_tensor.set_uid(UIDs.A_UID.value)
+        b_cudnn_tensor.set_uid(UIDs.B_UID.value)
+        bias_cudnn_tensor.set_uid(UIDs.BIAS_UID.value)
+        out_cudnn_tensor.set_uid(UIDs.O_UID.value)
+
+        graph.validate()
+        graph.build_operation_graph()
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+        graph.build_plans(policy)
+
+        return graph
+
+
+def execute_cudnn_gemm_bias_graph(graph, a, b, bias, out, workspace, tactic: int = -1):
+    """Execute dense GEMM + bias cuDNN graph."""
+    variant_pack = {
+        UIDs.A_UID.value: a,
+        UIDs.B_UID.value: b,
+        UIDs.BIAS_UID.value: bias,
+        UIDs.O_UID.value: out,
+    }
+
+    stream = torch.cuda.current_stream(a.device)
+    cudnn_handle = _get_cudnn_handle(a.device, stream)
+
+    if tactic >= graph.get_execution_plan_count():
+        tactic = -1
+
+    workspace_size = _get_cudnn_workspace_size(graph, tactic)
+    if workspace.numel() < workspace_size:
+        workspace.resize_(workspace_size)
+
+    if tactic == -1:
+        graph.execute(variant_pack, workspace, handle=cudnn_handle)
+    else:
+        graph.execute_plan_at_index(variant_pack, workspace, tactic, handle=cudnn_handle)
+
+
+# ---------------------------------------------------------------------------
+# cuDNN graph: FP8 GEMM + bias (per-tensor scales + bias epilogue)
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=1024)
+def build_cudnn_gemm_fp8_bias_graph(
+    a_shape,
+    a_stride,
+    b_shape,
+    b_stride,
+    bias_shape,
+    bias_stride,
+    a_type,
+    b_type,
+    o_type,
+    device,
+    policy=None,
+):
+    """Build cuDNN graph for: out = (a @ b) * a_scale * b_scale + bias (FP8)."""
+    _check_cudnn_availability()
+    if policy is None:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+
+    stream = torch.cuda.current_stream(device)
+    with cudnn.graph(_get_cudnn_handle(device, stream)) as (graph, _):
+        a_cudnn_tensor = graph.tensor(
+            name="a", dim=list(a_shape), stride=list(a_stride), data_type=a_type
+        )
+        b_cudnn_tensor = graph.tensor(
+            name="b", dim=list(b_shape), stride=list(b_stride), data_type=b_type
+        )
+        a_scale_cudnn_tensor = graph.tensor(
+            name="a_scale",
+            dim=(1, 1, 1),
+            stride=(1, 1, 1),
+            data_type=cudnn.data_type.FLOAT,
+        )
+        b_scale_cudnn_tensor = graph.tensor(
+            name="b_scale",
+            dim=(1, 1, 1),
+            stride=(1, 1, 1),
+            data_type=cudnn.data_type.FLOAT,
+        )
+        c_cudnn_tensor = graph.matmul(
+            name="matmul",
+            A=a_cudnn_tensor,
+            B=b_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        c_cudnn_tensor.set_data_type(cudnn.data_type.FLOAT)
+
+        c_after_a_scale = graph.mul(
+            name="scale_mul_a",
+            a=c_cudnn_tensor,
+            b=a_scale_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        c_after_a_scale.set_data_type(cudnn.data_type.FLOAT)
+        c_after_b_scale = graph.mul(
+            name="scale_mul_b",
+            a=c_after_a_scale,
+            b=b_scale_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        c_after_b_scale.set_data_type(cudnn.data_type.FLOAT)
+
+        bias_cudnn_tensor = graph.tensor(
+            name="bias",
+            dim=list(bias_shape),
+            stride=list(bias_stride),
+            data_type=o_type,
+        )
+        out_cudnn_tensor = graph.add(
+            name="bias_add",
+            a=c_after_b_scale,
+            b=bias_cudnn_tensor,
+        )
+        out_cudnn_tensor.set_name("out").set_output(True).set_data_type(o_type)
+
+        a_cudnn_tensor.set_uid(UIDs.A_UID.value)
+        b_cudnn_tensor.set_uid(UIDs.B_UID.value)
+        a_scale_cudnn_tensor.set_uid(UIDs.A_SCALE_UID.value)
+        b_scale_cudnn_tensor.set_uid(UIDs.B_SCALE_UID.value)
+        bias_cudnn_tensor.set_uid(UIDs.BIAS_UID.value)
+        out_cudnn_tensor.set_uid(UIDs.O_UID.value)
+
+        graph.validate()
+        graph.build_operation_graph()
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+        graph.build_plans(policy)
+
+        return graph
+
+
+def execute_cudnn_gemm_fp8_bias_graph(
+    graph, a, b, a_scale, b_scale, bias, out, workspace, tactic: int = -1
+):
+    """Execute FP8 GEMM + bias cuDNN graph."""
+    variant_pack = {
+        UIDs.A_UID.value: a,
+        UIDs.B_UID.value: b,
+        UIDs.A_SCALE_UID.value: a_scale,
+        UIDs.B_SCALE_UID.value: b_scale,
+        UIDs.BIAS_UID.value: bias,
+        UIDs.O_UID.value: out,
+    }
+
+    stream = torch.cuda.current_stream(a.device)
+    cudnn_handle = _get_cudnn_handle(a.device, stream)
+
+    if tactic >= graph.get_execution_plan_count():
+        tactic = -1
+
+    workspace_size = _get_cudnn_workspace_size(graph, tactic)
+    if workspace.numel() < workspace_size:
+        workspace.resize_(workspace_size)
+
+    if tactic == -1:
+        graph.execute(variant_pack, workspace, handle=cudnn_handle)
+    else:
+        graph.execute_plan_at_index(variant_pack, workspace, tactic, handle=cudnn_handle)
+
+
+# ---------------------------------------------------------------------------
+# Internal dispatch helpers
+# ---------------------------------------------------------------------------
+
+
+def _cudnn_mm_bias_dense(workspace, a, b, bias, out, tactic=-1):
+    """Dispatch dense (non-FP8) GEMM + bias through cuDNN."""
+    _check_cudnn_availability()
+
+    a_shape, a_stride = _get_bf16_3d_shape_stride(a)
+    b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+    bias_shape, bias_stride = _get_3d_bias_shape_stride(bias)
+
+    if tactic == -1:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    else:
+        policy = cudnn.build_plan_policy.ALL
+
+    graph = build_cudnn_gemm_bias_graph(
+        a_shape,
+        a_stride,
+        b_shape,
+        b_stride,
+        bias_shape,
+        bias_stride,
+        _torch_data_type_to_cudnn_data_type(a.dtype),
+        _torch_data_type_to_cudnn_data_type(out.dtype),
+        a.device,
+        policy=policy,
+    )
+    execute_cudnn_gemm_bias_graph(graph, a, b, bias, out, workspace, tactic=tactic)
+    return out
+
+
+def _cudnn_mm_bias_fp8(workspace, a, b, a_scale, b_scale, bias, out, tactic=-1):
+    """Dispatch FP8 GEMM + bias through cuDNN."""
+    _check_cudnn_availability()
+
+    a_shape, a_stride = _get_bf16_3d_shape_stride(a)
+    b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+    bias_shape, bias_stride = _get_3d_bias_shape_stride(bias)
+
+    if tactic == -1:
+        policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
+    else:
+        policy = cudnn.build_plan_policy.ALL
+
+    graph = build_cudnn_gemm_fp8_bias_graph(
+        a_shape,
+        a_stride,
+        b_shape,
+        b_stride,
+        bias_shape,
+        bias_stride,
+        _torch_data_type_to_cudnn_data_type(a.dtype),
+        _torch_data_type_to_cudnn_data_type(b.dtype),
+        _torch_data_type_to_cudnn_data_type(out.dtype),
+        a.device,
+        policy=policy,
+    )
+
+    # Ensure scale tensors are 3D FP32 scalars for cuDNN
+    def _to_3d_float_scalar(t):
+        return t.float().reshape(1, 1, 1)
+
+    execute_cudnn_gemm_fp8_bias_graph(
+        graph,
+        a,
+        b,
+        _to_3d_float_scalar(a_scale),
+        _to_3d_float_scalar(b_scale),
+        bias,
+        out,
+        workspace,
+        tactic=tactic,
+    )
+    return out
+
+
+def _cudnn_mm_bias_runner():
+    class CudnnMmBiasRunner(TunableRunner):
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            a, b, bias, a_scale, b_scale, out, _ = inputs
+            return (a.dtype, b.dtype, out.dtype, a_scale is not None)
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            a, b, bias, a_scale, b_scale, out, _ = inputs
+            a_shape, a_stride = _get_bf16_3d_shape_stride(a)
+            b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+            bias_shape, bias_stride = _get_3d_bias_shape_stride(bias)
+
+            if _is_fp8(a.dtype):
+                graph = build_cudnn_gemm_fp8_bias_graph(
+                    a_shape, a_stride, b_shape, b_stride,
+                    bias_shape, bias_stride,
+                    _torch_data_type_to_cudnn_data_type(a.dtype),
+                    _torch_data_type_to_cudnn_data_type(b.dtype),
+                    _torch_data_type_to_cudnn_data_type(out.dtype),
+                    a.device,
+                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                )
+            else:
+                graph = build_cudnn_gemm_bias_graph(
+                    a_shape, a_stride, b_shape, b_stride,
+                    bias_shape, bias_stride,
+                    _torch_data_type_to_cudnn_data_type(a.dtype),
+                    _torch_data_type_to_cudnn_data_type(out.dtype),
+                    a.device,
+                    policy=cudnn.build_plan_policy.HEURISTICS_CHOICE,
+                )
+            return list(range(graph.get_execution_plan_count()))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, bias, a_scale, b_scale, out, workspace_buffer = inputs
+            if _is_fp8(a.dtype):
+                _cudnn_mm_bias_fp8(
+                    workspace_buffer, a, b, a_scale, b_scale, bias, out, tactic=tactic
+                )
+            else:
+                _cudnn_mm_bias_dense(workspace_buffer, a, b, bias, out, tactic=tactic)
+            return out
+
+    return CudnnMmBiasRunner()
+
+
+# ---------------------------------------------------------------------------
+# mm_bias requirement / check / heuristic functions
+# ---------------------------------------------------------------------------
+
+
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
+def _cudnn_mm_bias_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor,
+    a_scale: Optional[torch.Tensor] = None,
+    b_scale: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "auto"] = "cudnn",
+):
+    """Single cuDNN requirement for mm_bias covering both dense and FP8 inputs.
+
+    Dense (BF16/FP16/FP32) is supported on SM80+.
+    FP8 is a subset, supported on SM89+; the runtime check in _check_mm_bias_problem_size
+    enforces the SM89+ gate for FP8 before the kernel is dispatched.
+    """
+    return _cudnn_available_or_raise_for_backend(backend)
+
+
+def _check_mm_bias_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor,
+    a_scale: Optional[torch.Tensor] = None,
+    b_scale: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "auto"] = "cudnn",
+):
+    fp8 = _is_fp8(a.dtype)
+
+    # Input dtype validation
+    if not fp8 and a.dtype not in _MM_BIAS_DENSE_DTYPES:
+        raise ValueError(
+            f"Unsupported a dtype {a.dtype} for mm_bias. "
+            f"Supported: bfloat16, float16, float32, float8_e4m3fn, float8_e5m2."
+        )
+    if not fp8 and b.dtype != a.dtype:
+        raise ValueError(
+            f"a and b must have the same dtype for dense mm_bias, got a={a.dtype}, b={b.dtype}."
+        )
+    if fp8 and b.dtype not in _MM_BIAS_FP8_DTYPES:
+        raise ValueError(
+            f"When a is FP8, b must also be FP8, got b={b.dtype}."
+        )
+
+    # FP8 scale requirements
+    if fp8:
+        if a_scale is None or b_scale is None:
+            raise ValueError(
+                "a_scale and b_scale are required when a/b are FP8 tensors."
+            )
+    else:
+        if a_scale is not None or b_scale is not None:
+            raise ValueError(
+                "a_scale and b_scale must be None for non-FP8 inputs."
+            )
+
+    # Output dtype
+    resolved_out_dtype = out_dtype if out_dtype is not None else (
+        torch.bfloat16 if fp8 else a.dtype
+    )
+    if resolved_out_dtype not in _MM_BIAS_OUTPUT_DTYPES:
+        raise ValueError(
+            f"Unsupported out_dtype {resolved_out_dtype}. "
+            "Supported: bfloat16, float16, float32."
+        )
+
+    # Bias dtype must match output dtype
+    if bias.dtype != resolved_out_dtype:
+        raise ValueError(
+            f"bias dtype {bias.dtype} must match out_dtype {resolved_out_dtype}."
+        )
+
+    # Shape: a [m, k] or [b, m, k]; b [k, n] col-major or [b, k, n]
+    if a.dim() not in (2, 3):
+        raise ValueError(f"a must be 2D or 3D, got {a.dim()}D with shape {a.shape}.")
+    if b.dim() not in (2, 3):
+        raise ValueError(f"b must be 2D or 3D, got {b.dim()}D with shape {b.shape}.")
+    if a.dim() != b.dim():
+        raise ValueError(
+            f"a and b must have the same number of dimensions, got {a.dim()}D and {b.dim()}D."
+        )
+
+    # Bias shape
+    if bias.dim() not in (1, 3):
+        raise ValueError(
+            f"bias must be 1D [N] or 3D [B, 1, N], got {bias.dim()}D with shape {bias.shape}."
+        )
+    n = b.shape[-1]
+    if bias.dim() == 1 and bias.shape[0] != n:
+        raise ValueError(
+            f"bias size {bias.shape[0]} does not match b output dim N={n}."
+        )
+    if bias.dim() == 3:
+        if bias.shape[1] != 1:
+            raise ValueError(
+                f"3D bias must have shape [B, 1, N] (M=1), got {bias.shape}."
+            )
+        if bias.shape[2] != n:
+            raise ValueError(
+                f"3D bias N dim {bias.shape[2]} != b output dim N={n}."
+            )
+
+    # out validation
+    if out is not None:
+        expected_shape = (*a.shape[:-1], b.shape[-1])
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"out shape {out.shape} does not match expected {expected_shape}."
+            )
+        if out.dtype != resolved_out_dtype:
+            raise ValueError(
+                f"out dtype {out.dtype} does not match out_dtype {resolved_out_dtype}."
+            )
+
+    return True
+
+
+def _heuristic_func_mm_bias(
+    suitable_backends: List[str],
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor,
+    a_scale: Optional[torch.Tensor] = None,
+    b_scale: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "auto"] = "cudnn",
+):
+    heuristic_backends = []
+    if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
+        heuristic_backends.append("cudnn")
+    return heuristic_backends
+
+
+# ---------------------------------------------------------------------------
+# mm_bias public API
+# ---------------------------------------------------------------------------
+
+
+@backend_requirement(
+    backend_checks={
+        "cudnn": _cudnn_mm_bias_requirement,
+    },
+    common_check=_check_mm_bias_problem_size,
+    heuristic_func=_heuristic_func_mm_bias,
+)
+@flashinfer_api(trace=mm_bias_trace)
+def mm_bias(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor,
+    a_scale: Optional[torch.Tensor] = None,
+    b_scale: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "auto"] = "cudnn",
+) -> torch.Tensor:
+    r"""Fused GEMM + Bias: ``out = a @ b + bias``
+
+    Performs a matrix multiplication followed by a bias addition as a single
+    fused operation using the cuDNN backend. Supports bfloat16, float16,
+    float32, and float8 (e4m3fn / e5m2) input matrices.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input matrix, shape ``(m, k)`` or ``(batch, m, k)``.
+        Dtype: ``bfloat16``, ``float16``, ``float32``, ``float8_e4m3fn``,
+        or ``float8_e5m2``.
+
+    b: torch.Tensor
+        Weight matrix in **column-major** layout, shape ``(k, n)`` or
+        ``(batch, k, n)``. Must have the same dtype as ``a`` (or a compatible
+        FP8 variant).
+
+    bias: torch.Tensor
+        Bias vector, shape ``(n,)`` for a global bias or ``(batch, 1, n)``
+        for a per-batch bias. Must have the same dtype as ``out_dtype``.
+
+    a_scale: Optional[torch.Tensor]
+        Per-tensor dequantization scale for ``a``. Required when ``a`` is FP8;
+        must be ``None`` for non-FP8 inputs.
+
+    b_scale: Optional[torch.Tensor]
+        Per-tensor dequantization scale for ``b``. Required when ``b`` is FP8;
+        must be ``None`` for non-FP8 inputs.
+
+    out_dtype: Optional[torch.dtype]
+        Output dtype. Defaults to ``a.dtype`` for non-FP8 inputs and to
+        ``torch.bfloat16`` for FP8 inputs. Supported: ``bfloat16``,
+        ``float16``, ``float32``.
+
+    out: Optional[torch.Tensor]
+        Pre-allocated output tensor. If ``None``, allocated automatically.
+
+    backend: Literal["cudnn", "auto"]
+        Compute backend. ``"cudnn"`` uses the cuDNN pointwise-fusion engine.
+        ``"auto"`` selects the best available backend.
+
+    Returns
+    -------
+    out: torch.Tensor
+        Output tensor, shape ``(m, n)`` or ``(batch, m, n)``, dtype
+        ``out_dtype``.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> # BF16 GEMM + bias
+    >>> a = torch.randn([48, 64], device="cuda", dtype=torch.bfloat16)
+    >>> b = torch.randn([128, 64], device="cuda", dtype=torch.bfloat16).T.contiguous()
+    >>> bias = torch.randn([128], device="cuda", dtype=torch.bfloat16)
+    >>> out = flashinfer.mm_bias(a, b, bias)
+    >>> out.shape
+    torch.Size([48, 128])
+    >>> out.dtype
+    torch.bfloat16
+    >>> # FP16 GEMM + bias with different output dtype
+    >>> a16 = a.half(); b16 = b.half(); bias16 = bias.half()
+    >>> out16 = flashinfer.mm_bias(a16, b16, bias16)
+    >>> out16.dtype
+    torch.float16
+    >>> # FP8 GEMM + bias (per-tensor scales required)
+    >>> def to_fp8(x):
+    ...     scale = x.float().abs().max() / 448.0
+    ...     return x.float().div(scale).clamp(-448, 448).to(torch.float8_e4m3fn), scale
+    >>> a_fp8, a_s = to_fp8(a)
+    >>> b_fp8, b_s = to_fp8(b)
+    >>> bias_bf16 = bias  # bias stays in output dtype (bf16)
+    >>> out_fp8 = flashinfer.mm_bias(
+    ...     a_fp8, b_fp8, bias_bf16, a_scale=a_s, b_scale=b_s,
+    ...     out_dtype=torch.bfloat16
+    ... )
+    >>> out_fp8.shape
+    torch.Size([48, 128])
+    """
+    fp8 = _is_fp8(a.dtype)
+    resolved_out_dtype = out_dtype if out_dtype is not None else (
+        torch.bfloat16 if fp8 else a.dtype
+    )
+
+    if out is None:
+        expected_shape = (*a.shape[:-1], b.shape[-1])
+        out = torch.empty(expected_shape, device=a.device, dtype=resolved_out_dtype)
+
+    workspace_buffer = _get_cache_buf("mm_bias_workspace", DEFAULT_WORKSPACE_SIZE, a.device)
+
+    if backend == "auto":
+        backends = mm_bias.suitable_auto_backends
+    else:
+        backends = [backend]
+
+    tuner = AutoTuner.get()
+    runners = [_cudnn_mm_bias_runner() for _ in backends]
+
+    inputs = [a, b, bias, a_scale, b_scale, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "mm_bias",
+        runners,
+        _MM_BIAS_TUNING_CONFIG,
+        inputs,
+    )
+
+    runner(inputs=inputs, tactic=tactic)
+    return out

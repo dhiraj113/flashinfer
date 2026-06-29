@@ -251,5 +251,73 @@ def test_mm_fp4_cute_dsl_misaligned_n_raises():
         )
 
 
+# Regression test for #1741: mm_fp4 with alpha was incurring ~200 ms CPU overhead per call.
+@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4_alpha"])
+def test_mm_fp4_cpu_dispatch_time_regression(fp4_type):
+    device = torch.device("cuda")
+    cc = get_compute_capability(device)
+    if cc[0] < 10:
+        pytest.skip("mm_fp4 requires SM100+.")
+
+    use_nvfp4 = fp4_type == "nvfp4"
+    block_size = 16 if use_nvfp4 else 32
+    m, n, k = 128, 256, 128
+
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    g_a = (448 * 6) / a.float().abs().nan_to_num().max()
+    g_b = (448 * 6) / b.float().abs().nan_to_num().max()
+    alpha = 1.0 / (g_a * g_b)
+
+    if use_nvfp4:
+        a_fp4, a_sf = nvfp4_quantize(
+            a, g_a, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+        )
+        b_fp4, b_sf = nvfp4_quantize(
+            b, g_b, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+        )
+    else:
+        a_fp4, a_sf = mxfp4_quantize(a)
+        b_fp4, b_sf = mxfp4_quantize(b)
+
+    def _run():
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_sf,
+            b_sf.T,
+            alpha,
+            torch.bfloat16,
+            block_size=block_size,
+            use_nvfp4=use_nvfp4,
+        )
+
+    # Warm up: JIT compile + cuDNN graph build happens here, not in the timed section.
+    for _ in range(3):
+        _run()
+    torch.cuda.synchronize()
+
+    # Measure pure CPU dispatch time: launch N kernels without synchronizing inside
+    # the loop so GPU execution is fully overlapped.  Only Python/cuDNN CPU overhead
+    # is captured.  A regression (graph rebuild or autotuner re-run per call) would
+    # push this well above 100 ms/call.
+    N = 50
+    import time
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(N):
+        _run()
+    cpu_elapsed_ms = (time.perf_counter() - t0) / N * 1000
+    torch.cuda.synchronize()
+
+    assert cpu_elapsed_ms < 100, (
+        f"mm_fp4 CPU dispatch regression detected: {cpu_elapsed_ms:.1f} ms/call "
+        f"(fp4_type={fp4_type}). Expected < 100 ms. "
+        "This likely means the cuDNN graph or autotuner is re-running every call — "
+        "see issue #1741."
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

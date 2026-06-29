@@ -62,8 +62,20 @@ class LibraryError(Exception):
     pass
 
 
-class BackendSupportedError(Exception):
-    """Custom exception for backend-related errors."""
+class ComputeCapabilityNotSupportedError(Exception):
+    """Raised when a backend does not support the current compute capability."""
+
+    pass
+
+
+class NoSuitableAutoBackendsFoundError(Exception):
+    """Raised when no suitable backend can be found during auto-selection."""
+
+    pass
+
+
+class ProblemSizeNotSupportedError(ValueError):
+    """Raised when a problem size is not supported for the given backend."""
 
     pass
 
@@ -1036,7 +1048,7 @@ def backend_requirement(
 
     Raises
     ------
-    BackendSupportedError
+    ComputeCapabilityNotSupportedError
         If the function is called with an unsupported backend or compute capability.
     ValueError
         If the problem size is not supported for the given backend.
@@ -1134,7 +1146,7 @@ def backend_requirement(
                 return common_check(*args, **kwargs)
 
             if backend not in backend_checks:
-                raise BackendSupportedError(
+                raise ComputeCapabilityNotSupportedError(
                     f"Backend '{backend}' is not supported for {func.__name__}"
                 )
             req_checker = backend_checks[backend]
@@ -1200,16 +1212,13 @@ def backend_requirement(
             # It prevents the performance overhead of checking.
             skip_check = kwargs.pop("skip_check", False)
 
+            bound_args = sig.bind(*args, **kwargs)
+            bound_args.apply_defaults()
+            kwargs_with_defaults = dict(bound_args.arguments)
+            backend = kwargs_with_defaults.get("backend")
+            capability = _get_capability(*args, **kwargs)
+
             if not skip_check:
-                # Apply defaults from the function signature for validation
-                # This ensures that all parameters (including backend) have their default values
-                # if not explicitly provided by the caller
-                bound_args = sig.bind(*args, **kwargs)
-                bound_args.apply_defaults()
-                # Convert to kwargs for validation functions
-                kwargs_with_defaults = dict(bound_args.arguments)
-                backend = kwargs_with_defaults.get("backend")
-                capability = _get_capability(*args, **kwargs)
                 if not has_backend_choices() and common_check is None:
                     raise ValueError(
                         f"Invalid @backend_requirement decorator usage: no backend choices and no common_check for {func.__name__}"
@@ -1220,36 +1229,30 @@ def backend_requirement(
                         if not suitable_auto_backends(
                             capability, **kwargs_with_defaults
                         ):
-                            raise BackendSupportedError(
-                                f"No suitable auto backends found for {func.__name__}"
+                            raise NoSuitableAutoBackendsFoundError(
+                                f"{func.__name__} found no suitable auto backends for compute capability {capability}"
                             )
                     else:
                         if not is_backend_supported(backend, capability):
-                            extra = (
-                                f" with capability {capability}" if capability else ""
-                            )
-                            raise BackendSupportedError(
-                                f"{func.__name__} does not support backend '{backend}'{extra}"
+                            raise ComputeCapabilityNotSupportedError(
+                                f"{func.__name__} does not support backend '{backend}' for compute capability {capability}"
                             )
                         if not _is_problem_size_supported(**kwargs_with_defaults):
-                            raise ValueError(
-                                f"Problem size is not supported for {func.__name__}"
+                            raise ProblemSizeNotSupportedError(
+                                f"{func.__name__} does not support the given problem size for backend '{backend}'"
                             )
                 else:
                     # If the function doesnt have backends (i.e., there is only 1, implicit backend), run the following checks.
                     if not is_compute_capability_supported(capability):
-                        raise BackendSupportedError(
+                        raise ComputeCapabilityNotSupportedError(
                             f"{func.__name__} does not support compute capability {capability}"
                         )
                     if not _is_problem_size_supported(**kwargs_with_defaults):
-                        raise ValueError(
-                            f"Problem size is not supported for {func.__name__}"
+                        raise ProblemSizeNotSupportedError(
+                            f"{func.__name__} does not support the given problem size"
                         )
-            elif skip_check and heuristic_func is not None:
-                if kwargs.get("backend") == "auto":
-                    # This needs to be called for heuristic function
-                    capability = _get_capability(*args, **kwargs)
-                    suitable_auto_backends(capability, *args, **kwargs)
+            elif heuristic_func is not None and backend == "auto":
+                suitable_auto_backends(capability, *args, **kwargs)
 
             return func(*args, **kwargs)
 
