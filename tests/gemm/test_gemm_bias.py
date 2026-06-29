@@ -299,17 +299,73 @@ def test_gemm_bias_nvfp4_preallocated_out():
     assert not out_pre.isnan().any()
 
 
-def test_gemm_bias_autotuning():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_gemm_bias_autotuning_dense(dtype):
+    """Autotuning selects a tactic and gives correct output for each dense dtype."""
     _skip_if_no_dense()
     m, n, k = 64, 1024, 512
     torch.manual_seed(13)
-    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16).T.contiguous()
-    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
-    ref = F.linear(a, b.T.contiguous(), bias)
+    a = torch.randn(m, k, device="cuda", dtype=dtype)
+    b = torch.randn(n, k, device="cuda", dtype=dtype).T.contiguous()
+    bias = torch.randn(n, device="cuda", dtype=dtype)
+    ref = F.linear(a.float(), b.T.contiguous().float(), bias.float()).to(dtype)
     with autotune():
-        out = gemm_bias(a, b, bias)
+        for _ in range(5):  # warmup so the tuner profiles multiple calls
+            out = gemm_bias(a, b, bias)
+    assert _cos_sim(out, ref) > 0.99, f"dtype={dtype}"
+    # Second call outside autotune() should reuse the cached tactic
+    out2 = gemm_bias(a, b, bias)
+    assert torch.allclose(out.float(), out2.float(), atol=1e-3), "cached tactic gives different result"
+
+
+@_SKIP_FP8
+def test_gemm_bias_autotuning_fp8():
+    """Autotuning works for FP8 path and selected tactic is reused."""
+    m, n, k = 32, 512, 256
+    torch.manual_seed(7)
+    a_f = torch.randn(m, k, device="cuda")
+    b_f = torch.randn(k, n, device="cuda")
+    a_fp8, a_s = _fp8_quant(a_f)
+    b_fp8, b_s = _fp8_quant(b_f)
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    ref = (a_f @ b_f + bias.float()).bfloat16()
+    with autotune():
+        for _ in range(5):
+            out = gemm_bias(a_fp8, b_fp8, bias, a_scale=a_s, b_scale=b_s, out_dtype=torch.bfloat16)
+    assert _cos_sim(out, ref) > 0.97
+    out2 = gemm_bias(a_fp8, b_fp8, bias, a_scale=a_s, b_scale=b_s, out_dtype=torch.bfloat16)
+    assert torch.allclose(out.float(), out2.float(), atol=1e-3)
+
+
+def test_gemm_bias_autotuning_batched():
+    """Autotuning works for 3D batched inputs."""
+    _skip_if_no_dense()
+    batch, m, n, k = 4, 16, 256, 128
+    torch.manual_seed(3)
+    a = torch.randn(batch, m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(batch, k, n, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(batch, 1, n, device="cuda", dtype=torch.bfloat16)
+    ref = (torch.bmm(a.float(), b.float()) + bias.float()).bfloat16()
+    with autotune():
+        for _ in range(5):
+            out = gemm_bias(a, b, bias)
+    assert out.shape == (batch, m, n)
     assert _cos_sim(out, ref) > 0.99
+
+
+@pytest.mark.parametrize("m", [1, 8, 64, 256, 512])
+def test_gemm_bias_autotuning_varying_m(m):
+    """Autotuner handles different M values (key axis for token-bucket heuristic)."""
+    _skip_if_no_dense()
+    n, k = 1024, 512
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+    ref = _ref(a, b, bias).bfloat16()
+    with autotune():
+        for _ in range(3):
+            out = gemm_bias(a, b, bias)
+    assert _cos_sim(out, ref) > 0.99, f"M={m}"
 
 
 # ===========================================================================

@@ -54,6 +54,8 @@ def run_gemm_test(args):
         return testBmmBf16(args)
     elif args.routine == "tinygemm_bf16":
         return testTinygemmBf16(args)
+    elif args.routine == "gemm_bias":
+        return testGemmBias(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -2422,4 +2424,193 @@ def testBmmBf16(args):
                 cur_res["backend"] = backend_name
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
+    return res
+
+
+def testGemmBias(args):
+    """
+    Benchmark gemm_bias: fused GEMM + bias addition (cuDNN backend).
+
+    Supports dense (bfloat16/float16/float32) and FP8 (float8_e4m3fn) inputs.
+    The bias is always 1-D [N] and dtype matches out_dtype.
+
+    FLOP count: 2*M*N*K (matmul) + M*N (bias addition).
+
+    Example::
+
+        python benchmarks/flashinfer_benchmark.py \\
+            --routine gemm_bias \\
+            --m 64 --n 4096 --k 4096 \\
+            --input_dtype bfloat16 --out_dtype bfloat16 \\
+            --backends cudnn --autotune --refcheck -v
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testGemmBias")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    m = args.m
+    n = args.n
+    k = args.k
+    backends = args.backends
+    run_refcheck = args.refcheck
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    # gemm_bias only has a cuDNN backend; warn and filter anything else
+    supported_backends = ["cudnn"]
+    unsupported = [b for b in backends if b not in supported_backends]
+    if unsupported:
+        print(f"[INFO] gemm_bias only supports {supported_backends}; ignoring: {unsupported}")
+        backends = [b for b in backends if b in supported_backends]
+    if not backends:
+        print("[ERROR] No supported backends remaining. Exiting.")
+        return res
+
+    input_dtype_str = getattr(args, "input_dtype", "bfloat16")
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
+    if out_dtype not in [torch.bfloat16, torch.float16, torch.float32]:
+        raise ValueError(
+            f"gemm_bias out_dtype must be bfloat16/float16/float32, got {args.out_dtype}."
+        )
+
+    fp8_dtypes = {"fp8_e4m3": torch.float8_e4m3fn, "fp8_e5m2": torch.float8_e5m2}
+    is_fp8 = input_dtype_str in fp8_dtypes
+    input_dtype = fp8_dtypes.get(input_dtype_str) or dtype_str_to_torch_dtype(input_dtype_str)
+
+    # Build input tensors
+    if is_fp8:
+        a_fp32 = torch.randn(m, k, device=device)
+        b_fp32 = torch.randn(k, n, device=device)
+        a, a_scale = to_float8(a_fp32, input_dtype)
+        b, b_scale = to_float8(b_fp32, input_dtype)
+        a_scale = a_scale.to(torch.float32)
+        b_scale = b_scale.to(torch.float32)
+    else:
+        a = torch.randn(m, k, device=device, dtype=input_dtype)
+        b = torch.randn(k, n, device=device, dtype=input_dtype)
+        a_scale = b_scale = None
+
+    bias = torch.randn(n, device=device, dtype=out_dtype)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] a: {a.shape} {a.dtype}")
+        print(f"[VVERBOSE] b: {b.shape} {b.dtype}")
+        print(f"[VVERBOSE] bias: {bias.shape} {bias.dtype}")
+        print(f"[VVERBOSE] out_dtype: {out_dtype}")
+
+    def run_backend(backend, a, b, bias, a_scale, b_scale, out_dtype):
+        return flashinfer.gemm_bias(
+            a=a,
+            b=b,
+            bias=bias,
+            a_scale=a_scale,
+            b_scale=b_scale,
+            out_dtype=out_dtype,
+            backend=backend,
+        )
+
+    # Validate all backends before timing
+    backends_to_remove = []
+    for backend in backends:
+        try:
+            run_backend(backend, a, b, bias, a_scale, b_scale, out_dtype)
+        except Exception as e:
+            print(f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}")
+            backends_to_remove.append(backend)
+    for backend in backends_to_remove:
+        backends.remove(backend)
+    if not backends:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return res
+
+    # Reference output for correctness check
+    has_reference_output = False
+    reference_output = None
+    if run_refcheck:
+        if is_fp8:
+            reference_output = (a_fp32 @ b_fp32 + bias.float()).to(out_dtype)
+        else:
+            reference_output = (a.float() @ b.float() + bias.float()).to(out_dtype)
+        has_reference_output = True
+
+    # Autotuning warmup
+    if getattr(args, "autotune", False):
+        warmup_iters = args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        if args.verbose >= 1:
+            print(f"[INFO] Autotuning warmup: {warmup_iters} iters")
+        with autotune(True):
+            for _ in range(warmup_iters):
+                for backend in backends:
+                    run_backend(backend, a, b, bias, a_scale, b_scale, out_dtype)
+
+    # Timing + refcheck
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(
+                cur_backend, a, b, bias, a_scale, b_scale, out_dtype
+            ).detach()
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=True,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            cold_l2_cache=True,
+            input_args=(cur_backend, a, b, bias, a_scale, b_scale, out_dtype),
+        )
+
+    if run_refcheck and has_reference_output:
+        for backend, out in outputs.items():
+            cos_sim = F.cosine_similarity(
+                reference_output.reshape(-1).float(),
+                out.reshape(-1).float(),
+                dim=0,
+            )
+            if cos_sim < 0.99:
+                print(f"[ERROR] {backend} output mismatch: cos_sim={cos_sim:.4f}")
+                if not args.allow_output_mismatch:
+                    raise AssertionError(f"[ERROR] {backend} output mismatch: cos_sim={cos_sim:.4f}")
+
+    # Metrics
+    for backend in backends:
+        backend_name = backend + ("_autotune" if getattr(args, "autotune", False) else "")
+        times = backend_times[backend]
+        if not times:
+            continue
+        median_time = np.median(times)
+        std_time = np.std(times)
+        # FLOPs: matmul (2*M*N*K) + bias addition (M*N)
+        problem_flops = 2 * m * n * k + m * n
+        # Bytes: a + b + bias (read) + out (write)
+        a_bytes = m * k * (1 if is_fp8 else input_dtype.itemsize)
+        b_bytes = k * n * (1 if is_fp8 else input_dtype.itemsize)
+        problem_bytes = a_bytes + b_bytes + n * out_dtype.itemsize + m * n * out_dtype.itemsize
+        tflops = problem_flops / (10**9 * median_time)
+        tb_per_sec = problem_bytes / (10**9 * median_time)
+        print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+
+        if args.output_path is not None:
+            cur_res = defaultdict(str)
+            cur_res["routine"] = args.routine
+            cur_res["median_time"] = median_time
+            cur_res["std_time"] = std_time
+            cur_res["tflops"] = tflops
+            cur_res["tb_per_sec"] = tb_per_sec
+            cur_res["m"] = m
+            cur_res["n"] = n
+            cur_res["k"] = k
+            cur_res["input_dtype"] = input_dtype_str
+            cur_res["out_dtype"] = str(out_dtype)
+            cur_res["backend"] = backend_name
+            cur_res["case_tag"] = args.case_tag
+            res.append(cur_res)
     return res

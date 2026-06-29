@@ -206,6 +206,7 @@ benchmark_apis = {
         "mm_bf16",
         "bmm_bf16",
         "tinygemm_bf16",
+        "gemm_bias",
     ],
     "moe": [
         "trtllm_fp4_block_scale_moe",
