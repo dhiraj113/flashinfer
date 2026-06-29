@@ -22,9 +22,12 @@ and data-type converters that are used by both :mod:`gemm_base` and
 avoids circular imports between those sibling modules.
 """
 
+import logging
 from enum import Enum
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # cuDNN optional import
@@ -224,7 +227,7 @@ def _get_cudnn_handle(device, stream: torch.cuda.Stream):
     if _cudnn_handles.get(device_id) is None:
         _check_cudnn_availability()
         _cudnn_handles[device_id] = cudnn.create_handle()
-        print("cudnn_handle created for device_id = {}\n".format(device_id))
+        logger.debug("cudnn_handle created for device_id = %d", device_id)
     cudnn.set_stream(_cudnn_handles[device_id], stream.cuda_stream)
 
     return _cudnn_handles[device_id]

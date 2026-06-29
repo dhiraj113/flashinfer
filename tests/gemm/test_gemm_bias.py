@@ -7,7 +7,6 @@ specific stress run:
     PYTEST_STRESS_SEED=1234 pytest tests/gemm/test_gemm_bias.py -v
 """
 
-import gc
 import os
 import random
 import time
@@ -97,10 +96,6 @@ def _cos_sim(a, b):
 def _ref(a, b, bias):
     return (a.float() @ b.float() + bias.float())
 
-
-def _skip_if_no_cudnn():
-    if not CUDNN_AVAILABLE:
-        pytest.skip("cuDNN not available.")
 
 
 def _skip_if_no_fp8():
@@ -555,7 +550,7 @@ def test_cache_alternating_shapes():
            torch.randn(n, device="cuda", dtype=torch.bfloat16))
           for _, n, k in configs]
     for _ in range(5):
-        for i, (m, n, k) in enumerate(configs):
+        for i, (m, _, k) in enumerate(configs):
             a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
             b, bias = bs[i]
             out = gemm_bias(a, b, bias)

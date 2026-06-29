@@ -244,7 +244,7 @@ class FP4Type(Enum):
 
     Attributes
     ----------
-    NVFP4: NV native FP4, block_size=16, descale dtype ``float8_e4m3fn``.
+    NVFP4: NV native FP4, block_size=16, descale dtype ``uint8``.
     MXFP4: MX FP4, block_size=32, descale dtype ``uint8`` (fp8_e8m0).
     """
 
@@ -823,6 +823,13 @@ def _check_gemm_bias_problem_size(
             )
         if b_descale is None:
             raise ValueError("b_descale is required when a_descale is provided.")
+
+        # Packed uint8: 2 FP4 values per byte → logical K = 2 * K_packed.
+        k_packed = a.shape[-1]
+        if k_packed < 1:
+            raise ValueError(
+                f"gemm_bias FP4 requires at least 1 packed K byte (logical K >= 2), got K_packed={k_packed}."
+            )
     else:
         # cuDNN segfaults when K=1 due to TMA alignment requirements.
         # FP4 K is in units of 2 (packed), so this check doesn't apply there.
