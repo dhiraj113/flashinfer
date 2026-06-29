@@ -823,6 +823,24 @@ def _check_gemm_bias_problem_size(
             )
         if b_descale is None:
             raise ValueError("b_descale is required when a_descale is provided.")
+        if a_descale.dim() != a.dim():
+            raise ValueError(
+                f"a_descale must have the same number of dimensions as a "
+                f"({a.dim()}D), got a_descale {a_descale.dim()}D."
+            )
+        if b_descale.dim() != b.dim():
+            raise ValueError(
+                f"b_descale must have the same number of dimensions as b "
+                f"({b.dim()}D), got b_descale {b_descale.dim()}D."
+            )
+        if a.dim() == 3 and a_descale.shape[0] != a.shape[0]:
+            raise ValueError(
+                f"a_descale batch dim {a_descale.shape[0]} != a batch dim {a.shape[0]}."
+            )
+        if b.dim() == 3 and b_descale.shape[0] != b.shape[0]:
+            raise ValueError(
+                f"b_descale batch dim {b_descale.shape[0]} != b batch dim {b.shape[0]}."
+            )
 
         # Packed uint8: 2 FP4 values per byte → logical K = 2 * K_packed.
         k_packed = a.shape[-1]
@@ -906,6 +924,14 @@ def _check_gemm_bias_problem_size(
             f"bias size {bias.shape[0]} does not match b output dim N={n}."
         )
     if bias.dim() == 3:
+        if a.dim() != 3:
+            raise ValueError(
+                f"3D bias [B, 1, N] requires 3D a and b, got {a.dim()}D a."
+            )
+        if bias.shape[0] != a.shape[0]:
+            raise ValueError(
+                f"3D bias batch dim {bias.shape[0]} != a batch dim {a.shape[0]}."
+            )
         if bias.shape[1] != 1:
             raise ValueError(
                 f"3D bias must have shape [B, 1, N] (M=1), got {bias.shape}."
