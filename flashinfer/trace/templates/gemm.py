@@ -1918,10 +1918,10 @@ trtllm_ragged_attention_deepseek_trace = TraceTemplate(
 )
 
 
-# ── GEMM + Bias (mm_bias) ─────────────────────────────────────────────────────
+# ── GEMM + Bias (gemm_bias) ─────────────────────────────────────────────────────
 
 
-def _mm_bias_init(
+def _gemm_bias_init(
     *,
     M: int,
     N: int = 4096,
@@ -1943,12 +1943,12 @@ def _mm_bias_init(
     return {"a": a, "b": b, "bias": bias}
 
 
-def _mm_bias_reference(a, b, bias):
+def _gemm_bias_reference(a, b, bias):
     return a @ b + bias
 
 
-mm_bias_trace = TraceTemplate(
-    op_type="mm_bias",
+gemm_bias_trace = TraceTemplate(
+    op_type="gemm_bias",
     description=(
         "Fused GEMM + bias: out = a @ b + bias. "
         "b is column-major [K, N]. Supports bf16, fp16, fp32, and fp8 inputs."
@@ -1971,7 +1971,7 @@ mm_bias_trace = TraceTemplate(
         "out": Tensor(["M", "N"], dtype_from="a"),
     },
     tags=["status:verified"],
-    reference=_mm_bias_reference,
-    init=_mm_bias_init,
+    reference=_gemm_bias_reference,
+    init=_gemm_bias_init,
 )
 

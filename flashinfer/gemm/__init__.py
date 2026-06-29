@@ -1,5 +1,6 @@
 from .gemm_base import SegmentGEMMWrapper as SegmentGEMMWrapper
-from .gemm_base import mm_bias as mm_bias
+from .gemm_base import gemm_bias as gemm_bias
+from .gemm_bias import FP4Type as FP4Type
 from .gemm_base import bmm_bf16 as bmm_bf16
 from .gemm_base import bmm_fp8 as bmm_fp8
 from .gemm_base import bmm_mxfp8 as bmm_mxfp8
@@ -90,7 +91,7 @@ except ImportError:
 __all__ = (
     [
         "SegmentGEMMWrapper",
-        "mm_bias",
+        "gemm_bias",
         "bmm_bf16",
         "bmm_fp8",
         "bmm_mxfp8",
