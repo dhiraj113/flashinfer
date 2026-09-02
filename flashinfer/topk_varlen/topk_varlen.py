@@ -2081,11 +2081,19 @@ def _run_walkfirst_primitives(
     # Caller hints are a first-class input here: the hint arm skips the
     # census and scan entirely when the hinted bar verifies (see module doc).
     _vec = 4 if logits.dtype == torch.float32 else 8
+    # Hints are consumed only with FLASHINFER_TOPK_USE_HINTS=1.  Measured with
+    # realistic previous-step hints (85-90% overlap): the register kernel's
+    # hint arm fails verification on any intruder and falls through to the
+    # census (+1.4us over hintless at 16K), and walk-first's value gathers
+    # cost more than the tightened threshold saves; only EXACT hints win
+    # (16K: 4.8 vs 6.0us).  A caller cannot know its hint is exact, so the
+    # default keeps the hinted call identical to the hintless one.
     _hints_ok = (
         pre_idx is not None
         and pre_idx.shape == (num_rows, top_k)
         and pre_idx.dtype == torch.int32
         and pre_idx.stride(1) == 1
+        and os.environ.get("FLASHINFER_TOPK_USE_HINTS") == "1"
     )
     # fp32 always; the 16-bit dtypes only with usable hints (measured: their
     # hinted arm is ~2x the streaming path at 16K on H100/5080/A100/L40S,
@@ -2317,12 +2325,15 @@ def _run_walkfirst_primitives(
         # experimentation override (cluster splits need no spin safety)
         splits = int(force)
     # hint rung: forward usable caller hints (right shape, int32,
-    # contiguous), else a cached zero dummy with the flag off
+    # contiguous) when FLASHINFER_TOPK_USE_HINTS=1 (see the register-kernel
+    # note above for why hints are off by default), else a cached zero dummy
+    # with the flag off
     if (
         pre_idx is not None
         and pre_idx.shape == (num_rows, top_k)
         and pre_idx.dtype == torch.int32
         and pre_idx.stride(1) == 1
+        and os.environ.get("FLASHINFER_TOPK_USE_HINTS") == "1"
     ):
         hints_t, has_hints = pre_idx, 1
     else:

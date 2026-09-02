@@ -1372,16 +1372,23 @@ def test_cross_backend_value_consistency():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 @pytest.mark.parametrize("N,batch", [(262144, 1), (262144, 8), (1048576, 64)])
 @pytest.mark.parametrize("hint_kind", ["identity", "random"])
-def test_walkfirst_garbage_hint_no_fallback(N, batch, hint_kind):
-    """A garbage pre_idx must not cost more than a hintless call: the hint rung
-    qualifies the hint with a row-uniform sample and rejects it before the walk.
-    Pre-fix, identity hints on the multi-CTA forms overflowed staging and every
-    row took the exact fallback (6-8x slower at 1M).  Checks exactness and that
-    no row reports the fallback path (status block 0)."""
+@pytest.mark.parametrize("use_hints", [False, True], ids=["hints_off", "hints_on"])
+def test_walkfirst_garbage_hint_no_fallback(
+    N, batch, hint_kind, use_hints, monkeypatch
+):
+    """A garbage pre_idx must never send a row to the exact fallback.  Hints are
+    ignored by default (hints_off: the call is identical to hintless); with
+    FLASHINFER_TOPK_USE_HINTS=1 the smallest hinted value may only TIGHTEN the
+    sample-derived threshold, so a garbage hint changes nothing.  Pre-fix, the
+    hint rung replaced the sample and identity hints on the multi-CTA forms
+    overflowed staging (6-8x slower at 1M).  Checks exactness and that no row
+    reports the fallback path (status block 0)."""
     from flashinfer.topk_varlen.topk_varlen import _experimental_prim_buffers
 
     if torch.cuda.get_device_capability()[0] < 8:
         pytest.skip("walkfirst_primitives requires Ampere+")
+    if use_hints:
+        monkeypatch.setenv("FLASHINFER_TOPK_USE_HINTS", "1")
     top_k = 512 if batch == 1 else 1024
     torch.manual_seed(N // 1024 + batch)
     logits = (torch.randn(batch, N, device="cuda") * 2.0).contiguous()
