@@ -1311,6 +1311,99 @@ def test_cross_backend_value_consistency():
         )
 
 
+def _gvr2_check_complete_exact(out, logits, kv, top_k, ref_vals, sentinel):
+    """Every output slot written and the selected value multiset equals the
+    reference (rows masked to their own length)."""
+    torch.cuda.synchronize()
+    assert int((out == sentinel).sum()) == 0, "unwritten output slots"
+    for r in range(out.shape[0]):
+        idx = out[r].long()
+        assert bool((idx >= 0).all()) and bool((idx < int(kv[r])).all()), (
+            f"row={r}: index outside the valid window"
+        )
+        assert idx.numel() == torch.unique(idx).numel(), f"row={r}: duplicate indices"
+        got = logits[r][idx].sort(descending=True).values
+        assert torch.equal(got, ref_vals[r]), f"row={r}: value multiset differs"
+
+
+@requires_blackwell
+@pytest.mark.parametrize("n_valid", [3072, 4096], ids=["n3072", "n4096"])
+def test_gvr2_high_anchor_hint_completeness(n_valid):
+    """Port of TensorRT-LLM PR #18501's regression: anchor-only hints whose
+    gathered values all sit ABOVE the true k-th value (an argmax anchor over
+    the all-zero cold-start buffer, with row[0] = second-max) bracket the
+    sampling band so it holds fewer than top_k entries.  The register-family
+    kernel must then escape to the key-space ranking instead of stopping at
+    the histogram total (pre-fix: out[tot:k) left unwritten -- 130,304 of
+    131,072 slots per cell here)."""
+    top_k, bs = 512, 256
+    gen = torch.Generator(device="cuda").manual_seed(top_k + n_valid)
+    logits = torch.randn(
+        (bs, n_valid), generator=gen, dtype=torch.float32, device="cuda"
+    )
+    logits[:, 0] = torch.topk(logits, 2, dim=1).values[:, 1]
+    ref_vals = torch.topk(logits, top_k, dim=1).values
+    pre_idx = torch.zeros((bs, top_k), dtype=torch.int32, device="cuda")
+    pre_idx[:, 0] = logits.argmax(dim=1).to(torch.int32)
+    kv = torch.full((bs,), n_valid, dtype=torch.int32, device="cuda")
+    out = torch.full((bs, top_k), -7, dtype=torch.int32, device="cuda")
+    flashinfer.top_k_varlen(
+        logits, kv, top_k, out_indices=out, pre_idx=pre_idx, backend="gvr_2"
+    )
+    _gvr2_check_complete_exact(out, logits, kv, top_k, ref_vals, -7)
+
+
+@requires_blackwell
+def test_gvr2_neginf_tail_completeness():
+    """Port of TensorRT-LLM PR #18501's second regression: an in-window -inf in
+    the row's tail column (n_valid % 4 == 1) drags the hint-free bracket to
+    -inf, every classify product becomes NaN and the histogram total is zero
+    (pre-fix: whole rows unwritten).  Odd rows keep fewer than top_k finite
+    entries so the -inf tie class exercises the escape's fill-lane bound
+    (pre-fix: duplicate indices)."""
+    top_k, bs, npad, n_valid = 1024, 256, 4096, 4093
+    gen = torch.Generator(device="cuda").manual_seed(top_k + n_valid)
+    logits = torch.randn((bs, npad), generator=gen, dtype=torch.float32, device="cuda")
+    logits[:, n_valid:] = 3e38  # poison past the window
+    logits[:, n_valid - 1] = float("-inf")  # in-window -inf in the tail column
+    logits[1::2, 500:n_valid] = float("-inf")  # odd rows: n_finite < top_k
+    masked = logits.clone()
+    masked[:, n_valid:] = float("-inf")
+    ref_vals = torch.topk(masked, top_k, dim=1).values
+    pre_idx = torch.zeros((bs, top_k), dtype=torch.int32, device="cuda")
+    kv = torch.full((bs,), n_valid, dtype=torch.int32, device="cuda")
+    out = torch.full((bs, top_k), -7, dtype=torch.int32, device="cuda")
+    flashinfer.top_k_varlen(
+        logits, kv, top_k, out_indices=out, pre_idx=pre_idx, backend="gvr_2"
+    )
+    _gvr2_check_complete_exact(out, logits, kv, top_k, ref_vals, -7)
+
+
+@requires_blackwell
+@pytest.mark.xfail(
+    strict=True,
+    reason="gvr_2 drops a +inf entry (classify transform maps +inf to NaN); "
+    "DKG issue #58, listed as an adjacent defect in TensorRT-LLM PR #18501",
+)
+def test_gvr2_plus_inf_selected():
+    """A single +inf must be in the top-k (finite + inf inputs are inside the
+    kernel's exactness contract).  Strict xfail: flips to a failure -- i.e.
+    remove the marker -- once the upstream fix lands."""
+    top_k, n = 1024, 4096
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    logits = torch.randn((1, n), generator=gen, dtype=torch.float32, device="cuda")
+    logits[0, 17] = float("inf")
+    kv = torch.full((1,), n, dtype=torch.int32, device="cuda")
+    pre_idx = (
+        torch.arange(top_k, dtype=torch.int32, device="cuda").view(1, -1).contiguous()
+    )
+    out, _ = flashinfer.top_k_varlen(
+        logits, kv, top_k, pre_idx=pre_idx, backend="gvr_2"
+    )
+    torch.cuda.synchronize()
+    assert bool((out == 17).any()), "+inf entry missing from the top-k"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 def test_unknown_backend_rejected():
     """Unregistered backend names — including the pre-rename 'radix_cutedsl' — raise.
@@ -1487,8 +1580,6 @@ def test_lb_max_batch_size_boundaries():
     assert _lb_max_batch_size(1024) == 1024
     with pytest.raises(ValueError):
         _lb_max_batch_size(1025)
-
-
 
 
 # ---------------------------------------------------------------------------
