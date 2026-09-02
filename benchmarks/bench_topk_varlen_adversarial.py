@@ -157,7 +157,7 @@ def validate(backend, logits, seq_lens, k, indices, rows_to_check=4, relaxed=Fal
 def time_backend(backend, logits, seq_lens, k, pre_idx=None, approx=False):
     out_i = torch.empty(logits.shape[0], k, dtype=torch.int32, device=DEV)
     kw = {}
-    if backend == "gvr":
+    if backend in ("gvr", "gvr_2"):
         if pre_idx is None:
             return None
         kw["pre_idx"] = pre_idx
@@ -193,15 +193,30 @@ def attack(tag, pattern, dtype, k, N, seq_list, seed, use_oracle=False):
     seq_t = torch.tensor(seq_list, dtype=torch.int32, device=DEV)
     pre = oracle_pre_idx(logits, seq_t, k) if use_oracle else None
     res = {}
-    backends = ["radix_primitives", "radix", "radix_cutlass"]
+    backends = ["radix_primitives", "radix", "radix_cutlass", "radix_filter"]
+    if N % 4 == 0 and k <= 2048:
+        backends.append("walkfirst_primitives")
     if dtype == torch.float32 and N % 4 == 0 and k <= 2048:
         backends.append("sglang")
     if use_oracle and k in (512, 1024, 2048):
         backends.append("gvr")
+    if dtype == torch.float32 and k in (512, 1024, 2048) and N % 4 == 0:
+        backends.append(
+            "gvr_2"
+        )  # identity anchor unless an oracle is in play (hints are inert)
     if ONLY_PRIM:
         backends = ["radix_primitives"]
+    if os.environ.get("FI_BACKENDS"):
+        backends = os.environ["FI_BACKENDS"].split(",")
     for be in backends:
-        res[be] = time_backend(be, logits, seq_t, k, pre)
+        pre_be = pre
+        if be == "gvr_2" and pre_be is None:
+            pre_be = (
+                torch.arange(k, dtype=torch.int32, device=DEV)
+                .expand(rows, k)
+                .contiguous()
+            )
+        res[be] = time_backend(be, logits, seq_t, k, pre_be)
     p = res.get("radix_primitives")
     line = f"{tag:44s} " + " ".join(
         f"{be[:9]}={v:7.2f}" if isinstance(v, float) else f"{be[:9]}={v}"
@@ -224,6 +239,10 @@ def attack(tag, pattern, dtype, k, N, seq_list, seed, use_oracle=False):
 
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else "all"
+    print(
+        f"flashinfer: {flashinfer.__file__} device={torch.cuda.get_device_name(0)}",
+        flush=True,
+    )
 
     if only in ("all", "p1"):
         print("== P1 tie-overflow distributions ==", flush=True)
