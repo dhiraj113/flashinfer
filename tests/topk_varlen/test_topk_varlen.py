@@ -1311,6 +1311,49 @@ def test_cross_backend_value_consistency():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize("N,batch", [(262144, 1), (262144, 8), (1048576, 64)])
+@pytest.mark.parametrize("hint_kind", ["identity", "random"])
+def test_walkfirst_garbage_hint_no_fallback(N, batch, hint_kind):
+    """A garbage pre_idx must not cost more than a hintless call: the hint rung
+    qualifies the hint with a row-uniform sample and rejects it before the walk.
+    Pre-fix, identity hints on the multi-CTA forms overflowed staging and every
+    row took the exact fallback (6-8x slower at 1M).  Checks exactness and that
+    no row reports the fallback path (status block 0)."""
+    from flashinfer.topk_varlen.topk_varlen import _experimental_prim_buffers
+
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("walkfirst_primitives requires Ampere+")
+    top_k = 512 if batch == 1 else 1024
+    torch.manual_seed(N // 1024 + batch)
+    logits = (torch.randn(batch, N, device="cuda") * 2.0).contiguous()
+    seq_lens = torch.full((batch,), N, dtype=torch.int32, device="cuda")
+    if hint_kind == "identity":
+        pre_idx = (
+            torch.arange(top_k, dtype=torch.int32, device="cuda")
+            .expand(batch, top_k)
+            .contiguous()
+        )
+    else:
+        pre_idx = torch.randint(0, N, (batch, top_k), dtype=torch.int32, device="cuda")
+    out = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        out_indices=out,
+        pre_idx=pre_idx,
+        backend="walkfirst_primitives",
+    )
+    torch.cuda.synchronize()
+    ref = torch.topk(logits, top_k, dim=1).values
+    got = torch.sort(logits.gather(1, out.long()), dim=1, descending=True).values
+    assert torch.equal(got, ref), "garbage hint changed the selected value multiset"
+    _, status = _experimental_prim_buffers(batch, logits.device)
+    fallback_rows = int((status[:batch] != 0).sum())
+    assert fallback_rows == 0, f"{fallback_rows}/{batch} rows took the exact fallback"
+
+
 def _gvr2_check_complete_exact(out, logits, kv, top_k, ref_vals, sentinel):
     """Every output slot written and the selected value multiset equals the
     reference (rows masked to their own length)."""

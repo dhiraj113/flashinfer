@@ -63,6 +63,7 @@ from .radix_topk_primitives import (
     smem_atomic_add,
     smem_red_max_u32,
     warp_inclusive_sum,
+    warp_sum,
 )
 from .gvr2_topk_decode import (
     RES_B,
@@ -946,6 +947,25 @@ class WalkFirstTopK(SampledPivotTopK):
                 # or fewer than k in-range hints (varlen truncation) skip
                 # the rung.  Replica-deterministic (identical gather on
                 # every CTA).
+                #
+                # PLAUSIBILITY GATE.  "Garbage hints overflow the cand gate
+                # and take the exact fallback" was a 6-8x cliff on the
+                # multi-CTA forms (identity hints at 1M: 683us vs 90us
+                # hintless on B200), because only the S==1 form has an
+                # overflow rung and the gmem form (S>=8) cannot re-walk
+                # after its last-arriver verdict.  So the hint is qualified
+                # BEFORE the walk: every thread loads one vector at the same
+                # row-uniform stride the fused sample below uses and counts
+                # keys >= the smallest hinted key; the block sum scaled to
+                # the row estimates the survivor count.  A previous-step
+                # top-k puts ~k survivors there (about 4 sample hits at 1M,
+                # k=1024, 4096 samples); garbage puts most of the row
+                # (thousands of hits).  Reject above lcap/2 -- far above
+                # any stale-but-real hint, far below any garbage one -- and
+                # the row runs the sample path exactly as if hintless.
+                # Identical positions on every CTA of the row, so the
+                # verdict is replica-uniform; cost is one v4 load + one
+                # warp redux + one barrier on top of the k gathers.
                 hint_ok = cutlass.Int32(0)
                 tf_f = cutlass.Float32(0.0)
                 sc = cutlass.Float32(0.0)
@@ -958,6 +978,7 @@ class WalkFirstTopK(SampledPivotTopK):
                             s_misc[6] = cutlass.Int32(0)  # red.max(key)
                             s_misc[7] = cutlass.Int32(0)  # red.max(~key)
                             s_misc[8] = cutlass.Int32(0)  # in-range hints
+                            s_misc[9] = cutlass.Int32(0)  # plausibility hits
                         cute.arch.barrier()
                         hints_row = hp_ptr + row64 * top_k
                         for ht in range(tidx, top_k, self.nt):
@@ -971,7 +992,48 @@ class WalkFirstTopK(SampledPivotTopK):
                         hk_max = cutlass.Uint32(s_misc[6])
                         hk_min = ~cutlass.Uint32(s_misc[7])
                         n_valid = s_misc[8]
-                        if n_valid == top_k and hk_min != hk_max and hk_min != 0:
+                        # plausibility sample: one row-uniform vector per thread
+                        hlgk = cutlass.const_expr(self.vec_elems.bit_length() - 1)
+                        hepw = cutlass.const_expr(self.vec_elems // 4)
+                        hn4 = length >> cutlass.Int32(hlgk)
+                        hp4 = cutlass.Int32(
+                            (cutlass.Int64(tidx) * cutlass.Int64(hn4))
+                            // cutlass.Int64(self.nt)
+                        )
+                        if hp4 > hn4 - 1:
+                            hp4 = hn4 - 1
+                        if hp4 < 0:
+                            hp4 = cutlass.Int32(0)
+                        hw0, hw1, hw2, hw3 = ld_global_nc_v4_u32(
+                            row_in.toint() + cutlass.Int64(hp4) * cutlass.Int64(16)
+                        )
+                        hhits = cutlass.Int32(0)
+                        for hj_ in cutlass.range_constexpr(4):
+                            for hh_ in cutlass.range_constexpr(hepw):
+                                hk2 = self.exact_key(
+                                    self._wf_elem_bits((hw0, hw1, hw2, hw3)[hj_], hh_)
+                                )
+                                if hk2 >= hk_min:
+                                    hhits = hhits + cutlass.Int32(1)
+                        hhits = warp_sum(hhits)
+                        if tidx % 32 == 0:
+                            if hhits > 0:
+                                smem_atomic_add(s_misc + 9, hhits)
+                        cute.arch.barrier()
+                        # est survivors = hits * length / nsamp  >  lcap / 2  -> reject
+                        h_est = cutlass.Int64(s_misc[9]) * cutlass.Int64(length)
+                        h_lim = cutlass.Int64(self.lcap // 2) * cutlass.Int64(
+                            self.nt * self.vec_elems
+                        )
+                        h_plaus = cutlass.Int32(0)
+                        if h_est <= h_lim:
+                            h_plaus = cutlass.Int32(1)
+                        if (
+                            n_valid == top_k
+                            and hk_min != hk_max
+                            and hk_min != 0
+                            and h_plaus == 1
+                        ):
                             h_max_f = self._wf_val_of_key(hk_max)
                             # one key-step below the smallest hint: v == min_hint
                             # survives the walk's v <= TF cull
