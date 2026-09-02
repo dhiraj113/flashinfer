@@ -406,8 +406,6 @@ def _radix_kernel_source_files() -> Tuple[str, ...]:
     return (__file__, radix_topk.__file__, block_scan.__file__)
 
 
-
-
 @functools.cache
 def _radix_primitives_kernel_source_files() -> Tuple[str, ...]:
     # radix_topk_primitives.py is self-contained (no block_scan dependency).
@@ -2158,6 +2156,25 @@ def _run_walkfirst_primitives(
         and num_rows * 32 <= get_device_sm_count(logits.device)
     ):
         splits = 32
+    # Long rows (>= 4 MB) in grids that leave SMs idle under a power-of-two
+    # split: use the largest one-wave cluster shape in {2, 3, 4, 6} instead.
+    # Measured on Rubin (208 SMs): 1M fp32 b=64 S2 -> S3 43.2 -> 38.2us
+    # (gvr_2 40.1), b=32 S4 -> S6 24.4 -> 22.3us (22.3); at 64K-256K the
+    # extra CTAs' fixed costs outweigh the shorter slices (256K b=64 S3 within
+    # noise, 64K worse), hence the byte bound.  On 148-SM parts the rule only
+    # changes grids where 3 CTAs per row fit one wave (b in 38..49).
+    if (
+        splits in (2, 4)
+        and N * logits.element_size() >= (4 << 20)
+        and num_rows >= 16
+        and torch.cuda.get_device_capability(logits.device)[0] >= 9
+    ):
+        _sms = get_device_sm_count(logits.device)
+        for _s in (6, 4, 3, 2):
+            if num_rows * _s <= _sms:
+                if _s > splits:
+                    splits = _s
+                break
     force = os.environ.get("FLASHINFER_TOPK_WF_SPLITS")
     if force:
         # experimentation override (cluster splits need no spin safety)
