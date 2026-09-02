@@ -41,6 +41,14 @@ Backend choices
                        Datacentre Blackwell-class (sm_100/103/107) only;
                        requires nvidia-cutlass-dsl >= 4.8 (see below);
                        opt-in — never chosen by ``"auto"``.
+``"radix_primitives"`` — coarse-histogram top-K written against the CuTe DSL
+                       *primitives* API (raw pointers + PTX wrappers, no layout
+                       algebra); sglang DeepSeek-V4 algorithm, one CTA per row.
+                       Ampere+ (sm_80+, incl. Rubin sm_107); explicit-only.
+``"walkfirst_primitives"`` / ``"sampled_primitives"`` / ``"hint_primitives"`` /
+``"stacked_primitives"`` / ``"sglang"``
+                     — experimental primitives selectors and the vendored
+                       sglang reference; explicit-only (see the API docstring).
 ``"auto"``           — shape/dtype-aware ranking that tracks the measured
                        per-config winner (see ``_top_k_varlen_heuristic``):
                        gvr_2 for hinted fp32; gvr only for large hinted
@@ -51,6 +59,7 @@ Backend choices
 
 import functools
 import math
+import os
 from typing import Literal, Optional, Tuple
 
 import torch
@@ -66,6 +75,7 @@ _CUTE_DSL_AVAILABLE = is_cute_dsl_available()
 from ..utils import (
     _get_cache_buf,
     backend_requirement,
+    get_compute_capability,
     get_device_sm_count,
     get_shared_bytes_per_block_optin,
     supported_compute_capability,
@@ -87,6 +97,15 @@ _ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 107, 110, 120, 121]
 # ``sm_107a`` natively. ``_cute_dsl_supports_arch`` below keeps a DSL that
 # predates the device from being selected.
 _BLACKWELL_PLUS_CCS = [100, 103, 107, 110, 120, 121]
+
+# Vendored sglang DSv4 kernel: Hopper-plus (its PDL/launch design targets).
+_HOPPER_PLUS_CCS = [90, 100, 103, 107, 110, 120, 121]
+
+# radix_primitives / walk-first / regrow / sampled / hint / stacked: Ampere-plus.
+# The kernels' only SM90+ constructs (PDL / griddepcontrol, DSMEM clusters) are
+# compiled out or not selected below SM90; redux.sync and the smem/gmem red/atom
+# ops are SM80+.  Rubin (SM107) runs them as-is (family-portable ops only).
+_AMPERE_PLUS_CCS = [80, 86, 89] + _HOPPER_PLUS_CCS
 
 # GVR is B200-class only (SM100/103/107). The non-LB (cluster_size=1) GVR
 # CuTe-DSL kernel fails to build on sm_120a: libNVVM rejects the generated
@@ -161,6 +180,7 @@ def _radix_cutlass_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    approx_ties=False,
 ):  # extra kwargs mirror the public signature; unused by the check
     """Radix masked-fallback: runs on all supported SM tiers."""
     return True
@@ -180,6 +200,7 @@ def _gvr_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    approx_ties=False,
 ):
     """Return True only when GVR can run on this exact configuration.
 
@@ -221,6 +242,7 @@ def _gvr2_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    approx_ties=False,
 ):
     """Return True only when the self-sampling GVR V2 port can run this config.
 
@@ -269,6 +291,7 @@ def _top_k_varlen_heuristic(
     backend: str = "auto",
     load_balance: bool = True,
     workspace=None,
+    approx_ties=False,
 ):
     """Shape/dtype-aware ranking so auto tracks the measured per-config winner.
 
@@ -344,12 +367,14 @@ if _CUTE_DSL_AVAILABLE:
     from .kernels.config import GvrTopKConfig, GvrTopKLBConfig
     from ..cute_dsl.utils import torch_to_cutlass_dtype
     from .kernels import (
+        CoarseHistTopKPrimitivesKernel,
         GvrTopKKernel,
         GvrTopKLBKernel,
         GvrTopKLBPrepareKernel,
         SinglePassMultiCTARadixTopKKernel,
     )
     from .kernels.radix_topk import STATE_SIZE as _RADIX_STATE_SIZE
+    from .kernels.radix_topk_primitives import mc_state_size as _prim_mc_state_size
 
 
 @functools.cache
@@ -379,6 +404,16 @@ def _radix_kernel_source_files() -> Tuple[str, ...]:
     from .kernels import radix_topk, block_scan
 
     return (__file__, radix_topk.__file__, block_scan.__file__)
+
+
+
+
+@functools.cache
+def _radix_primitives_kernel_source_files() -> Tuple[str, ...]:
+    # radix_topk_primitives.py is self-contained (no block_scan dependency).
+    from .kernels import radix_topk_primitives
+
+    return (__file__, radix_topk_primitives.__file__)
 
 
 @functools.cache
@@ -787,6 +822,132 @@ def _compile_radix(
     )
 
 
+def _prim_vec_elems(torch_dtype) -> int:
+    """Elements per 16B vector load in the primitives kernel."""
+    return 4 if torch_dtype == torch.float32 else 8
+
+
+def _prim_get_group_config(
+    N: int, torch_dtype, num_rows: int, num_sms: int
+) -> Tuple[int, int]:
+    """Return ``(ctas_per_group, chunk_elems)`` for the primitives backend.
+
+    Multi-CTA groups engage only where measured to beat single-CTA streaming
+    on B200: rows of at least 65536 elements AND enough spare SMs to split
+    each row into (near-)single-register-slot chunks (8192 elems bf16/fp16,
+    4096 fp32) -- one 16B vector per thread, read from gmem exactly once.
+    Probes showed the win comes from small chunks, not just more CTAs:
+    two-slot chunks pay enough register pressure that cpg=4 x 8K beats
+    cpg=2 x 16K by ~20%, and below N=65536 the group-barrier floor
+    (~4 gmem spin barriers) always loses to one CTA streaming the row.
+    """
+    ve = _prim_vec_elems(torch_dtype)
+    slot = 1024 * ve  # one register slot per thread
+    if N < 65536:
+        return 1, 0
+    want = math.ceil(N / slot)
+    ideal = num_sms // max(num_rows, 1)
+    if ideal < min(8, want):
+        return 1, 0
+    ctas_per_group = min(ideal, want)
+    chunk = math.ceil(N / ctas_per_group)
+    chunk = ((chunk + ve - 1) // ve) * ve  # vector-aligned chunk starts
+    ctas_per_group = max(1, math.ceil(N / chunk))
+    if ctas_per_group == 1:
+        return 1, 0
+    return ctas_per_group, chunk
+
+
+@functools.cache
+def _compile_radix_primitives(
+    cute_dtype,
+    top_k,
+    next_n,
+    compress_ratio,
+    N,
+    return_output_values,
+    ctas_per_group=1,
+    chunk_elems=0,
+    num_sms=148,
+    min_blocks_per_mp=0,
+    approx_ties=False,
+    enable_pdl=True,
+    warp_agg=False,
+):
+    # N (vocab width) is static (matches _compile_radix's static-N convention);
+    # num_rows / sym_groups stay dynamic, so one compiled kernel serves every
+    # batch size at this specialization.  ctas_per_group == 1 is the
+    # one-block-per-row kernel (no scratch state at all); > 1 launches the
+    # multi-CTA group kernel, which needs the row_states scratch tensor.
+    from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+    kernel = CoarseHistTopKPrimitivesKernel(
+        dtype=cute_dtype,
+        top_k=top_k,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        return_values=return_output_values,
+        ctas_per_group=ctas_per_group,
+        chunk_elems=chunk_elems,
+        num_sms=num_sms,
+        min_blocks_per_mp=min_blocks_per_mp,
+        # fp32 collect classifies with two float compares against per-row
+        # bin-boundary values (~20 instructions once per row) instead of a
+        # per-element fp32->fp16 bin recompute; no effect for 16-bit dtypes.
+        boundary_cls=True,
+        approx_ties=approx_ties,
+        enable_pdl=enable_pdl,
+        warp_agg=warp_agg,
+    )
+    sym_groups = cute.sym_int()  # number of requests (= num_rows // next_n)
+    sym_rows = sym_groups * next_n
+    max_num_groups = max(1, num_sms // ctas_per_group)
+
+    dtype_name = str(cute_dtype).split(".")[-1]
+    kernel_name = (
+        f"prim_{dtype_name}_topk{top_k}_nextn{next_n}_cr{compress_ratio}"
+        f"_N{N}_rv{int(return_output_values)}"
+        f"_cta{ctas_per_group}_chunk{chunk_elems}_sms{num_sms}"
+        f"_mb{min_blocks_per_mp}_bc1_ax{int(approx_ties)}_pdl{int(enable_pdl)}"
+        f"_wa{int(warp_agg)}"
+    )
+
+    def _compile_fn():
+        return cute.compile(
+            kernel,
+            cute.runtime.make_fake_compact_tensor(
+                cute_dtype, (sym_rows, N), stride_order=(1, 0), assumed_align=16
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (max_num_groups, kernel.state_size),
+                stride_order=(1, 0),
+            )
+            if ctas_per_group > 1
+            else None,
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_groups,), stride_order=(0,)
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+            )
+            if return_output_values
+            else None,
+            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+
+    return build_and_load_cute_dsl_kernel(
+        "radix_topk_primitives",
+        kernel_name,
+        _compile_fn,
+        extra_key_files=_radix_primitives_kernel_source_files(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Internal: GVR backend implementation
 # ---------------------------------------------------------------------------
@@ -1026,7 +1187,7 @@ def _run_radix_cutlass(
     offsets = torch.zeros(num_rows, dtype=torch.int32, device=logits.device)
 
     row_states_buffer = _get_cache_buf(
-        f"radix_topk_row_states_{logits.device}",
+        f"radix_topk_row_states_{_scratch_tag(logits.device)}",
         1024 * 1024,
         logits.device,
         zero_init=True,
@@ -1078,6 +1239,7 @@ def _radix_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    approx_ties=False,
 ):
     """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required."""
     return _cute_dsl_ready(logits.device)
@@ -1146,7 +1308,7 @@ def _run_radix(
     nbytes = max_num_groups * _RADIX_STATE_SIZE * 4  # int32 → 4 bytes each
     row_states = (
         _get_cache_buf(
-            f"radix_row_states_{logits.device}",
+            f"radix_row_states_v2_{_scratch_tag(logits.device)}",  # _v2: + departure counter slot
             num_sms * _RADIX_STATE_SIZE * 4,  # worst case: ctas_per_group=1
             logits.device,
             zero_init=True,
@@ -1213,6 +1375,7 @@ def _radix_filter_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    approx_ties=False,
 ):
     """Return True only when the vendored DKG kernel covers this configuration.
 
@@ -1310,6 +1473,802 @@ def _run_radix_filter(
 
 
 # ---------------------------------------------------------------------------
+# Internal: vendored sglang DeepSeek-V4 kernel (benchmark reference backend)
+# ---------------------------------------------------------------------------
+
+
+@supported_compute_capability(_AMPERE_PLUS_CCS)
+def _sglang_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+    approx_ties=False,
+):
+    """Vendored sglang DSv4 ragged top-k: fp32 only, 16B-aligned rows,
+    runtime top_k <= 2048."""
+    if logits.dtype != torch.float32:
+        return False
+    if logits.shape[1] % 4 != 0:
+        return False
+    return 0 < top_k <= 2048
+
+
+@functools.cache
+def _cached_get_sglang_dsv4_topk_module():
+    from ..jit.topk import gen_sglang_dsv4_topk_module
+
+    return gen_sglang_dsv4_topk_module().build_and_load()
+
+
+def _run_sglang(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_output_values: bool,
+    out_indices: torch.Tensor,
+    out_values: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Vendored sglang DSv4 ragged kernel: one block per row, fp32 scores.
+
+    The kernel takes per-ROW effective lengths, so the next_n/compress_ratio
+    arithmetic happens host-side (same convention as _run_radix_cutlass).
+    Emitted indices are local column indices (out_offsets = 0), -1 padded.
+    """
+    num_rows, N = logits.shape
+    if next_n > 1:
+        row_seq_lens = seq_lens.repeat_interleave(next_n)
+        row_offsets = torch.arange(
+            next_n, device=logits.device, dtype=torch.int32
+        ).repeat(seq_lens.shape[0])
+        row_seq_lens = (row_seq_lens - next_n + row_offsets + 1) // compress_ratio
+    else:
+        row_seq_lens = seq_lens // compress_ratio
+    lengths = row_seq_lens.clamp(min=0, max=N).to(torch.int32)
+
+    # Zero out_offsets (kernel adds them to every emitted index).  The cached
+    # buffer is zero-initialized and never written, so reuse is safe.
+    zero_offsets = (
+        _get_cache_buf(
+            f"sglang_topk_zero_offsets_{logits.device}",
+            max(num_rows, 1024) * 4,
+            logits.device,
+            zero_init=True,
+        )[: num_rows * 4]
+        .view(torch.int32)
+        .view(num_rows)
+    )
+
+    from ..utils import device_support_pdl
+
+    _cached_get_sglang_dsv4_topk_module().sglang_dsv4_topk_ragged(
+        logits,
+        lengths,
+        zero_offsets,
+        out_indices,
+        device_support_pdl(logits.device),
+    )
+
+    if return_output_values:
+        # Gather values at selected indices; -1 sentinel slots -> 0.
+        sentinel = out_indices < 0
+        gather_idx = out_indices.long().clamp_(min=0)
+        out_values.copy_(torch.gather(logits, 1, gather_idx))
+        out_values.masked_fill_(sentinel, 0)
+
+    return out_indices, (out_values if return_output_values else None)
+
+
+# ---------------------------------------------------------------------------
+# Internal: radix_primitives (CuTe DSL primitives API) backend implementation
+# ---------------------------------------------------------------------------
+
+
+@supported_compute_capability(_AMPERE_PLUS_CCS)
+def _radix_primitives_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+    approx_ties=False,
+):
+    """Coarse-histogram primitives kernel: Ampere+, no top_k bound, no
+    pre_idx required.  The kernel uses no Blackwell-specific features
+    (no clusters/TMA/tcgen05; redux.sync is SM80+, PDL is SM90+ and
+    compiled out below that); perf tuning constants were chosen on B200."""
+    # top_k <= 2048 resolves ties through the smem stage buffer; larger
+    # top_k adds a compile-time-gated direct-fill path (see _OP_EQFILL in
+    # the kernel), so there is no upper bound.
+    return _CUTE_DSL_AVAILABLE
+
+
+def _run_radix_primitives(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_output_values: bool,
+    out_indices: torch.Tensor,
+    out_values: Optional[torch.Tensor],
+    approx_ties: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Coarse-histogram top-k (CuTe DSL primitives API): one block per row
+    (native varlen, no scratch, no inter-CTA sync), or multi-CTA groups for
+    long rows on small batches."""
+    cute_dtype = torch_to_cutlass_dtype(logits.dtype)
+    num_rows, N = logits.shape
+    if num_rows == 0:
+        # Empty batch: launching a grid of 0 blocks is a CUDA error.
+        return out_indices, (out_values if return_output_values else None)
+    num_sms = get_device_sm_count(logits.device)
+    ctas_per_group, chunk_elems = _prim_get_group_config(
+        N, logits.dtype, num_rows, num_sms
+    )
+
+    # seq_lens is passed through in raw token units: the kernel applies the
+    # next_n adjustment and compress_ratio division internally, exactly like
+    # the ``radix`` backend.
+    #
+    # min_blocks_per_mp=2 when the one-block-per-row grid oversubscribes the
+    # SMs: two co-resident CTAs halve the tail wave (32 regs/thread fits two
+    # 1024-thread CTAs on SM100).  Left unset otherwise so ptxas keeps its
+    # own register budget for the latency-bound small-batch regime.
+    min_blocks = 2 if (ctas_per_group == 1 and num_rows >= num_sms) else 0
+    # griddepcontrol (PDL) exists on SM90+ only; compile it out on Ampere.
+    cc_major = get_compute_capability(logits.device)[0]
+    enable_pdl = cc_major >= 9
+    # Ampere serializes same-address smem atomics: use the warp-aggregated
+    # walker there.  SM90+ measured FASTER with plain per-lane atomics.
+    warp_agg = cc_major == 8
+    compiled = _compile_radix_primitives(
+        cute_dtype,
+        top_k,
+        next_n,
+        compress_ratio,
+        N,
+        return_output_values,
+        ctas_per_group,
+        chunk_elems,
+        num_sms,
+        min_blocks,
+        approx_ties,
+        enable_pdl,
+        warp_agg,
+    )
+
+    row_states = None
+    if ctas_per_group > 1:
+        # Per-group scratch: merged histogram + barrier/output counters +
+        # staged tie buffer.  zero_init on first allocation; the kernel
+        # self-resets everything it dirtied, so replays (and CUDA graphs)
+        # stay correct without re-zeroing.  Sized for the worst case
+        # (ctas_per_group=2 -> num_sms//2 groups) so the buffer never regrows.
+        #
+        # The cache key includes the state layout (fp32 has a smaller
+        # histogram, hence smaller per-group stride): the self-reset only
+        # guarantees zeros at the offsets of ITS layout, so sharing one
+        # buffer across layouts would let one dtype's (deliberately
+        # un-reset) stale tie buffer alias into the other's histogram.
+        is_f32 = logits.dtype == torch.float32
+        state_size = _prim_mc_state_size(is_f32)
+        max_num_groups = max(1, num_sms // ctas_per_group)
+        nbytes = max_num_groups * state_size * 4
+        row_states = (
+            _get_cache_buf(
+                # _v2: layout grew by two tie-key-range slots; _v4: by the
+                # departure counter.  A stale-layout buffer under an old
+                # key must never be reused.
+                f"radix_primitives_row_states_v4_{'f32' if is_f32 else 'f16'}_{_scratch_tag(logits.device)}",
+                (num_sms // 2) * state_size * 4,
+                logits.device,
+                zero_init=True,
+            )[:nbytes]
+            .view(torch.int32)
+            .view(max_num_groups, state_size)
+        )
+
+    compiled(
+        logits,
+        row_states,
+        seq_lens,
+        out_indices,
+        out_values if return_output_values else None,
+    )
+    return out_indices, (out_values if return_output_values else None)
+
+
+# ---------------------------------------------------------------------------
+# Internal: experimental primitives selectors (sampled / hint / stacked)
+#
+# Explicit-only: never returned by backend="auto" (absent from the heuristic
+# order).  All three verify on-device and rerun any missed rows through
+# _run_radix_primitives on the host, so results are always exact; the host
+# status readback makes them NOT CUDA-graph capturable.  fp32, next_n == 1,
+# compress_ratio == 1, return_values=False, k <= 2048 only.  Qualified
+# functionally on SM80/89/90/100/120.
+# ---------------------------------------------------------------------------
+
+
+def _experimental_prim_common_ok(logits, top_k, compress_ratio, next_n, return_values):
+    if not _CUTE_DSL_AVAILABLE:
+        return False
+    if logits.dtype != torch.float32 or not logits.is_contiguous():
+        return False
+    if next_n != 1 or compress_ratio != 1 or return_values:
+        return False
+    return top_k <= 2048
+
+
+def _experimental_hint_ok(logits, top_k, pre_idx):
+    return (
+        pre_idx is not None
+        and pre_idx.dtype == torch.int32
+        and pre_idx.is_contiguous()
+        and tuple(pre_idx.shape) == (logits.shape[0], top_k)
+    )
+
+
+@supported_compute_capability(_AMPERE_PLUS_CCS)
+def _sampled_primitives_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+    approx_ties=False,
+):
+    """Sampled-pivot (GVR2-style, hintless) selector; N % 4 == 0."""
+    return (
+        _experimental_prim_common_ok(
+            logits, top_k, compress_ratio, next_n, return_values
+        )
+        and logits.shape[1] % 4 == 0
+    )
+
+
+@supported_compute_capability(_AMPERE_PLUS_CCS)
+def _hint_primitives_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+    approx_ties=False,
+):
+    """Hint-pivot (GVR1-modern) selector; requires int32 pre_idx (rows, k)."""
+    return _experimental_prim_common_ok(
+        logits, top_k, compress_ratio, next_n, return_values
+    ) and _experimental_hint_ok(logits, top_k, pre_idx)
+
+
+@supported_compute_capability(_AMPERE_PLUS_CCS)
+def _stacked_primitives_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+    approx_ties=False,
+):
+    """Stacked hint->sample selector; needs pre_idx AND N % 4 == 0."""
+    return (
+        _experimental_prim_common_ok(
+            logits, top_k, compress_ratio, next_n, return_values
+        )
+        and logits.shape[1] % 4 == 0
+        and _experimental_hint_ok(logits, top_k, pre_idx)
+    )
+
+
+# Memoized (num_rows, device) -> (slab, status) views over the persistent
+# cache buffers.  Entries pin their own storage, so a later regrow for a
+# bigger batch never invalidates earlier views; a handful of live batch
+# shapes costs a handful of buffers.  Status holds 10 blocks of num_rows:
+# block 0 is the per-row verify status the gated fallback kernel reads,
+# blocks 1+ are the speculative kernels' debug telemetry.
+def _scratch_tag(device) -> str:
+    """Suffix for MUTABLE scratch-buffer cache keys: device + current stream.
+
+    Scratch that a kernel mutates (arrival counters, tickets, slabs, status)
+    must not be shared between kernels that can run concurrently, i.e.
+    between streams.  Under CUDA-graph capture the current stream is the
+    capture stream, which the eager warm-up already used, so captured
+    graphs keep their buffers.  Read-only dummies stay stream-agnostic."""
+    return f"{device}_s{torch.cuda.current_stream(device).cuda_stream:x}"
+
+
+_experimental_prim_buf_views: dict = {}
+
+
+def _experimental_prim_buffers(num_rows, device):
+    tag = _scratch_tag(device)
+    key = (num_rows, tag)
+    hit = _experimental_prim_buf_views.get(key)
+    if hit is not None:
+        return hit
+    from .kernels.sampled_topk_primitives import GCAP
+
+    n_slab = num_rows * 2 * GCAP
+    slab = (
+        _get_cache_buf(f"topk_experimental_slab_{tag}", n_slab * 4, device)[
+            : n_slab * 4
+        ]
+        .view(torch.int32)
+        .view(num_rows, 2 * GCAP)
+    )
+    status = _get_cache_buf(
+        f"topk_experimental_status_{tag}", 10 * num_rows * 4, device
+    )[: 10 * num_rows * 4].view(torch.int32)[: 10 * num_rows]
+    _experimental_prim_buf_views[key] = (slab, status)
+    return slab, status
+
+
+def _mc_splits_for(num_rows, N, device, spin_safe_required=False):
+    """Row-split factor for the speculative kernels: fill the GPU when
+    the one-CTA-per-row grid would leave it idle (the occupancy regime
+    where gvr_2's row-splitting families win).
+
+    spin_safe_required (the STACKED kernel, whose inter-CTA verdict uses
+    a spin barrier): the whole grid must be GUARANTEEDLY co-resident, and
+    the only cap guaranteed regardless of register pressure is 1 CTA/SM
+    (a 1024-thread CTA can never exceed 64 regs/thread, so 1/SM always
+    schedules; 2/SM would require <= 32 regs/thread, which these kernels
+    exceed -- allowing 2x SMs here DEADLOCKED the spin barrier, measured).
+    The spin-free last-arriver kernels (sampled/hint) tolerate multiple
+    waves; they may split up to 2x the SM count, paying only replicated
+    pivot cost in the extra wave."""
+    if N < 16384:
+        return 1
+    cap = get_device_sm_count(device)
+    if not spin_safe_required:
+        cap = 2 * cap
+    per = cap // max(num_rows, 1)
+    for s in (16, 8, 4, 2):
+        if per >= s and (N // s) >= 4096:
+            return s
+    return 1
+
+
+def _run_sampled_primitives(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    out_indices: torch.Tensor,
+) -> Tuple[torch.Tensor, None]:
+    from .kernels.fallback_topk_primitives import get_prod_kernel
+    from .kernels.mc_sampled_topk_primitives import get_mc_kernel
+
+    num_rows, N = logits.shape
+    if num_rows == 0:
+        return out_indices, None
+    slab, status = _experimental_prim_buffers(num_rows, logits.device)
+    splits = _mc_splits_for(num_rows, N, logits.device)
+    if splits > 1:
+        mc_state = _experimental_prim_mc_state(num_rows, logits.device)
+        get_mc_kernel("sampled", top_k, N, splits)(
+            logits, seq_lens, out_indices, slab, status[:num_rows], mc_state
+        )
+        return out_indices, None
+    # one FFI call: speculative kernel + status-gated exact fallback
+    # (sync-free, CUDA-graph safe)
+    get_prod_kernel("sampled", top_k, N)(
+        logits, seq_lens, out_indices, slab, status[:num_rows]
+    )
+    return out_indices, None
+
+
+@supported_compute_capability(_AMPERE_PLUS_CCS)
+def _walkfirst_primitives_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+    approx_ties=False,
+):
+    """Walk-first (gvr_2-architecture) selector; fp32/fp16/bf16; the row
+    width must fill whole 16-byte vectors (N % 4 for fp32, N % 8 for the
+    16-bit dtypes)."""
+    # eligibility checks must reject malformed input quietly (the public
+    # API's asserts own the user-facing error): a 1-D tensor has no shape[1]
+    if not _CUTE_DSL_AVAILABLE or logits.dim() != 2 or not logits.is_contiguous():
+        return False
+    if logits.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+    if next_n != 1 or compress_ratio != 1 or return_values:
+        return False
+    ve = 4 if logits.dtype == torch.float32 else 8
+    return top_k <= 2048 and logits.shape[1] % ve == 0
+
+
+_HYBRID_ANCHOR_READY: set = set()
+
+
+def _run_walkfirst_primitives(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    out_indices: torch.Tensor,
+    pre_idx: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, None]:
+    from .kernels.walkfirst_topk_primitives import WF_ROW_INTS, get_walkfirst_kernel
+
+    num_rows, N = logits.shape
+    if num_rows == 0:
+        return out_indices, None
+    # ---- register-resident short rows (experimental) ----
+    # Rows of at most 4 vectors per thread (16K fp32 / 32K 16-bit) fit in
+    # the registers of one 1024-thread CTA: one gmem read, exact coarse
+    # census from registers, 4 block barriers, no sample / split / slab
+    # (kernels/regrow_topk_primitives.py).  The streaming pipeline's fixed
+    # costs are pure overhead at these widths (16K b=64: 20-30% behind
+    # gvr_2's register family).  FLASHINFER_TOPK_WF_REGROW=0 disables.
+    from .kernels.regrow_topk_primitives import (
+        get_regrow_kernel,
+        regrow_enabled,
+        regrow_max_n,
+    )
+
+    # Caller hints are a first-class input here: the hint arm skips the
+    # census and scan entirely when the hinted bar verifies (see module doc).
+    _vec = 4 if logits.dtype == torch.float32 else 8
+    _hints_ok = (
+        pre_idx is not None
+        and pre_idx.shape == (num_rows, top_k)
+        and pre_idx.dtype == torch.int32
+        and pre_idx.stride(1) == 1
+    )
+    # fp32 always; the 16-bit dtypes only with usable hints (measured: their
+    # hinted arm is ~2x the streaming path at 16K on H100/5080/A100/L40S,
+    # while the hintless 8192-bin census is a wash on H100 and slower on B200)
+    if (
+        (regrow_enabled(logits.dtype) or (_hints_ok and regrow_enabled(torch.float32)))
+        and N % _vec == 0
+        and regrow_max_n(_vec) >= N
+        and top_k <= 2048
+    ):
+        if _hints_ok:
+            rg_hints, rg_has = pre_idx, 1
+        else:
+            rg_hints = (
+                _get_cache_buf(
+                    "topk_wf_hint_dummy",
+                    num_rows * top_k * 4,
+                    logits.device,
+                    zero_init=True,
+                )[: num_rows * top_k * 4]
+                .view(torch.int32)
+                .view(num_rows, top_k)
+            )
+            rg_has = 0
+        n_slab = num_rows * WF_ROW_INTS
+        slab = (
+            _get_cache_buf(
+                f"topk_experimental_wf_slab_{_scratch_tag(logits.device)}",
+                n_slab * 4,
+                logits.device,
+                zero_init=True,
+            )[: n_slab * 4]
+            .view(torch.int32)
+            .view(num_rows, WF_ROW_INTS)
+        )
+        _, status = _experimental_prim_buffers(num_rows, logits.device)
+        get_regrow_kernel(top_k, N, logits.dtype)(
+            logits, seq_lens, out_indices, slab, status[:num_rows], rg_hints, rg_has
+        )
+        return out_indices, None
+    # ---- hybrid engine routing (SM100/103 only) ----
+    # In two measured shape windows the vendored gvr_2 streaming kernel
+    # beats the primitives walk pipeline by more than a 2% parity bar and
+    # no primitives-side mechanism remains (see the documented dead ends):
+    # tiny rows (N <= 16K: its fused register-disciplined sample floor)
+    # and wide batches from 256K up at k <= 1024 (its per-row dynamic
+    # routing under length skew).  Route exactly those windows to the
+    # vendored engine with a synthesized identity anchor (gvr_2 reads
+    # pre_idx only as a degenerate-case anchor, so this API stays
+    # hintless); k = 2048 joins only in the N <= 16K window (above it the
+    # walk pipeline beats gvr_2 by 1.3-1.5x).  Any gvr-side failure falls
+    # through to the walk.
+    #
+    # OFF BY DEFAULT (opt in with FLASHINFER_TOPK_WF_HYBRID=1): the
+    # adversarial campaign found the vendored gvr_2 engine WRONG on inputs
+    # the walk pipeline handles exactly -- NaN not ranked on top for
+    # batches above 148 rows (its 512/256-thread families), and value/
+    # index errors on +inf, NaN and +-3e38 inputs under variable lengths
+    # (rows of length K+1, rows ~1-3K long).  Routing to it would trade
+    # 3-15% on two shape windows for wrong answers on those inputs.
+    if (
+        top_k in (512, 1024)
+        and (N <= 16384 or (N >= 262144 and num_rows >= 33))
+        or (top_k == 2048 and N <= 16384)
+    ) and (
+        logits.dtype == torch.float32  # the vendored engine is fp32-only
+        and logits.stride(1) == 1
+        and (logits.stride(0) if num_rows > 1 else N) % 4 == 0
+        and not (logits.data_ptr() & 15)
+        and torch.cuda.get_device_capability(logits.device) in ((10, 0), (10, 3))
+        and os.environ.get("FLASHINFER_TOPK_WF_HYBRID") == "1"
+    ):
+        try:
+            if (
+                pre_idx is not None
+                and pre_idx.shape == (num_rows, top_k)
+                and pre_idx.dtype == torch.int32
+                and pre_idx.stride(1) == 1
+            ):
+                # caller hints: gvr_2's HIC window tightens with a good
+                # anchor, recovering full oracle-hint parity
+                _run_gvr2(
+                    logits,
+                    pre_idx,
+                    seq_lens,
+                    top_k,
+                    1,
+                    1,
+                    False,
+                    out_indices,
+                    None,
+                )
+                return out_indices, None
+            key = (int(num_rows), int(top_k), logits.device.index)
+            anchor_idx = (
+                _get_cache_buf(
+                    "topk_wf_hybrid_anchor",
+                    num_rows * top_k * 4,
+                    logits.device,
+                    zero_init=False,
+                )[: num_rows * top_k * 4]
+                .view(torch.int32)
+                .view(num_rows, top_k)
+            )
+            if key not in _HYBRID_ANCHOR_READY:
+                # device-side fill, no host reads: CUDA-graph safe (and
+                # done eagerly during warmup, before any capture)
+                anchor_idx.copy_(
+                    torch.arange(top_k, dtype=torch.int32, device=logits.device).expand(
+                        num_rows, top_k
+                    )
+                )
+                _HYBRID_ANCHOR_READY.add(key)
+            _run_gvr2(
+                logits,
+                anchor_idx,
+                seq_lens,
+                top_k,
+                1,
+                1,
+                False,
+                out_indices,
+                None,
+            )
+            return out_indices, None
+        except Exception:
+            pass  # fall through to the walk pipeline
+    # OWN zero-init slab: the row survivor histogram lives in the slab
+    # tail (per-row width WF_ROW_INTS = 2*GCAP keys/idx + 256 hist ints)
+    # and self-resets; sharing the other backends' (dirty) slab would
+    # corrupt it
+    n_slab = num_rows * WF_ROW_INTS
+    slab = (
+        _get_cache_buf(
+            f"topk_experimental_wf_slab_{_scratch_tag(logits.device)}",
+            n_slab * 4,
+            logits.device,
+            zero_init=True,
+        )[: n_slab * 4]
+        .view(torch.int32)
+        .view(num_rows, WF_ROW_INTS)
+    )
+    _, status = _experimental_prim_buffers(num_rows, logits.device)
+    mc_state = _experimental_prim_mc_state(num_rows, logits.device)
+    # ONE true wave: this kernel runs 1 CTA/SM (register pressure), so
+    # the spin-free 2x-SM split budget produces two waves and wave skew
+    # (measured: b=64 S=4 wall 19.9us vs better phase sums)
+    splits = _mc_splits_for(num_rows, N, logits.device, spin_safe_required=True)
+    if splits < 1:
+        splits = 1
+    # Small-batch cluster preference (measured B200): the spin-safe policy
+    # picks S in {8, 16} at small batches, which lands on the gmem
+    # publish/arrival path (~2.5us of coordination).  When the device has
+    # clusters (SM90+) and the per-CTA slice at S=4 stays walk-cheap
+    # (N <= 128K), 4-CTA DSMEM coordination wins despite the longer
+    # slices: 64K b=8 k=2048 10.32 -> 8.28us, k=1024 8.89 -> 7.87.  At
+    # DSv4 scale the slice cost dominates and S=8 stays better (1M b=16:
+    # S=4 measured +3us), hence the N bound.
+    if (
+        splits >= 8
+        and N <= 131072
+        and torch.cuda.get_device_capability(logits.device)[0] >= 9
+    ):
+        # (cs=8 clusters were also tried for rows <= 15, gvr_2's own veto
+        # boundary: MEASURED WORSE -- 64K b=1 7.66 -> 8.28us, b=8 7.87 ->
+        # 8.89; merging 8 peer histograms over DSMEM costs more than the
+        # already-short slices save.  S=4 is the cluster ceiling.)
+        splits = 4
+    # A100 (sm80) >= 4 MB rows at S == 1: single-CTA rows stream at ~12
+    # GB/s per CTA vs ~20 GB/s for 2 MB rows (dtype-independent; torch's
+    # row reduction is unaffected), and splitting restores the per-CTA
+    # rate even with a second wave -- 1M fp32 b=64: S1 364us -> S4 249us,
+    # b=16 157 -> 74.  Not applied where the base policy already splits,
+    # at rows > 64 (b=96 S1 313 vs S2 330), or on SM90+/SM89 (85-88% of
+    # the measured DRAM roof at S == 1).
+    if (
+        splits == 1
+        and num_rows <= 64
+        and N * logits.element_size() >= (4 << 20)
+        and torch.cuda.get_device_capability(logits.device) == (8, 0)
+    ):
+        splits = 4
+    # Very small batches of >= 1M rows: 32-way split (gmem last-arriver path)
+    # when the grid still fits one wave.  The shared policy stops at 16;
+    # measured B200 hintless 1M b=1: S16 13.4us -> S32 11.5us (k=512), b=4
+    # 13.2 -> 11.4; at b=8 32 x 8 = 256 CTAs is two waves and S32 measured
+    # 17.7us, so the one-wave bound is essential.  No gain at 256K (8.68 vs
+    # 8.67) and a loss at 64K, hence the width bound.
+    if (
+        splits == 16
+        and N >= (1 << 20)
+        and num_rows * 32 <= get_device_sm_count(logits.device)
+    ):
+        splits = 32
+    force = os.environ.get("FLASHINFER_TOPK_WF_SPLITS")
+    if force:
+        # experimentation override (cluster splits need no spin safety)
+        splits = int(force)
+    # hint rung: forward usable caller hints (right shape, int32,
+    # contiguous), else a cached zero dummy with the flag off
+    if (
+        pre_idx is not None
+        and pre_idx.shape == (num_rows, top_k)
+        and pre_idx.dtype == torch.int32
+        and pre_idx.stride(1) == 1
+    ):
+        hints_t, has_hints = pre_idx, 1
+    else:
+        hints_t = (
+            _get_cache_buf(
+                "topk_wf_hint_dummy",
+                num_rows * top_k * 4,
+                logits.device,
+                zero_init=True,
+            )[: num_rows * top_k * 4]
+            .view(torch.int32)
+            .view(num_rows, top_k)
+        )
+        has_hints = 0
+    get_walkfirst_kernel(top_k, N, splits, dtype=logits.dtype)(
+        logits,
+        seq_lens,
+        out_indices,
+        slab,
+        status[:num_rows],
+        mc_state,
+        hints_t,
+        has_hints,
+    )
+    return out_indices, None
+
+
+def _experimental_prim_mc_state(num_rows, device):
+    """(rows, 8) int32 counters for the MC kernels: zero-init at first
+    allocation, self-resetting after every call."""
+    return (
+        _get_cache_buf(
+            f"topk_experimental_mc_state_{_scratch_tag(device)}",
+            num_rows * 8 * 4,
+            device,
+            zero_init=True,
+        )[: num_rows * 8 * 4]
+        .view(torch.int32)
+        .view(num_rows, 8)
+    )
+
+
+def _run_hint_primitives(
+    logits: torch.Tensor,
+    pre_idx: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    out_indices: torch.Tensor,
+) -> Tuple[torch.Tensor, None]:
+    from .kernels.fallback_topk_primitives import get_prod_kernel
+    from .kernels.mc_sampled_topk_primitives import get_mc_kernel
+
+    num_rows, N = logits.shape
+    if num_rows == 0:
+        return out_indices, None
+    slab, status = _experimental_prim_buffers(num_rows, logits.device)
+    splits = _mc_splits_for(num_rows, N, logits.device)
+    if splits > 1:
+        mc_state = _experimental_prim_mc_state(num_rows, logits.device)
+        get_mc_kernel("hint", top_k, N, splits)(
+            logits, pre_idx, seq_lens, out_indices, slab, status[:num_rows], mc_state
+        )
+        return out_indices, None
+    get_prod_kernel("hint", top_k, N)(
+        logits, pre_idx, seq_lens, out_indices, slab, status[:num_rows]
+    )
+    return out_indices, None
+
+
+def _run_stacked_primitives(
+    logits: torch.Tensor,
+    pre_idx: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    out_indices: torch.Tensor,
+) -> Tuple[torch.Tensor, None]:
+    from .kernels.fallback_topk_primitives import get_prod_kernel
+    from .kernels.mc_sampled_topk_primitives import get_mc_kernel
+
+    num_rows, N = logits.shape
+    if num_rows == 0:
+        return out_indices, None
+    slab, status = _experimental_prim_buffers(num_rows, logits.device)
+    splits = _mc_splits_for(num_rows, N, logits.device, spin_safe_required=True)
+    if splits > 1 and N % 4 == 0:
+        # occupancy-starved regime: row-split two-rung stack (hint rung
+        # with early-abort -> group verdict -> sampled rung) + gated
+        # exact fallback.  spin_safe_required: the verdict barrier spins.
+        mc_state = _experimental_prim_mc_state(num_rows, logits.device)
+        get_mc_kernel("stacked", top_k, N, splits)(
+            logits, pre_idx, seq_lens, out_indices, slab, status[:num_rows], mc_state
+        )
+        return out_indices, None
+    get_prod_kernel("stacked", top_k, N)(
+        logits, pre_idx, seq_lens, out_indices, slab, status[:num_rows]
+    )
+    return out_indices, None
+
+
+# ---------------------------------------------------------------------------
 # Public API: top_k_varlen
 # ---------------------------------------------------------------------------
 
@@ -1321,6 +2280,13 @@ def _run_radix_filter(
         "gvr_2": _gvr2_top_k_varlen_check,
         "radix_cutlass": _radix_cutlass_top_k_varlen_check,
         "radix_filter": _radix_filter_top_k_varlen_check,
+        # primitives backends: explicit-only (absent from the auto heuristic)
+        "radix_primitives": _radix_primitives_top_k_varlen_check,
+        "sglang": _sglang_top_k_varlen_check,
+        "walkfirst_primitives": _walkfirst_primitives_top_k_varlen_check,
+        "sampled_primitives": _sampled_primitives_top_k_varlen_check,
+        "hint_primitives": _hint_primitives_top_k_varlen_check,
+        "stacked_primitives": _stacked_primitives_top_k_varlen_check,
     },
     heuristic_func=_top_k_varlen_heuristic,
 )
@@ -1336,10 +2302,22 @@ def top_k_varlen(
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
     backend: Literal[
-        "radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"
+        "radix",
+        "gvr",
+        "gvr_2",
+        "radix_cutlass",
+        "radix_filter",
+        "radix_primitives",
+        "sglang",
+        "walkfirst_primitives",
+        "sampled_primitives",
+        "hint_primitives",
+        "stacked_primitives",
+        "auto",
     ] = "auto",
     load_balance: bool = True,
     workspace: Optional[dict] = None,
+    approx_ties: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Top-K selection over batched decode-step logits.
 
@@ -1425,6 +2403,12 @@ def top_k_varlen(
                               implementation-specific.
         ``"radix_cutlass"`` — Masked CUTLASS radix top-K (all GPUs, no
                               ``pre_idx`` needed).
+        ``"radix_primitives"`` — Coarse-histogram top-K written against the
+                              CuTe DSL primitives API (raw pointers + PTX
+                              wrappers, no layout algebra); one CTA per row,
+                              sglang DeepSeek-V4 algorithm (Ampere+ incl. Rubin,
+                              no top_k restriction, no ``pre_idx`` needed).
+                              Explicit-only.
         ``"auto"``          — shape/dtype-aware selection tracking the
                               measured per-config winner: gvr_2 for hinted
                               fp32; gvr only when ``batch * max_seq_len`` is
@@ -1435,6 +2419,37 @@ def top_k_varlen(
                               ``max_seq_len`` are a known blind spot (auto
                               cannot read ``seq_lens`` without a sync);
                               prefer ``backend="radix"`` there.
+
+        Experimental primitives selectors (explicit-only — never chosen by
+        ``"auto"``; fp32, ``next_n == compress_ratio == 1``,
+        ``return_values=False``, ``top_k <= 2048``, Ampere+).  Each call
+        enqueues the speculative kernel plus a status-gated exact fallback
+        kernel (MSD radix-select) on the same stream: rows that miss
+        on-device verification are re-solved exactly on device, sync-free,
+        so the calls are CUDA-graph capturable once warmed up.  Like the
+        GVR workspace, the internal slab/status buffers are shared
+        per-device — do not call these backends concurrently from multiple
+        streams:
+
+        ``"gvr_2"``         — self-sampling GVR V2 (TRT-LLM #17821 port;
+                              Blackwell sm_100/103 only, fp32,
+                              ``top_k`` in {512, 1024, 2048}, requires
+                              ``pre_idx``).  Vendored for head-to-head
+                              comparison with the primitives selectors.
+        ``"walkfirst_primitives"`` — full gvr_2-architecture replication
+                              (fused walk-first ladder) with row-splitting
+                              at any k and the exact fallback; hintless.
+                              ``max_seq_len`` multiple of 4.
+        ``"sampled_primitives"`` — self-sampling pivot bracket (GVR2-style,
+                              no ``pre_idx``); fastest available on
+                              duplicate/flood-heavy rows.  ``max_seq_len``
+                              must be a multiple of 4.
+        ``"hint_primitives"`` — hint-derived pivot (GVR1-modern; requires
+                              ``pre_idx``); fastest when hints are good,
+                              falls back otherwise.
+        ``"stacked_primitives"`` — hint rung then sampled rung per row in
+                              one launch (requires ``pre_idx``;
+                              ``max_seq_len`` multiple of 4).
     load_balance : bool, optional
         Selects the GVR kernel path (ignored by the radix backend).  Default
         ``True``.
@@ -1475,6 +2490,21 @@ def top_k_varlen(
             streams — each stream must have its own workspace to avoid races
             on the device tensors.  When ``workspace`` is ``None`` (default)
             buffers are allocated locally and are safe for any concurrency.
+
+    approx_ties : bool, optional
+        Permit approximate resolution of boundary ties.  Default ``False``
+        (exact).  When more than an internal tie capacity (2048) of
+        candidates share the coarse histogram bin containing the ``top_k``-th
+        element, an exact backend refines the tie group by exact value; with
+        ``approx_ties=True`` the ``"radix_primitives"`` backend instead fills
+        the remaining output slots with an arbitrary first-arrival subset of
+        that bin — the same semantics the ``"sglang"`` backend always has
+        (its fixed-capacity tie buffer truncates such groups).  Everything
+        strictly above the tie bin is still exact.  Only relevant for
+        adversarially low-entropy rows (thousands of near-identical logits at
+        the selection boundary); on typical logits results are identical to
+        exact mode.  Exact backends ignore this flag (an exact result always
+        satisfies the relaxed contract).
 
     Returns
     -------
@@ -1605,6 +2635,43 @@ def top_k_varlen(
             out_values,
             workspace=workspace,
         )
+    elif backend == "radix_primitives":
+        out_i, out_v = _run_radix_primitives(
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
+            approx_ties,
+        )
+    elif backend == "walkfirst_primitives":
+        out_i, out_v = _run_walkfirst_primitives(
+            logits, seq_lens, top_k, out_indices, pre_idx
+        )
+    elif backend == "sampled_primitives":
+        out_i, out_v = _run_sampled_primitives(logits, seq_lens, top_k, out_indices)
+    elif backend == "hint_primitives":
+        out_i, out_v = _run_hint_primitives(
+            logits, pre_idx, seq_lens, top_k, out_indices
+        )
+    elif backend == "stacked_primitives":
+        out_i, out_v = _run_stacked_primitives(
+            logits, pre_idx, seq_lens, top_k, out_indices
+        )
+    elif backend == "sglang":
+        out_i, out_v = _run_sglang(
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
+        )
     elif backend == "radix_cutlass":
         out_i, out_v = _run_radix_cutlass(
             logits,
@@ -1630,7 +2697,8 @@ def top_k_varlen(
     else:
         raise ValueError(
             f"Unknown backend: {backend!r}. "
-            f"Expected 'radix', 'gvr', 'gvr_2', 'radix_cutlass', or 'radix_filter'."
+            f"Expected 'radix', 'gvr', 'gvr_2', 'radix_cutlass', 'radix_filter', "
+            f"'radix_primitives', 'sglang' or one of the *_primitives selectors."
         )
 
     return out_i, out_v
