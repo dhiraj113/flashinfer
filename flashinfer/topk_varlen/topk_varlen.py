@@ -1968,6 +1968,29 @@ def _mc_splits_for(num_rows, N, device, spin_safe_required=False):
     return 1
 
 
+@functools.cache
+def _cached_max_active_clusters(device_index: int, cluster_size: int) -> int:
+    """One-wave capacity, in clusters, for a 1-CTA/SM kernel launched with
+    hardware clusters of `cluster_size` (cuOccupancyMaxActiveClusters via the
+    DSL's HardwareInfo).  Cluster placement is GPC-granular, so floor(SMs / S)
+    overstates it: B200 (148 SMs) fits 45 clusters of 3, not 49, 33 of 4, not
+    37, 22 of 6, not 24; Rubin (208) 66 / 50 / 32 instead of 69 / 52 / 34.
+    Measured with the walk-first kernel: the first cluster past the capacity
+    runs as a second wave and doubles the wall time (B200 1M fp32 b=46 S3
+    69us vs 40us at b=45).  Costs one empty-kernel compile (~0.3s) per
+    process; the fallback if the query is unavailable is a 12.5% haircut on
+    floor(SMs / S), below every measured capacity."""
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    try:
+        from cutlass.utils import HardwareInfo
+
+        with torch.cuda.device(device_index):
+            torch.cuda.synchronize()  # the primary context must exist
+            return int(HardwareInfo(device_index).get_max_active_clusters(cluster_size))
+    except Exception:  # noqa: BLE001 -- occupancy query is best effort
+        return (sms // cluster_size) * 7 // 8
+
+
 def _run_sampled_primitives(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2257,25 +2280,38 @@ def _run_walkfirst_primitives(
         and num_rows * 32 <= get_device_sm_count(logits.device)
     ):
         splits = 32
-    # Long rows (>= 4 MB) in grids that leave SMs idle under a power-of-two
-    # split: use the largest one-wave cluster shape in {2, 3, 4, 6} instead.
-    # Measured on Rubin (208 SMs): 1M fp32 b=64 S2 -> S3 43.2 -> 38.2us
-    # (gvr_2 40.1), b=32 S4 -> S6 24.4 -> 22.3us (22.3); at 64K-256K the
-    # extra CTAs' fixed costs outweigh the shorter slices (256K b=64 S3 within
-    # noise, 64K worse), hence the byte bound.  On 148-SM parts the rule only
-    # changes grids where 3 CTAs per row fit one wave (b in 38..49).
-    if (
-        splits in (2, 4)
-        and N * logits.element_size() >= (4 << 20)
-        and num_rows >= 16
-        and torch.cuda.get_device_capability(logits.device)[0] >= 9
-    ):
-        _sms = get_device_sm_count(logits.device)
-        for _s in (6, 4, 3, 2):
-            if num_rows * _s <= _sms:
+    # Long rows in grids that leave SMs idle under a power-of-two split: use
+    # the largest one-wave cluster shape in {2, 3, 4, 6} instead.  Measured
+    # on Rubin (208 SMs), fp32 hintless: 1M b=64 S2 -> S3 43.2 -> 38.2us
+    # (gvr_2 40.1), 1M b=32 S4 -> S6 24.4 -> 22.3us (22.3), 256K b=64 S2 ->
+    # S3 11.7 -> 10.9us (11.4).  Shape 6 only pays off from 4 MB (256K b=32
+    # S4 -> S6 8.6 -> 8.9us: the wider cluster epilogue outweighs the shorter
+    # slice), and below 1 MB every shape loses (64K b=64 S3 7.0 -> 7.6us),
+    # hence the two byte bounds.  On 148-SM parts the rule only changes grids
+    # where 3 CTAs per row fit one wave (b in 38..45).  "Fits one wave" is
+    # the driver's cluster occupancy, not floor(SMs / S): see
+    # _cached_max_active_clusters.
+    _row_bytes = N * logits.element_size()
+    _dev_idx = logits.device.index if logits.device.index is not None else 0
+    _cluster_cc = torch.cuda.get_device_capability(logits.device)[0] >= 9
+    if splits in (2, 4) and _row_bytes >= (1 << 20) and num_rows >= 16 and _cluster_cc:
+        _shapes = (6, 4, 3, 2) if _row_bytes >= (4 << 20) else (4, 3, 2)
+        for _s in _shapes:
+            if num_rows <= _cached_max_active_clusters(_dev_idx, _s):
                 if _s > splits:
                     splits = _s
                 break
+    # One-wave guard for the cluster shapes: _mc_splits_for sizes the split
+    # by floor(SMs / S), which is too generous for S >= 3 (and S=4 on
+    # 148-SM parts: b in 34..37 would run 4-CTA clusters as two waves).
+    # Step down to the largest shape whose clusters all co-reside.
+    if _cluster_cc and splits in (2, 3, 4, 6):
+        for _s in (splits, 4, 3, 2):
+            if _s <= splits and num_rows <= _cached_max_active_clusters(_dev_idx, _s):
+                splits = _s
+                break
+        else:
+            splits = 1
     force = os.environ.get("FLASHINFER_TOPK_WF_SPLITS")
     if force:
         # experimentation override (cluster splits need no spin safety)
