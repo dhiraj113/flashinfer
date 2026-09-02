@@ -2031,14 +2031,22 @@ def get_walkfirst_kernel(
         cdt
     ]
     assert top_k <= 2 * nt and N % vec_elems == 0
-    assert splits in (1, 2, 4, 8, 16, 32)
+    assert splits in (1, 2, 3, 4, 6, 8, 16, 32)
     # cs=8 was built and MEASURED WORSE (B200 1M b=16: 18.1 -> 28.3us):
     # an 8-CTA cluster must pack into one GPC, and at 1 CTA/SM occupancy
     # the scheduler strands SMs waiting to co-place whole clusters.  cs=2
     # is a clear win (64K b=64 12.98 -> 10.73) and cs=4 neutral-positive;
     # S=8/16 keep the gmem slab + release/acquire arrival path.
+    # DSMEM cluster shapes: 2 and 4 (measured on B200), 3 and 6 (one-wave
+    # shapes the dispatcher picks for long rows on 208-SM parts; measured on
+    # Rubin: 1M b=64 S3 43.2 -> 38.2us, 1M b=32 S6 24.4 -> 22.3us).  8 is
+    # experimental only (FLASHINFER_TOPK_WF_CLUSTERX=1): measured worse
+    # everywhere on both parts.
+    _cl_sizes: tuple[int, ...] = (2, 3, 4, 6)
+    if os.environ.get("FLASHINFER_TOPK_WF_CLUSTERX") == "1":
+        _cl_sizes = (2, 3, 4, 6, 8)
     use_cluster = (
-        splits in (2, 4)
+        splits in _cl_sizes
         and os.environ.get("FLASHINFER_TOPK_WF_CLUSTER") != "0"
         and torch.cuda.get_device_capability()[0] >= 9
     )
