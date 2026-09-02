@@ -40,11 +40,26 @@ def gen_sglang_dsv4_topk_module() -> JitSpec:
     device target, so this module is single-arch: it targets the CURRENT
     device only (fine for a benchmark reference backend).
     """
+    import re
+
     import torch
+
+    from ..compilation_context import CompilationContext
 
     src_dir = jit_env.FLASHINFER_CSRC_DIR / "sglang_dsv4"
     major, minor = torch.cuda.get_device_capability()
+    # SGL_CUDA_ARCH must equal the __CUDA_ARCH__ of the DEVICE PASS nvcc runs,
+    # which is the JIT's gencode target, not the raw capability: FlashInfer
+    # builds Rubin (10.7) as the sm100f family target while the bundled
+    # CUTLASS lacks native compute_107a (cpp_ext maps 107 -> 100f), so the
+    # device pass sees 1000 there.  Derive the value from the same flag list.
     sgl_arch = major * 100 + minor * 10
+    ctx = CompilationContext()
+    for flag in ctx.get_nvcc_flags_list(map_sm107_to_100f=True):
+        m = re.match(r"-gencode=arch=compute_(\d+)[a-z]*,code=", flag)
+        if m and m.group(1).startswith(str(major)):
+            sgl_arch = int(m.group(1)) * 10
+            break
     return gen_jit_spec(
         "sglang_dsv4_topk",
         [
