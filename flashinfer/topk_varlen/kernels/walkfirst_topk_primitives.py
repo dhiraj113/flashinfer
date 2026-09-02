@@ -61,7 +61,6 @@ from .radix_topk_primitives import (
     gmem_red_add,
     read_globaltimer,
     smem_atomic_add,
-    smem_red_max_u32,
     warp_inclusive_sum,
     warp_sum,
 )
@@ -267,10 +266,11 @@ class WalkFirstTopK(SampledPivotTopK):
     # TEST ONLY (FLASHINFER_TOPK_WF_FORCE_RETRY=1): compile the retry-
     # capable paths with aim < k so the T3 rung fires on every row
     wf_force_retry: bool = False
-    # Hint rung (stacked's rung-1 idea): with caller hints, TF/SC come from
-    # a k-element gather instead of the sample phase.  Env kill switch
-    # FLASHINFER_TOPK_WF_HINT_RUNG=0 for A/B.
-    wf_hint_rung: bool = True
+    # Hint rung: with caller hints, the smallest hinted value tightens the
+    # sample-derived walk threshold (never replaces the sample).  Compiled
+    # in only with FLASHINFER_TOPK_USE_HINTS=1 (see get_walkfirst_kernel);
+    # off by default because realistic stale hints cost more than they save.
+    wf_hint_rung: bool = False
     # Tail-safe aim floor for grids of >= 32 rows (see the aim computation);
     # FLASHINFER_TOPK_WF_TAILSAFE=0 is the A/B switch
     wf_tail_safe: bool = True
@@ -966,87 +966,29 @@ class WalkFirstTopK(SampledPivotTopK):
                 # Identical positions on every CTA of the row, so the
                 # verdict is replica-uniform; cost is one v4 load + one
                 # warp redux + one barrier on top of the k gathers.
-                hint_ok = cutlass.Int32(0)
+                #
+                # REVISED (hints are not always correct): the hint no longer
+                # REPLACES the sample -- it TIGHTENS it.  The fused sample
+                # always runs; with k distinct in-range hints, the smallest
+                # hinted value is <= the true k-th value (k distinct elements
+                # cannot all rank above k), so one key-step below it is a
+                # threshold that can never undershoot, and max(sample_tf,
+                # hint_tf) can only shrink the candidate set.  An oracle hint
+                # pins cand == k (the stage/classify saving the old rung had);
+                # a stale hint lands below the sample's aim and changes
+                # nothing; garbage is ignored -- so a hinted call can never be
+                # slower than the hintless one by more than the k gathers,
+                # which are issued alongside the sample's vector load and
+                # folded through the sample's own barrier (no extra barriers).
+                # Measured before this revision: a 90%-overlap stale hint cost
+                # +2-3us over hintless (rung 2.9us + plausibility reject +
+                # sample 2.1us), identity hints +1-2.5us.
                 tf_f = cutlass.Float32(0.0)
                 sc = cutlass.Float32(0.0)
                 degen = cutlass.Int32(0)
                 tf3 = cutlass.Float32(0.0)
                 sc3 = cutlass.Float32(0.0)
-                if cutlass.const_expr(self.wf_hint_rung):
-                    if has_hints == cutlass.Int32(1):
-                        if tidx == 0:
-                            s_misc[6] = cutlass.Int32(0)  # red.max(key)
-                            s_misc[7] = cutlass.Int32(0)  # red.max(~key)
-                            s_misc[8] = cutlass.Int32(0)  # in-range hints
-                            s_misc[9] = cutlass.Int32(0)  # plausibility hits
-                        cute.arch.barrier()
-                        hints_row = hp_ptr + row64 * top_k
-                        for ht in range(tidx, top_k, self.nt):
-                            hidx = hints_row[ht]
-                            if hidx >= 0 and hidx < length:
-                                hk = self.exact_key(self.load_scalar(row_in, hidx))
-                                smem_red_max_u32(s_misc + 6, hk)
-                                smem_red_max_u32(s_misc + 7, ~hk)
-                                smem_atomic_add(s_misc + 8, 1)
-                        cute.arch.barrier()
-                        hk_max = cutlass.Uint32(s_misc[6])
-                        hk_min = ~cutlass.Uint32(s_misc[7])
-                        n_valid = s_misc[8]
-                        # plausibility sample: one row-uniform vector per thread
-                        hlgk = cutlass.const_expr(self.vec_elems.bit_length() - 1)
-                        hepw = cutlass.const_expr(self.vec_elems // 4)
-                        hn4 = length >> cutlass.Int32(hlgk)
-                        hp4 = cutlass.Int32(
-                            (cutlass.Int64(tidx) * cutlass.Int64(hn4))
-                            // cutlass.Int64(self.nt)
-                        )
-                        if hp4 > hn4 - 1:
-                            hp4 = hn4 - 1
-                        if hp4 < 0:
-                            hp4 = cutlass.Int32(0)
-                        hw0, hw1, hw2, hw3 = ld_global_nc_v4_u32(
-                            row_in.toint() + cutlass.Int64(hp4) * cutlass.Int64(16)
-                        )
-                        hhits = cutlass.Int32(0)
-                        for hj_ in cutlass.range_constexpr(4):
-                            for hh_ in cutlass.range_constexpr(hepw):
-                                hk2 = self.exact_key(
-                                    self._wf_elem_bits((hw0, hw1, hw2, hw3)[hj_], hh_)
-                                )
-                                if hk2 >= hk_min:
-                                    hhits = hhits + cutlass.Int32(1)
-                        hhits = warp_sum(hhits)
-                        if tidx % 32 == 0:
-                            if hhits > 0:
-                                smem_atomic_add(s_misc + 9, hhits)
-                        cute.arch.barrier()
-                        # est survivors = hits * length / nsamp  >  lcap / 2  -> reject
-                        h_est = cutlass.Int64(s_misc[9]) * cutlass.Int64(length)
-                        h_lim = cutlass.Int64(self.lcap // 2) * cutlass.Int64(
-                            self.nt * self.vec_elems
-                        )
-                        h_plaus = cutlass.Int32(0)
-                        if h_est <= h_lim:
-                            h_plaus = cutlass.Int32(1)
-                        if (
-                            n_valid == top_k
-                            and hk_min != hk_max
-                            and hk_min != 0
-                            and h_plaus == 1
-                        ):
-                            h_max_f = self._wf_val_of_key(hk_max)
-                            # one key-step below the smallest hint: v == min_hint
-                            # survives the walk's v <= TF cull
-                            h_tf = self._wf_val_of_key(hk_min - cutlass.Uint32(1))
-                            hspan = h_max_f - h_tf
-                            if hspan > cutlass.Float32(0.0):
-                                if hspan < cutlass.Float32(3.0e38):
-                                    hint_ok = cutlass.Int32(1)
-                                    tf_f = h_tf
-                                    sc = cutlass.Float32(255.0) / hspan
-                                    tf3 = h_tf
-                                    sc3 = sc
-                if hint_ok == 0:
+                if True:  # (kept indentation of the former hint_ok == 0 arm)
                     # ---- 1. FUSED SAMPLE (gvr_2's streaming-main structure:
                     # 3 block barriers total, replica-deterministic, with walk
                     # tile 0's latency exposed at walk start).  The
@@ -1065,6 +1007,26 @@ class WalkFirstTopK(SampledPivotTopK):
                         p4 = n4s - 1
                     if p4 < 0:
                         p4 = cutlass.Int32(0)
+                    # hint gathers: index loads first so their latency overlaps
+                    # the sample's vector load; the dependent value loads follow.
+                    # Per-warp partials go to owned s_hm slots (free until the
+                    # cluster epilogue): [0,32) max key, [32,64) max ~key
+                    # (= min key), [64,96) in-range count.  No zero-init round.
+                    hg_max = cutlass.Uint32(0)
+                    hg_nmax = cutlass.Uint32(0)
+                    hg_cnt = cutlass.Int32(0)
+                    if cutlass.const_expr(self.wf_hint_rung):
+                        if has_hints == cutlass.Int32(1):
+                            hints_row = hp_ptr + row64 * top_k
+                            for ht in range(tidx, top_k, self.nt):
+                                hidx = hints_row[ht]
+                                if hidx >= 0 and hidx < length:
+                                    hk = self.exact_key(self.load_scalar(row_in, hidx))
+                                    if hk > hg_max:
+                                        hg_max = hk
+                                    if ~hk > hg_nmax:
+                                        hg_nmax = ~hk
+                                    hg_cnt = hg_cnt + cutlass.Int32(1)
                     w0, w1, w2, w3 = ld_global_nc_v4_u32(
                         row_in.toint() + cutlass.Int64(p4) * cutlass.Int64(16)
                     )
@@ -1090,6 +1052,15 @@ class WalkFirstTopK(SampledPivotTopK):
                     if lane_s == 0:
                         s_warp_sums[warp_s] = kk.bitcast(cutlass.Int32)
                         s_count[warp_s] = nk.bitcast(cutlass.Int32)
+                    if cutlass.const_expr(self.wf_hint_rung):
+                        if has_hints == cutlass.Int32(1):
+                            hg_max = warp_max_u32(hg_max)
+                            hg_nmax = warp_max_u32(hg_nmax)
+                            hg_cnt = warp_sum(hg_cnt)
+                            if lane_s == 0:
+                                s_hm[warp_s] = hg_max.bitcast(cutlass.Int32)
+                                s_hm[32 + warp_s] = hg_nmax.bitcast(cutlass.Int32)
+                                s_hm[64 + warp_s] = hg_cnt
                     if tidx < 256:
                         s_h256[tidx] = cutlass.Int32(0)
                     cute.arch.barrier()  # B1: partials + hist zeros
@@ -1220,6 +1191,33 @@ class WalkFirstTopK(SampledPivotTopK):
                     # exact fallback (measured: one row turned a 53us
                     # batch into 320us).  1.5x wider bins cost tens of
                     # extra ties in the rank-k bin; no cliff.
+                    # ---- hint tightening (see the note above the sample) ----
+                    # k distinct in-range hints -> one key-step below the
+                    # smallest hinted value never undershoots; take it when it
+                    # is above the sample's threshold and below the sample max
+                    # (the survivor scale must keep a positive span).  Only the
+                    # walk threshold moves; the T3 floor stays the sample's.
+                    if cutlass.const_expr(self.wf_hint_rung):
+                        if has_hints == cutlass.Int32(1):
+                            if degen == 0:
+                                nwarps_h = cutlass.const_expr(self.nt // 32)
+                                hv_max = cutlass.Uint32(0)
+                                hv_nmax = cutlass.Uint32(0)
+                                hv_cnt = cutlass.Int32(0)
+                                if lane_s < nwarps_h:
+                                    hv_max = cutlass.Uint32(s_hm[lane_s])
+                                    hv_nmax = cutlass.Uint32(s_hm[32 + lane_s])
+                                    hv_cnt = s_hm[64 + lane_s]
+                                hv_max = warp_max_u32(hv_max)
+                                hv_min = ~warp_max_u32(hv_nmax)
+                                hv_cnt = warp_sum(hv_cnt)
+                                if hv_cnt == top_k and hv_min != hv_max and hv_min != 0:
+                                    h_tf = self._wf_val_of_key(
+                                        hv_min - cutlass.Uint32(1)
+                                    )
+                                    if h_tf > tf_f:
+                                        if h_tf < smax_f:
+                                            tf_f = h_tf
                     sspan = (smax_f - tf_f) * WF_SPAN_EXT
                     sc = cutlass.Float32(0.0)
                     if sspan > cutlass.Float32(0.0):
@@ -2114,7 +2112,7 @@ def get_walkfirst_kernel(
     )
     small_n = int(os.environ.get("FLASHINFER_TOPK_WF_SMALL_N", WF_SMALL_N))
     force_retry_env = os.environ.get("FLASHINFER_TOPK_WF_FORCE_RETRY") == "1"
-    hint_rung_env = os.environ.get("FLASHINFER_TOPK_WF_HINT_RUNG") != "0"
+    hint_rung_env = os.environ.get("FLASHINFER_TOPK_USE_HINTS") == "1"
     # packed-pair 16-bit classify: f16x2 setp exists on every supported
     # arch, bf16x2 setp needs sm_90 (older arches keep the scalar path);
     # FLASHINFER_TOPK_WF_PAIR16=0 is the A/B switch
@@ -2170,7 +2168,13 @@ def get_walkfirst_kernel(
     kern.wf_cluster = use_cluster
     force_retry = os.environ.get("FLASHINFER_TOPK_WF_FORCE_RETRY") == "1"
     kern.wf_force_retry = force_retry
-    hint_rung = os.environ.get("FLASHINFER_TOPK_WF_HINT_RUNG") != "0"
+    # Hints are OFF by default (FLASHINFER_TOPK_USE_HINTS=1 enables): with
+    # realistic previous-step hints (85-90% overlap) the k value gathers cost
+    # 0.6-1.4us and the tightened threshold saves less, so a hinted call
+    # measured slower than hintless everywhere except 1M b=64 (-5%).  Exact
+    # hints win up to 1.4us at 16K, but a caller cannot know its hint is
+    # exact, and "never slower than hintless" is the contract we keep.
+    hint_rung = os.environ.get("FLASHINFER_TOPK_USE_HINTS") == "1"
     kern.wf_hint_rung = hint_rung
     tail_safe = os.environ.get("FLASHINFER_TOPK_WF_TAILSAFE") != "0"
     kern.wf_tail_safe = tail_safe

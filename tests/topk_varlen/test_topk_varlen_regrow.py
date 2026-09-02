@@ -125,7 +125,10 @@ def test_regrow_exact_hintless(dtype, N, pattern, K, length):
 @pytest.mark.parametrize("N", [4096, 16384])
 @pytest.mark.parametrize("pattern", ["randn", "quant", "nan_inf"])
 @pytest.mark.parametrize("K", [512, 1024, 2048])
-def test_regrow_exact_with_hints(hint_mode, N, pattern, K):
+def test_regrow_exact_with_hints(hint_mode, N, pattern, K, monkeypatch):
+    # hints are consumed only with FLASHINFER_TOPK_USE_HINTS=1 (off by default:
+    # realistic stale hints cost more than they save)
+    monkeypatch.setenv("FLASHINFER_TOPK_USE_HINTS", "1")
     g = torch.Generator(device=_DEV)
     g.manual_seed(N * 3 + K + len(hint_mode))
     b = 64
@@ -150,8 +153,10 @@ def test_regrow_exact_with_hints(hint_mode, N, pattern, K):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("hint_mode", ["oracle", "stale", "garbage"])
 @pytest.mark.parametrize("N", [16384, 32768])
-def test_regrow_16bit_with_hints(dtype, hint_mode, N):
-    """16-bit rows route to the register kernel only when hints are usable."""
+def test_regrow_16bit_with_hints(dtype, hint_mode, N, monkeypatch):
+    """16-bit rows route to the register kernel only when hints are usable
+    (and hint consumption is enabled)."""
+    monkeypatch.setenv("FLASHINFER_TOPK_USE_HINTS", "1")
     g = torch.Generator(device=_DEV)
     g.manual_seed(N + len(hint_mode))
     b, K = 32, 1024

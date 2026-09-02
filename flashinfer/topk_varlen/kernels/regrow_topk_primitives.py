@@ -55,7 +55,7 @@ from . import radix_topk_primitives as _radix_mod
 from . import sampled_topk_primitives as _sampled_mod
 from . import walkfirst_topk_primitives as _wf_mod
 from .fallback_topk_primitives import GatedExactFallback
-from .radix_topk_primitives import smem_atomic_add, warp_inclusive_sum
+from .radix_topk_primitives import smem_atomic_add, warp_inclusive_sum, warp_sum
 from .sampled_topk_primitives import GCAP
 from .walkfirst_topk_primitives import (
     WF_ROW_INTS,
@@ -193,7 +193,10 @@ class RegRowTopK(WalkFirstTopK):
         s_h256 = smem.allocate_array(cutlass.Int32, 256, byte_alignment=128)
         s_tk = smem.allocate_array(cutlass.Uint32, self.tie_cap, byte_alignment=128)
         s_ti = smem.allocate_array(cutlass.Int32, self.tie_cap, byte_alignment=128)
-        s_warp_sums = smem.allocate_array(cutlass.Int32, self.nw, byte_alignment=128)
+        # 2*nw: the hint arm publishes per-warp winner AND tie counts here
+        s_warp_sums = smem.allocate_array(
+            cutlass.Int32, 2 * self.nw, byte_alignment=128
+        )
         s_misc = smem.allocate_array(cutlass.Int32, 16, byte_alignment=128)
         s_count = smem.allocate_array(cutlass.Int32, 32, byte_alignment=128)
         # tie_select's smem scratch (>= 512 ints): the histogram is dead by then
@@ -265,7 +268,8 @@ class RegRowTopK(WalkFirstTopK):
             # contribute ~0 = all-ones complement... i.e. key 0xFFFFFFFF, which
             # never lowers the minimum
             nkmax = cutlass.Uint32(0)
-            if has_hints == 1:
+            hint_arm = cutlass.const_expr(getattr(self, "rg_hint_arm", False))
+            if cutlass.const_expr(hint_arm) and has_hints == 1:
                 for i in range(tidx, top_k, self.nt):
                     hi = hint_row[i]
                     ok = cutlass.Int32(1)
@@ -287,46 +291,49 @@ class RegRowTopK(WalkFirstTopK):
                     s_warp_sums[warp] = nkmax.bitcast(cutlass.Int32)
             cute.arch.barrier()  # B0: zeros (+ hint partials) visible
             solved = cutlass.Int32(0)
-            if has_hints == 1:
+            if cutlass.const_expr(hint_arm) and has_hints == 1:
                 bar = ~warp_max_u32(cutlass.Uint32(s_warp_sums[lane]))  # min key
                 if bar != cutlass.Uint32(0xFFFFFFFF):  # at least one usable hint
+                    # COUNT FIRST, EMIT ONLY IF THE BAR VERIFIES.  The former
+                    # arm emitted winners and staged ties while counting; with
+                    # a stale hint the bar sits deep (thousands of "winners"),
+                    # all of that work was thrown away and the census ran
+                    # anyway: a 90%-overlap hint measured 9.3us vs 6.2 hintless
+                    # at 16K b=64.  Now the verdict costs one register pass +
+                    # one warp redux + one barrier; the emit pass re-derives
+                    # the same masks from registers (no reloads).
                     win = cutlass.Int32(0)
+                    ntie = cutlass.Int32(0)
                     for u in cutlass.range_constexpr(vpt):
                         vi = tidx + cutlass.Int32(u * self.nt)
                         valid = cutlass.Int32(vi < n4)
                         for j in cutlass.range_constexpr(4):
                             for h in cutlass.range_constexpr(epw):
-                                bits = self._wf_elem_bits(w[4 * u + j], h)
-                                kx = self.exact_key(bits)
+                                kx = self.exact_key(self._wf_elem_bits(w[4 * u + j], h))
                                 win = win | (
                                     (cutlass.Int32(kx > bar) & valid)
                                     << cutlass.Int32(u * self.vec_elems + j * epw + h)
                                 )
-                                if valid == 1:
-                                    if kx == bar:
-                                        t = smem_atomic_add(s_count + 4, 1)
-                                        if t < self.tie_cap:
-                                            s_tk[t] = kx
-                                            s_ti[t] = (
-                                                vi << cutlass.Int32(lg)
-                                            ) + cutlass.Int32(j * epw + h)
-                    self._rg_emit_winners(win, s_count, out_idx_row, tidx, lane, lg)
+                                ntie = ntie + (cutlass.Int32(kx == bar) & valid)
+                    nwin = cutlass.Int32(cute.arch.popc(win))
                     for i in range(tail0 + tidx, length, self.nt):
-                        bits = self.load_scalar(row_in, i)
-                        kx = self.exact_key(bits)
-                        if kx > bar:
-                            p = smem_atomic_add(s_count, 1)
-                            if p < top_k:
-                                out_idx_row[p] = cutlass.Int32(i)
-                        else:
-                            if kx == bar:
-                                t = smem_atomic_add(s_count + 4, 1)
-                                if t < self.tie_cap:
-                                    s_tk[t] = kx
-                                    s_ti[t] = cutlass.Int32(i)
-                    cute.arch.barrier()  # H1: counts final
-                    above = s_count[0]
-                    nb = s_count[4]
+                        kx = self.exact_key(self.load_scalar(row_in, i))
+                        nwin = nwin + cutlass.Int32(kx > bar)
+                        ntie = ntie + cutlass.Int32(kx == bar)
+                    nwin = warp_sum(nwin)
+                    ntie = warp_sum(ntie)
+                    if lane == 0:
+                        s_warp_sums[warp] = nwin
+                        s_warp_sums[cutlass.Int32(self.nt // 32) + warp] = ntie
+                    cute.arch.barrier()  # H1: per-warp counts visible
+                    nw_h = cutlass.const_expr(self.nt // 32)
+                    above = cutlass.Int32(0)
+                    nb = cutlass.Int32(0)
+                    if lane < nw_h:
+                        above = s_warp_sums[lane]
+                        nb = s_warp_sums[nw_h + lane]
+                    above = warp_sum(above)
+                    nb = warp_sum(nb)
                     ok = cutlass.Int32(1)
                     if above > cutlass.Int32(top_k):
                         ok = cutlass.Int32(0)  # bar too low: stale hints
@@ -335,6 +342,37 @@ class RegRowTopK(WalkFirstTopK):
                     if nb > self.tie_cap:
                         ok = cutlass.Int32(0)
                     if ok == 1:
+                        # emit pass: winners by warp-aggregated tickets, ties
+                        # staged for the exact sub-select
+                        self._rg_emit_winners(win, s_count, out_idx_row, tidx, lane, lg)
+                        for u in cutlass.range_constexpr(vpt):
+                            vi = tidx + cutlass.Int32(u * self.nt)
+                            if vi < n4:
+                                for j in cutlass.range_constexpr(4):
+                                    for h in cutlass.range_constexpr(epw):
+                                        kx = self.exact_key(
+                                            self._wf_elem_bits(w[4 * u + j], h)
+                                        )
+                                        if kx == bar:
+                                            t = smem_atomic_add(s_count + 4, 1)
+                                            if t < self.tie_cap:
+                                                s_tk[t] = kx
+                                                s_ti[t] = (
+                                                    vi << cutlass.Int32(lg)
+                                                ) + cutlass.Int32(j * epw + h)
+                        for i in range(tail0 + tidx, length, self.nt):
+                            kx = self.exact_key(self.load_scalar(row_in, i))
+                            if kx > bar:
+                                p = smem_atomic_add(s_count, 1)
+                                if p < top_k:
+                                    out_idx_row[p] = cutlass.Int32(i)
+                            else:
+                                if kx == bar:
+                                    t = smem_atomic_add(s_count + 4, 1)
+                                    if t < self.tie_cap:
+                                        s_tk[t] = kx
+                                        s_ti[t] = cutlass.Int32(i)
+                        cute.arch.barrier()  # H2: emit + tie stage complete
                         self._rg_finish(
                             above,
                             nb,
@@ -350,17 +388,9 @@ class RegRowTopK(WalkFirstTopK):
                             tidx,
                         )
                         solved = cutlass.Int32(1)
-                    else:
-                        # reset cursors for the census arm.  The barrier is
-                        # REQUIRED: every thread read above/nb from s_count after
-                        # H1, and thread 0 must not zero them until all reads are
-                        # done (a late reader would branch on 0 -> divergent
-                        # barrier counts).  The census's B1 orders the zeros
-                        # before its own cursor atomics.
-                        cute.arch.barrier()
-                        if tidx == 0:
-                            s_count[0] = cutlass.Int32(0)
-                            s_count[4] = cutlass.Int32(0)
+                    # verification failed: the cursors (s_count[0], s_count[4])
+                    # were never touched, so the census arm starts clean with
+                    # no reset and no extra barrier
 
             ok = cutlass.Int32(1)
             if solved == 0:
@@ -562,7 +592,11 @@ def get_regrow_kernel(top_k: int, N: int, dtype=None):
         torch.cuda.get_device_capability()[0] >= 9
         and os.environ.get("FLASHINFER_TOPK_WF_PDL") != "0"
     )
-    key = (top_k, N, dt_tag, use_pdl)
+    # The hint arm is compiled in only when hints are consumed at all
+    # (FLASHINFER_TOPK_USE_HINTS=1): compiled-but-idle, its gathers/counts
+    # still cost registers on the census path (16K b=64 measured +3%).
+    hint_arm = os.environ.get("FLASHINFER_TOPK_USE_HINTS") == "1"
+    key = (top_k, N, dt_tag, use_pdl, hint_arm)
     if key in _compiled:
         return _compiled[key]
     from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
@@ -589,6 +623,7 @@ def get_regrow_kernel(top_k: int, N: int, dtype=None):
     kern.wf_cluster = False
     kern.wf_force_retry = False
     kern.wf_hint_rung = False
+    kern.rg_hint_arm = hint_arm
     kern.wf_small_n = 0
     kern.lcap = 8192
     sym_rows = cute.sym_int()
@@ -618,7 +653,7 @@ def get_regrow_kernel(top_k: int, N: int, dtype=None):
 
     compiled = build_and_load_cute_dsl_kernel(
         "regrow_topk_primitives",
-        f"regrow_v2d_{dt_tag}_k{top_k}_N{N}{'_pdl' if use_pdl else ''}",
+        f"regrow_v2d_{dt_tag}_k{top_k}_N{N}{'_pdl' if use_pdl else ''}{'_hints' if hint_arm else ''}",
         _compile_fn,
         extra_key_files=(
             __file__,
