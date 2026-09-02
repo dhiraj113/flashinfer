@@ -927,7 +927,21 @@ def _prim_get_group_config(
         return 1, 0
     want = math.ceil(N / slot)
     ideal = num_sms // max(num_rows, 1)
-    if ideal < min(8, want):
+    # Long rows (>= 1 MB): a single CTA streams a 4 MB row at ~20 GB/s, so any
+    # one-wave split wins even below the 8-CTA gate measured for 64K rows
+    # (B200 fp32 1M b=64: 196 -> 118us at cpg=2, b=32: 192 -> 67us at cpg=4;
+    # Rubin 1M b=64: 178 -> 85us at cpg=3; 256K b=64: 44 -> 34us).
+    long_row = N * torch.tensor([], dtype=torch_dtype).element_size() >= (1 << 20)
+    _force = os.environ.get("FLASHINFER_TOPK_PRIM_CPG")
+    if _force:
+        # experimentation override: CTAs per row (must fit one wave: the group
+        # barrier spins), chunk = ceil(N / cpg) vector-aligned
+        cpg = int(_force)
+        if cpg <= 1:
+            return 1, 0
+        chunk = ((math.ceil(N / cpg) + ve - 1) // ve) * ve
+        return max(1, math.ceil(N / chunk)), chunk
+    if ideal < min(8, want) and not (long_row and ideal >= 2):
         return 1, 0
     ctas_per_group = min(ideal, want)
     chunk = math.ceil(N / ctas_per_group)
