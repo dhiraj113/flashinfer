@@ -24,7 +24,9 @@
 # The Cake selective-state, Mamba, and warp-decode CUDA/host trees, along with
 # frozen KDA fallback sources, are byte-faithful generated exports; their
 # SHA-256 digests are checked by JIT manifests and must not be rewritten.
-exclude: ^(?:csrc/(?:blackwell_msa/|cake_all_gather_matmul/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|fused_moe/warp_decode/generated/|kda/training_(?:fallback|grouped_row_wg8)_pointer_sm_(?:100a|103a)\.cu)|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/swapab_cutedsl_megakernel)/src/)
+# csrc/sglang_dsv4/sgl_kernel/ is vendored verbatim from sglang (benchmark
+# reference backend for top_k_varlen) and must stay diffable against upstream.
+exclude: ^(?:csrc/(?:blackwell_msa/|cake_all_gather_matmul/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|fused_moe/warp_decode/generated/|kda/training_(?:fallback|grouped_row_wg8)_pointer_sm_(?:100a|103a)\.cu|sglang_dsv4/sgl_kernel/)|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/swapab_cutedsl_megakernel)/src/)
 
 repos:
   # Standard hooks

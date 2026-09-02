@@ -17,6 +17,7 @@ from .config import GvrTopKConfig, GvrTopKLBConfig
 from .gvr_topk_decode import GvrTopKKernel
 from .gvr_topk_decode_lb import GvrTopKLBKernel, GvrTopKLBPrepareKernel
 from .radix_topk import SinglePassMultiCTARadixTopKKernel
+from .radix_topk_primitives import CoarseHistTopKPrimitivesKernel
 
 __all__ = [
     "GvrTopKConfig",
@@ -25,4 +26,5 @@ __all__ = [
     "GvrTopKLBKernel",
     "GvrTopKLBPrepareKernel",
     "SinglePassMultiCTARadixTopKKernel",
+    "CoarseHistTopKPrimitivesKernel",
 ]
