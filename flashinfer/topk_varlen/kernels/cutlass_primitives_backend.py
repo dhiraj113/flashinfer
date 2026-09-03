@@ -23,6 +23,7 @@ stale hints measured slower than none in every form tried.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -40,6 +41,14 @@ from ..cutlass_primitives.topk.kernels import register_resident as REG
 from ..cutlass_primitives.topk.kernels import streaming as STR
 
 WORKSPACE_KEY = "cutlass_primitives_workspace"
+
+
+@functools.cache
+def _cached_choose(device: torch.device, dtype: torch.dtype, k: int, n: int, rows: int):
+    """The router's (kernel, configuration) for a problem, memoized: the eligibility check and
+    the launch both ask, on every call, and the answer is a pure function of these arguments."""
+    return choose(device_facts(device), dtype, k, n, rows)
+
 
 _CUTLASS_DTYPES = {
     torch.float32: cutlass.Float32,
@@ -60,28 +69,24 @@ def cutlass_primitives_supported(
     return_values: bool,
 ) -> bool:
     """Eligibility: fp32/fp16/bf16 2-D logits in any layout (aligned rows and paged arenas are
-    read in place, anything else is copied once into a padded arena), k up to 8192 where the
-    part's shared memory holds the tie stage, any ``next_n`` dividing the row count and any
-    ``compress_ratio``, values on request, SM80 or newer."""
+    read in place, anything else is copied once into a padded arena), any k (rows shorter than
+    k are padded; k beyond the tie stages takes the radix refine, a wider split or the exact
+    select), any ``next_n`` dividing the row count and any ``compress_ratio``, values on
+    request, SM80 or newer."""
     if logits.dim() != 2 or logits.dtype not in _CUTLASS_DTYPES:
         return False
-    if top_k > 8192 or next_n < 1 or compress_ratio < 1 or logits.shape[0] % next_n:
+    if top_k < 1 or next_n < 1 or compress_ratio < 1 or logits.shape[0] % next_n:
         return False
     if torch.cuda.get_device_capability(logits.device)[0] < 8:
         return False
-    if top_k > 4096:
-        # the tie stage grows with k; whether it fits the part's shared memory is the
-        # configuration's call (99 KB parts hold k up to 4096 on long rows)
-        try:
-            choose(
-                device_facts(logits.device),
-                logits.dtype,
-                top_k,
-                logits.shape[1],
-                logits.shape[0],
-            )
-        except ValueError:
-            return False
+    if logits.shape[0] == 0:
+        return True
+    try:  # the router declines only what no configuration on this part can hold
+        _cached_choose(
+            logits.device, logits.dtype, top_k, logits.shape[1], logits.shape[0]
+        )
+    except ValueError:
+        return False
     return True
 
 
@@ -228,7 +233,7 @@ def cutlass_primitives_workspace_bytes(logits: torch.Tensor, top_k: int) -> int:
     rows, n = logits.shape
     if rows == 0:
         return 0
-    kind, config = choose(device_facts(logits.device), logits.dtype, top_k, n, rows)
+    kind, config = _cached_choose(logits.device, logits.dtype, top_k, n, rows)
     return workspace_layout(kind, config, rows, arena_bytes(logits)).total_bytes
 
 
@@ -278,7 +283,7 @@ def run_cutlass_primitives(
         out_values = torch.empty(rows, top_k, dtype=logits.dtype, device=logits.device)
     if rows == 0:
         return out_indices, (out_values if return_values else None)
-    kind, config = choose(device_facts(logits.device), logits.dtype, top_k, n, rows)
+    kind, config = _cached_choose(logits.device, logits.dtype, top_k, n, rows)
     words = {
         "register": REG.STATUS_WORDS,
         "register_cluster": RCL.STATUS_WORDS,

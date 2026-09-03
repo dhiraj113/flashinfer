@@ -2724,7 +2724,7 @@ def top_k_varlen(
                               rows up to 16K, the streaming kernel with
                               cluster or slab merges above, an exact
                               fallback; its own router picks the kernel.
-                              fp32/fp16/bf16, k <= 8192, any 2-D layout,
+                              fp32/fp16/bf16, any k, any 2-D layout,
                               SM80+; ``next_n``, ``compress_ratio`` and
                               ``return_values`` supported; hints ignored;
                               optional caller-owned memory through

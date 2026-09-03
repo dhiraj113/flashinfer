@@ -2655,23 +2655,73 @@ def test_cutlass_primitives_unaligned_row_length(N, dtype):
 @pytest.mark.skipif(
     not _cutlass_primitives_available(), reason="cutlass_primitives needs CUDA SM80+"
 )
-@pytest.mark.parametrize("top_k", [5000, 8192])
-@pytest.mark.parametrize("N", [16384, 65536, 262144])
-def test_cutlass_primitives_large_k(top_k, N):
-    """k above 4096 where the part's shared memory holds the 8K tie stage."""
-    batch = 6
-    logits, seq_lens = _make_varlen_inputs([N] * batch, N, torch.float32, seed=47)
+@pytest.mark.parametrize(
+    "top_k, N, dtype",
+    [
+        (5000, 16384, torch.float32),
+        (8192, 65536, torch.float32),
+        (8192, 262144, torch.float32),
+        (
+            16384,
+            32768,
+            torch.float32,
+        ),  # register kernel beyond its tie stage: radix refine
+        (20000, 32768, torch.bfloat16),
+        (65535, 65536, torch.float32),  # k = N - 1
+        (16384, 16384, torch.float32),  # k = N: every row is the identity
+        (12000, 262144, torch.float32),  # streaming: stage grown or split widened
+        (65536, 262144, torch.float32),
+        (
+            200000,
+            1 << 20,
+            torch.float32,
+        ),  # wide slab split, or the exact select on 99 KB parts
+        (
+            900000,
+            1 << 20,
+            torch.bfloat16,
+        ),  # nothing holds it: the exact select for every row
+    ],
+    ids=[
+        "5000",
+        "8192_64k",
+        "8192_256k",
+        "reg16k",
+        "reg20k_bf16",
+        "n_minus_1",
+        "k_eq_n",
+        "str12k",
+        "str64k",
+        "1M_200k",
+        "1M_900k_bf16",
+    ],
+)
+def test_cutlass_primitives_large_k(top_k, N, dtype):
+    """Any k up to and including N is eligible: exact on full rows, padded on rows shorter
+    than k, with values."""
+    batch = 4
+    logits, seq_lens = _make_varlen_inputs([N] * batch, N, dtype, seed=47)
     from flashinfer.topk_varlen.topk_varlen import (
         _cutlass_primitives_top_k_varlen_check,
     )
 
-    if not _cutlass_primitives_top_k_varlen_check(logits, seq_lens, top_k):
-        pytest.skip("the tie stage for this k does not fit this part's shared memory")
-    indices, _ = flashinfer.top_k_varlen(
-        logits, seq_lens, top_k, backend="cutlass_primitives"
+    assert _cutlass_primitives_top_k_varlen_check(logits, seq_lens, top_k)
+    indices, values = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, backend="cutlass_primitives", return_values=True
     )
     torch.cuda.synchronize()
     _check_correct(indices, logits, seq_lens, top_k, require_all_checked=True)
+    for row in range(batch):
+        assert torch.equal(logits[row][indices[row].long()], values[row]), f"row={row}"
+    seq_lens[0] = top_k // 2  # a row shorter than k pads with -1 / -inf
+    indices, values = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, backend="cutlass_primitives", return_values=True
+    )
+    torch.cuda.synchronize()
+    _check_correct(indices, logits, seq_lens, top_k)
+    valid = top_k // 2
+    assert (indices[0, valid:] == -1).all() and torch.isneginf(values[0, valid:]).all()
+    assert torch.equal(logits[0][indices[0, :valid].long()], values[0, :valid])
 
 
 # ---------------------------------------------------------------------------

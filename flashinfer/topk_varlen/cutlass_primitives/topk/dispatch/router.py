@@ -50,7 +50,7 @@ def _cluster_kernel_wins(facts, dtype: torch.dtype, k: int, n: int, rows: int) -
     # the device's cluster cap is about the streaming kernel's long DSMEM merges; this kernel
     # merges 256 group sums and a few fine bins, and its 8-CTA form beat the alternatives even
     # on consumer Blackwell (RTX 5080 128K b=8: 11.2 us vs 12.4 streaming, 12.0 walk-first)
-    if not facts.supports_clusters or k > 8192:
+    if not facts.supports_clusters:
         return False
     if n <= SLICE_ELEMENTS or n > 8 * SLICE_ELEMENTS:
         return False
@@ -72,12 +72,14 @@ def choose(
 ) -> tuple[str, RegisterConfig | RegisterClusterConfig | StreamingConfig]:
     """(kernel name, configuration) for a batch of ``rows`` rows of ``n`` elements.
 
-    Raises ``ValueError`` when no configuration fits the device (a tie stage for a large k
-    that the part's shared memory does not hold), so callers can decline the problem up front.
+    Any k: the register kernels refine an overflowing crossing bin by the radix select over
+    its key range, the streaming kernel widens its stage or its split for k beyond the tie
+    stage, and a k that nothing holds (or k >= N) takes the exact select for every row.
+    Raises ``ValueError`` when no configuration fits the device, so callers can decline up front.
     """
     per_word = 1 if dtype == torch.float32 else 2
     config: RegisterConfig | RegisterClusterConfig | StreamingConfig
-    if n <= REGISTER_MAX_ROW * per_word and k <= 8192:
+    if n <= REGISTER_MAX_ROW * per_word and k < n:
         kernel, config = "register", register_config_for(facts, dtype, k, n, rows)
     elif _cluster_kernel_wins(facts, dtype, k, n, rows):
         kernel, config = (

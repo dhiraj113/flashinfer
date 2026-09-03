@@ -53,6 +53,9 @@ _DTYPES = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
 }
+EXACT_ONLY = (
+    1 << 30
+)  # a short_cutoff no row length reaches: every row takes the exact select
 STATUS_WORDS = 12  # per row: [0] sampled path failed, [1] arm (0 identity, 1 census, 2 sampled, 3 radix), [2] survivors, [3..7] phase clocks, [8..11] slab-merge sub-phase clocks
 
 
@@ -81,11 +84,17 @@ class StreamingConfig:
     # epilogue
     ballot_limit: int = 128
     # scheduling
-    short_cutoff: int = 16384  # rows at or below take the radix select directly
+    short_cutoff: int = 16384  # rows at or below take the exact select directly; EXACT_ONLY: every row does
     pdl: bool = False
     packed_compare: bool = False  # 16-bit rows: setp.le.{f16x2,bf16x2} classify
     # instrumentation
     telemetry: bool = False
+
+    @property
+    def exact_only(self) -> bool:
+        """Every row takes the exact select (census, then the radix select by key range): the
+        configuration for a k that no stage x splits holds.  One CTA per row, no sample."""
+        return self.short_cutoff >= EXACT_ONLY
 
     def validate(self, k: int, elems: Elements, shared_memory_limit: int) -> None:
         if self.threads not in (256, 512, 1024):
@@ -110,7 +119,9 @@ class StreamingConfig:
             raise ValueError(
                 "the slab merge's scratch needs a stage of at least max(768, 256 x splits)"
             )
-        if k >= 3 * self.stage * self.splits // 4:
+        if self.exact_only and self.splits != 1:
+            raise ValueError("the exact-only configuration runs one CTA per row")
+        if k >= 3 * self.stage * self.splits // 4 and not self.exact_only:
             raise ValueError(
                 f"stage {self.stage} x {self.splits} too small for k={k}: k must sit below 3/4 of it (the balanced aim needs room on both sides)"
             )
@@ -124,9 +135,11 @@ class StreamingConfig:
             raise ValueError(
                 f"slab splits must be one of 1, 2, 4, 8, 16, 32, got {self.splits}"
             )
-        if self.tie_capacity < max(2 * self.threads, k):
+        # the tie stage need not hold k: a crossing bin wider than it sends the row to the exact
+        # select (census, then the radix select by key range), which is exact for any k
+        if self.tie_capacity < 2 * self.threads:
             raise ValueError(
-                f"tie_capacity must be at least max(2 * threads, k) = {max(2 * self.threads, k)}"
+                f"tie_capacity must be at least 2 * threads = {2 * self.threads}"
             )
         if self.tie_capacity > 8 * self.threads or self.tie_capacity % self.threads:
             raise ValueError(
