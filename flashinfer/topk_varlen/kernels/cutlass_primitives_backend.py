@@ -10,7 +10,9 @@ kernels and their router; this file owns everything FlashInfer-specific:
 * the small per-call buffers (status words, slab workspace) FlashInfer callers never see.
 
 Routing is the library's: rows that fit a CTA's registers take the register-resident kernel,
-longer rows the streaming kernel with the cluster or slab merge chosen from the device facts.
+rows up to eight register slices in batches that fit one wave of clusters take its clustered
+form, and longer rows the streaming kernel with the cluster or slab merge chosen from the
+device facts.
 Hints (``pre_idx``) are accepted and ignored; the library's design keeps hints off because
 stale hints measured slower than none in every form tried.
 """
@@ -27,6 +29,7 @@ import torch
 
 from ..cutlass_primitives.dispatch.device import device_facts
 from ..cutlass_primitives.topk.dispatch.router import choose
+from ..cutlass_primitives.topk.kernels import register_cluster as RCL
 from ..cutlass_primitives.topk.kernels import register_resident as REG
 from ..cutlass_primitives.topk.kernels import streaming as STR
 
@@ -96,6 +99,15 @@ def _compiled_kernel(
             _fake(i32, (rows, k), 16),
             _fake(i32, (rows, REG.STATUS_WORDS), 16),
         )
+    elif kind == "register_cluster":
+        assert isinstance(config, RCL.RegisterClusterConfig)
+        kern = RCL.RegisterClusterTopK(cdt, k, config, facts.shared_memory_optin)
+        fakes = (
+            _fake(cdt, (rows, n), 16),
+            _fake(i32, (rows,)),
+            _fake(i32, (rows, k), 16),
+            _fake(i32, (rows, RCL.STATUS_WORDS), 16),
+        )
     else:
         assert isinstance(config, STR.StreamingConfig)
         kern = STR.StreamingTopK(cdt, k, config, facts.shared_memory_optin)
@@ -154,12 +166,13 @@ def run_cutlass_primitives(
         return out_indices, None
     kind, config = choose(device_facts(logits.device), logits.dtype, top_k, n, rows)
     compiled = _compiled_kernel(kind, logits.dtype, top_k, n, config, logits.device)
-    if kind == "register":
+    if kind in ("register", "register_cluster"):
+        words = REG.STATUS_WORDS if kind == "register" else RCL.STATUS_WORDS
         compiled(
             logits,
             seq_lens,
             out_indices,
-            _status_buffer(rows, REG.STATUS_WORDS, logits.device),
+            _status_buffer(rows, words, logits.device),
         )
     else:
         assert isinstance(config, STR.StreamingConfig)

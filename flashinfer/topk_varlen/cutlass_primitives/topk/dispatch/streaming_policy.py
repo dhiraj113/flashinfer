@@ -22,8 +22,10 @@ Rules, each with its measurement:
   slices are shorter; measured on B200 1M b=8: cluster 8 15.7 us, slab 16 13.8; b=1: cluster 8
   15.6, slab 32 12.2; 256K b=8: cluster 6 10.3, slab 16 10.1.  The slab form cannot re-walk
   an undershoot, so it takes the wide aim.
-* Row splits, slab merge, parts without clusters: the largest of 16/8/4/2 CTAs per row that
-  keeps the grid within one wave and slices of at least 4096 elements.  Two waves of half
+* Row splits, slab merge, parts without clusters: the largest of 8/4/2 CTAs per row that
+  keeps the grid within one wave and slices of at least 4096 elements.  Cluster shapes are
+  capped by the device fact ``max_fast_cluster`` (4 on consumer Blackwell, where clusters of 6
+  and 8 measured far slower than the slab; 8 on the data-center parts).  Two waves of half
   rows cost more than one wave of whole rows (A100 64K b=64: 2 CTAs per row 38.5 us against
   one CTA 23.3).  Exception from FlashInfer's A100 measurements: rows of 4 MB or more in
   batches up to 64 split four ways even into a second wave, because one CTA streams a 4 MB row
@@ -59,12 +61,13 @@ def splits_for(
     if n < 16384 or rows >= facts.sm_count:
         return 1, "cluster"
     row_bytes = n * elem_bytes
-    # long rows in small batches: wide slab splits beat the widest cluster
+    # long rows in small batches: wide slab splits beat the widest cluster (B200 1M b=8: slab
+    # 16 13.8 us, cluster 8 15.7; RTX 5080 1M b=8: slab 8 23.7, cluster 8 45.6)
     if row_bytes >= BIG_ROW_BYTES:
-        for s in (32, 16) if row_bytes >= 4 * BIG_ROW_BYTES else (16,):
+        for s in (32, 16, 8) if row_bytes >= 4 * BIG_ROW_BYTES else (16, 8):
             if n // s >= MIN_SLICE and rows * s <= facts.sm_count:
                 return s, "slab"
-    if facts.supports_clusters:
+    if facts.max_fast_cluster >= 2:
         shapes: tuple
         if row_bytes >= 4 * BIG_ROW_BYTES:
             shapes = (8, 6, 4, 3, 2)
@@ -73,7 +76,11 @@ def splits_for(
         else:
             shapes = (4, 2)
         for s in shapes:
-            if n // s >= MIN_SLICE and rows <= max_active_clusters(facts.index, s):
+            if (
+                s <= facts.max_fast_cluster
+                and n // s >= MIN_SLICE
+                and rows <= max_active_clusters(facts.index, s)
+            ):
                 return s, "cluster"
         return 1, "cluster"
     for s in (8, 4, 2):
