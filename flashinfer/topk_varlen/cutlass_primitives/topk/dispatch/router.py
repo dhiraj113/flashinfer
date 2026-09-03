@@ -82,16 +82,29 @@ def topk(
     k: int,
     lengths: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    values: torch.Tensor | None = None,
+    next_n: int = 1,
+    compress_ratio: int = 1,
 ) -> torch.Tensor:
     """Indices of the k largest elements of each row of ``x`` (rows, N), int32 (rows, k).
 
-    ``lengths`` (rows, int32) limits each row to its first elements; rows shorter than k are
-    padded with -1.  NaN ranks above +inf.  Order within a row is unspecified.
+    ``lengths`` (rows // next_n, int32) limits each row to its first elements: row r sees
+    ``(lengths[r // next_n] - next_n + r % next_n + 1) // compress_ratio`` of them (both default
+    to 1: ``lengths[r]``).  Rows shorter than k are padded with -1.  NaN ranks above +inf.
+    Order within a row is unspecified.  ``values`` (rows, k, x's dtype), when given, receives
+    the selected elements (-inf in padding).
     """
     rows, n = x.shape
     kernel, config = choose(device_facts(x.device), x.dtype, k, n, rows)
+    extra = {
+        "lengths": lengths,
+        "out": out,
+        "values": values,
+        "next_n": next_n,
+        "compress_ratio": compress_ratio,
+    }
     if isinstance(config, RegisterConfig):
-        return topk_register(x, k, lengths=lengths, config=config, out=out)
+        return topk_register(x, k, config=config, **extra)
     if isinstance(config, RegisterClusterConfig):
-        return topk_register_cluster(x, k, lengths=lengths, config=config, out=out)
-    return topk_streaming(x, k, lengths=lengths, config=config, out=out)
+        return topk_register_cluster(x, k, config=config, **extra)
+    return topk_streaming(x, k, config=config, **extra)

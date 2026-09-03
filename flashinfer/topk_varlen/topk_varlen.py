@@ -2070,8 +2070,9 @@ def _cutlass_primitives_top_k_varlen_check(
     approx_ties=False,
 ):
     """The vendored cutlass_primitives library (one backend, its own router):
-    fp32/fp16/bf16, indices only, k <= 4096, row stride a multiple of 16
-    bytes, SM80+.  Hints are accepted and ignored."""
+    fp32/fp16/bf16, k <= 4096, row stride a multiple of 16 bytes, SM80+;
+    ``next_n``, ``compress_ratio`` and ``return_values`` supported.  Hints are
+    accepted and ignored."""
     if not _CUTE_DSL_AVAILABLE or not isinstance(logits, torch.Tensor):
         return False
     from .kernels.cutlass_primitives_backend import cutlass_primitives_supported
@@ -2085,12 +2086,26 @@ def _run_cutlass_primitives(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
     top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_values: bool,
     out_indices: torch.Tensor,
+    out_values: Optional[torch.Tensor],
     pre_idx: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, None]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     from .kernels.cutlass_primitives_backend import run_cutlass_primitives
 
-    return run_cutlass_primitives(logits, seq_lens, top_k, out_indices, pre_idx)
+    return run_cutlass_primitives(
+        logits,
+        seq_lens,
+        top_k,
+        next_n,
+        compress_ratio,
+        return_values,
+        out_indices,
+        out_values,
+        pre_idx,
+    )
 
 
 def _run_walkfirst_primitives(
@@ -2707,7 +2722,9 @@ def top_k_varlen(
                               cluster or slab merges above, an exact
                               fallback; its own router picks the kernel.
                               fp32/fp16/bf16, k <= 4096, row stride a
-                              multiple of 16 bytes, SM80+; hints ignored.
+                              multiple of 16 bytes, SM80+; ``next_n``,
+                              ``compress_ratio`` and ``return_values``
+                              supported; hints ignored.
         ``"sampled_primitives"`` — self-sampling pivot bracket (GVR2-style,
                               no ``pre_idx``); fastest available on
                               duplicate/flood-heavy rows.  ``max_seq_len``
@@ -3032,7 +3049,15 @@ def top_k_varlen(
         )
     elif backend == "cutlass_primitives":
         out_i, out_v = _run_cutlass_primitives(
-            logits, seq_lens, top_k, out_indices, pre_idx
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
+            pre_idx,
         )
     elif backend == "sglang":
         out_i, out_v = _run_sglang(

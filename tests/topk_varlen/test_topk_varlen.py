@@ -2498,3 +2498,87 @@ def test_cuda_graph_cutlass_primitives():
     g.replay()
     torch.cuda.synchronize()
     _check_correct(out, logits, seq_lens, top_k, require_all_checked=True)
+
+
+@pytest.mark.skipif(
+    not _cutlass_primitives_available(), reason="cutlass_primitives needs CUDA SM80+"
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("top_k", [512, 1024])
+@pytest.mark.parametrize("next_n", [2, 3])
+@pytest.mark.parametrize("N", [8192, 65536])
+def test_cutlass_primitives_next_n(dtype, top_k, next_n, N):
+    """next_n rows share one seq_len entry; row i of a group sees i % next_n more tokens."""
+    num_rows = 8 * next_n
+    logits, _, seq_lens = _make_inputs(
+        num_rows, N, top_k, dtype, seed=41, next_n=next_n
+    )
+    indices, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, next_n=next_n, backend="cutlass_primitives"
+    )
+    torch.cuda.synchronize()
+    _check_correct(
+        indices, logits, seq_lens, top_k, next_n=next_n, require_all_checked=True
+    )
+
+
+@pytest.mark.skipif(
+    not _cutlass_primitives_available(), reason="cutlass_primitives needs CUDA SM80+"
+)
+@pytest.mark.parametrize("cr", [2, 4])
+@pytest.mark.parametrize("N", [8192, 65536, 262144])
+def test_cutlass_primitives_compress_ratio(cr, N):
+    """compress_ratio divides the token length into compressed-block units."""
+    dtype, top_k, batch_size = torch.bfloat16, 512, 6
+    logits, _, _ = _make_inputs(batch_size, N, top_k, dtype, seed=43, compress_ratio=cr)
+    # ragged token lengths, all long enough for a full top-k in block units
+    g = torch.Generator(device="cuda").manual_seed(43)
+    seq_lens = torch.randint(
+        (top_k + 1) * cr, N * cr + 1, (batch_size,), device="cuda", generator=g
+    ).to(torch.int32)
+    indices, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, compress_ratio=cr, backend="cutlass_primitives"
+    )
+    torch.cuda.synchronize()
+    _check_correct(
+        indices, logits, seq_lens, top_k, compress_ratio=cr, require_all_checked=True
+    )
+
+
+@pytest.mark.skipif(
+    not _cutlass_primitives_available(), reason="cutlass_primitives needs CUDA SM80+"
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("N, batch", [(8192, 8), (65536, 8), (262144, 16)])
+def test_cutlass_primitives_return_values(dtype, N, batch):
+    """values equal logits[row, indices] exactly; padding slots carry -inf values."""
+    top_k = 1024
+    logits, seq_lens = _make_varlen_inputs([N] * batch, N, dtype, seed=45)
+    seq_lens[0] = top_k // 2  # a padded row
+    indices, values = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, backend="cutlass_primitives", return_values=True
+    )
+    torch.cuda.synchronize()
+    assert values.shape == (batch, top_k) and values.dtype == dtype
+    _check_correct(indices, logits, seq_lens, top_k)
+    for row in range(batch):
+        valid = min(top_k, int(seq_lens[row]))
+        expected = logits[row][indices[row, :valid].long()]
+        assert torch.equal(expected, values[row, :valid]), f"row={row}: values differ"
+        assert torch.isneginf(values[row, valid:]).all(), f"row={row}: padding values"
+    # preallocated outputs are written in place
+    out_i = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    out_v = torch.empty(batch, top_k, dtype=dtype, device="cuda")
+    ri, rv = flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        top_k,
+        backend="cutlass_primitives",
+        return_values=True,
+        out_indices=out_i,
+        out_values=out_v,
+    )
+    torch.cuda.synchronize()
+    assert ri.data_ptr() == out_i.data_ptr() and rv.data_ptr() == out_v.data_ptr()
+    # order within a row is unspecified: compare the rows as sorted multisets
+    assert torch.equal(rv.float().sort(dim=1).values, values.float().sort(dim=1).values)
