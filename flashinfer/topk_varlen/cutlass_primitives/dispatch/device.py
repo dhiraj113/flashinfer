@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import torch
 
-__all__ = ["DeviceFacts", "device_facts", "max_active_clusters"]
+__all__ = ["DeviceFacts", "device_facts", "max_active_clusters", "cluster_capacity"]
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ class DeviceFacts:
     shared_memory_optin: int  # bytes per block with the opt-in attribute
     supports_clusters: bool  # thread-block clusters and DSMEM (SM90+)
     max_fast_cluster: int  # largest cluster whose DSMEM merge beats the slab merge here (0: none; see _facts)
+    cheap_small_clusters: bool  # a small cluster costs little over one CTA (see _facts)
     supports_pdl: bool  # programmatic dependent launch (SM90+)
     packed_bf16_compare: bool  # setp.le.bf16x2 (SM90+); fp16x2 is available everywhere
 
@@ -44,6 +45,11 @@ def _facts(index: int) -> DeviceFacts:
         # 16.5 vs 12.7; 1M b=8: 45.6 vs 23.7).  The data-center parts (SM90, SM100, SM107) win
         # with clusters up to 8.
         max_fast_cluster=0 if cc[0] < 9 else (4 if cc[0] == 12 else 8),
+        # Whether a 4-CTA cluster over a 64K fp32 row beats one CTA streaming it: measured with
+        # the clustered register kernel against the streaming kernel at b=8.  Rubin 6.25 vs 6.42
+        # us (k=1024), 5.86 vs 6.18 (k=512); RTX 5080 8.94 vs 11.0, 8.14 vs 10.6.  H100 loses
+        # 13.7 vs 12.5, 13.0 vs 12.4; B200 8.28 vs 7.87 at k=1024 and ties at k=512.
+        cheap_small_clusters=cc[0] >= 9 and cc not in ((9, 0), (10, 0), (10, 3)),
         supports_pdl=cc[0] >= 9,
         packed_bf16_compare=cc[0] >= 9,
     )
@@ -70,3 +76,23 @@ def max_active_clusters(index: int, cluster_size: int) -> int:
         return int(HardwareInfo(index).get_max_active_clusters(cluster_size))
     except Exception:  # noqa: BLE001 - the query is an optimization, never a requirement
         return (facts.sm_count // cluster_size) * 7 // 8
+
+
+def cluster_capacity(index: int, cluster_size: int) -> int:
+    """Clusters of ``cluster_size`` CTAs that run in one wave, as measured rather than as queried.
+
+    The driver's query is exact for clusters of 8 (a batch one row past it doubles the time:
+    B200 15 -> 16 rows 17.1 -> 30.6 us, Rubin 22 -> 24 13.9 -> 27.8, H100 14 -> 16 35.2 ->
+    60.4) but pessimistic for small clusters: H100 runs 66 pairs where it says 57 (64 rows 95.7
+    us, 70 rows 179), Rubin 66 triples where it says 60 (66 rows 38.8, 69 rows 63.4), B200 45
+    triples where it says 42 (45 rows 41.5, 47 rows 72.0).  Small clusters pack up to
+    ``SMs // size`` less a few, so the capacity for sizes up to 4 is the larger of the query and
+    ``SMs // size - 5``; the 5 is the tightest measured loss (H100 triples: 39 rows 67.4 us,
+    40 rows 108.3, where SMs // 3 is 44).  Every other measured boundary sits at or above the
+    formula (B200 quads 33-34 of 37 // formula 32; Rubin quads > 50 of 52; Rubin pairs > 104
+    of 104; RTX 5080 pairs > 42 of 42, triples > 26 of 28, quads > 19 of 21).
+    """
+    queried = max_active_clusters(index, cluster_size)
+    if cluster_size > 4:
+        return queried
+    return max(queried, _facts(index).sm_count // cluster_size - 5)
