@@ -25,6 +25,9 @@ class DeviceFacts:
     supports_clusters: bool  # thread-block clusters and DSMEM (SM90+)
     max_fast_cluster: int  # largest cluster whose DSMEM merge beats the slab merge here (0: none; see _facts)
     cheap_small_clusters: bool  # a small cluster costs little over one CTA (see _facts)
+    filter_unroll: (
+        int  # 16-byte vectors per thread in flight per filter iteration (see _facts)
+    )
     supports_pdl: bool  # programmatic dependent launch (SM90+)
     packed_bf16_compare: bool  # setp.le.bf16x2 (SM90+); fp16x2 is available everywhere
 
@@ -50,6 +53,15 @@ def _facts(index: int) -> DeviceFacts:
         # us (k=1024), 5.86 vs 6.18 (k=512); RTX 5080 8.94 vs 11.0, 8.14 vs 10.6.  H100 loses
         # 13.7 vs 12.5, 13.0 vs 12.4; B200 8.28 vs 7.87 at k=1024 and ties at k=512.
         cheap_small_clusters=cc[0] >= 9 and cc not in ((9, 0), (10, 0), (10, 3)),
+        # The filter pass is bound by bytes in flight, not issue: eight vectors per thread per
+        # iteration (128 B) beat four on H100 (64K b=132 k=2048 27.2 -> 25.0 us; unroll 2:
+        # 34.9), B200 (64K b=256 k=1024 17.3 -> 15.3, 1M b=148 k=2048 110.6 -> 105.7, 1M b=8
+        # 12.0 -> 11.5) and Rubin (64K b=208 k=512 8.70 -> 8.38, 64K b=256 k=1024 13.2 ->
+        # 11.8, 1M b=8 9.39 -> 9.03), and lost on L40S (64K b=142 k=512 25.9 -> 28.1, 64K
+        # b=256 k=1024 43.8 -> 50.7) and the RTX 5080 (256K b=64 59.1 -> 63.3); on the A100
+        # it loses at 1024 threads (64K b=108 21.5 -> 23.7) and wins at 512 (64K b=256 k=1024
+        # 89.5 -> 86.2, ragged k=2048 100 -> 87), which the streaming policy special-cases.
+        filter_unroll=8 if cc[0] in (9, 10) else 4,
         supports_pdl=cc[0] >= 9,
         packed_bf16_compare=cc[0] >= 9,
     )

@@ -70,16 +70,13 @@ def aim_tight(
     aim = cutlass.Int32(k) + margin
     if rows >= cutlass.Int32(32):
         per_sample = length.to(cutlass.Float32) / cutlass.Float32(samples)
-        margin_f = (aim - cutlass.Int32(k)).to(cutlass.Float32)
-        variance = aim.to(cutlass.Float32) * per_sample
-        if margin_f * margin_f < cutlass.Float32(6.25) * variance:  # below 2.5 sigma
-            zq = cutlass.Float32(3.5) * cmath.sqrt(per_sample)
-            root = (
-                zq + cmath.sqrt(zq * zq + cutlass.Float32(4.0 * k))
-            ) * cutlass.Float32(0.5)
-            floor = (root * root).to(cutlass.Int32) + cutlass.Int32(1)
-            if floor > aim:
-                aim = floor
+        zq = cutlass.Float32(3.5) * cmath.sqrt(per_sample)
+        root = (zq + cmath.sqrt(zq * zq + cutlass.Float32(4.0 * k))) * cutlass.Float32(
+            0.5
+        )
+        floor = (root * root).to(cutlass.Int32) + cutlass.Int32(1)
+        if floor > aim:
+            aim = floor
     return _capped(aim, k, cap, length, samples)
 
 

@@ -95,13 +95,21 @@ class StreamingConfig:
             raise ValueError(f"unknown aim policy {self.aim!r}")
         if self.sample_vectors not in (1, 2, 4):
             raise ValueError("sample_vectors must be 1, 2 or 4")
-        if self.stage < 4096 or self.stage % 256:
+        if self.stage < 2048 or self.stage % 256:
             raise ValueError(
-                "stage must be a multiple of 256 and at least 4096 (the census histogram aliases it)"
+                "stage must be a multiple of 256 and at least 2048 (the census histogram aliases both stage halves)"
             )
-        if k + (k >> 1) > 3 * self.stage * self.splits // 4:
+        if (
+            self.merge == "slab"
+            and self.splits > 1
+            and self.stage < max(768, 256 * self.splits)
+        ):
             raise ValueError(
-                f"stage {self.stage} x {self.splits} too small for k={k}: the tight aim must fit in 3/4 of it"
+                "the slab merge's scratch needs a stage of at least max(768, 256 x splits)"
+            )
+        if k >= 3 * self.stage * self.splits // 4:
+            raise ValueError(
+                f"stage {self.stage} x {self.splits} too small for k={k}: k must sit below 3/4 of it (the balanced aim needs room on both sides)"
             )
         if self.merge not in ("cluster", "slab"):
             raise ValueError(f"unknown merge {self.merge!r}")
@@ -171,8 +179,8 @@ class StreamingTopK:
     ):
         """The exact path for one whole row (census, then the radix select over the rank-k
         bin's key range if it overflowed the tie stage; with ``check_constant`` a range pass
-        first).  ``s_scratch``: at least 4096 Int32 (the dead stage).  Returns the arm taken
-        (1 census, 3 radix) for the status word."""
+        first).  ``s_scratch``: at least 4096 Int32 (the dead stage, both halves).  Returns the
+        arm taken (1 census, 3 radix) for the status word."""
         cfg = self.config
         return exact_select_row(
             self.elems,
@@ -223,8 +231,13 @@ class StreamingTopK:
         telemetry = cutlass.const_expr(cfg.telemetry)
 
         smem = SmemAllocator()
-        s_keys = smem.allocate_array(cutlass.Int32, cfg.stage + 4, byte_alignment=128)
-        s_idx = smem.allocate_array(cutlass.Int32, cfg.stage + 4, byte_alignment=128)
+        # one allocation for both stage halves: the exact fallback's 4096-bin census and the
+        # slab merge's scratch alias the dead stage from s_keys and may run into s_idx
+        s_stage = smem.allocate_array(
+            cutlass.Int32, 2 * (cfg.stage + 4), byte_alignment=128
+        )
+        s_keys = s_stage
+        s_idx = s_stage + (cfg.stage + 4)
         s_hist = smem.allocate_array(cutlass.Int32, 256, byte_alignment=128)
         s_merged = smem.allocate_array(cutlass.Int32, 256, byte_alignment=128)
         s_tie_keys = smem.allocate_array(
