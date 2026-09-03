@@ -2171,3 +2171,127 @@ def test_cuda_graph_radix_primitives():
     g.replay()
     torch.cuda.synchronize()
     _check_correct(out_i, logits, seq_lens, top_k, require_all_checked=True)
+
+
+# ---------------------------------------------------------------------------
+# cutlass_primitives: the vendored library as one backend
+# ---------------------------------------------------------------------------
+
+
+def _cutlass_primitives_available():
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+
+
+@pytest.mark.skipif(
+    not _cutlass_primitives_available(), reason="cutlass_primitives needs CUDA SM80+"
+)
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["f32", "bf16", "f16"]
+)
+@pytest.mark.parametrize(
+    "N,batch,top_k",
+    [
+        (4096, 256, 512),
+        (16384, 64, 1024),
+        (16384, 8, 2048),
+        (65536, 8, 512),
+        (65536, 148, 1024),
+        (65536, 256, 2048),
+        (262144, 64, 1024),
+        (1048576, 8, 1024),
+    ],
+)
+def test_cutlass_primitives_exact(N, batch, top_k, dtype):
+    """Value multiset equals torch.topk on every row, full and ragged lengths; every kernel
+    the library's router can pick is covered by the (N, batch) grid."""
+    torch.manual_seed(N // 1024 + batch)
+    logits = (torch.randn(batch, N, device="cuda") * 2.0).to(dtype).contiguous()
+    for seq_lens in (
+        torch.full((batch,), N, dtype=torch.int32, device="cuda"),
+        torch.randint(top_k + 1, N + 1, (batch,), dtype=torch.int32, device="cuda"),
+    ):
+        out = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+        flashinfer.top_k_varlen(
+            logits, seq_lens, top_k, out_indices=out, backend="cutlass_primitives"
+        )
+        torch.cuda.synchronize()
+        _check_correct(out, logits, seq_lens, top_k, require_all_checked=True)
+
+
+@pytest.mark.skipif(
+    not _cutlass_primitives_available(), reason="cutlass_primitives needs CUDA SM80+"
+)
+@pytest.mark.parametrize("kind", ["constant", "two_values", "short_rows"])
+def test_cutlass_primitives_degenerate_rows(kind):
+    """Low-entropy rows take the exact fallback; rows shorter than k pad with -1."""
+    batch, N, top_k = 16, 65536, 1024
+    if kind == "constant":
+        logits = torch.full((batch, N), 0.5, device="cuda")
+    elif kind == "two_values":
+        logits = torch.where(torch.rand(batch, N, device="cuda") < 0.001, 3.0, -1.0)
+    else:
+        logits = torch.randn(batch, N, device="cuda")
+    seq_lens = torch.full((batch,), N, dtype=torch.int32, device="cuda")
+    if kind == "short_rows":
+        seq_lens = torch.tensor(
+            [0, 1, 100, 1023, 1024, 1025, 4096, 16384] * 2,
+            dtype=torch.int32,
+            device="cuda",
+        )
+    out = torch.full((batch, top_k), -7, dtype=torch.int32, device="cuda")
+    flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, out_indices=out, backend="cutlass_primitives"
+    )
+    torch.cuda.synchronize()
+    for r in range(batch):
+        n_eff = int(seq_lens[r])
+        valid = min(n_eff, top_k)
+        assert (out[r, valid:] == -1).all(), f"row {r}: padding"
+        idx = out[r, :valid].long()
+        assert (
+            idx.numel() == torch.unique(idx).numel()
+            and bool((idx >= 0).all())
+            and bool((idx < n_eff).all())
+        )
+        if valid == top_k:
+            got = logits[r, idx].sort(descending=True).values
+            ref = torch.topk(logits[r, :n_eff], top_k).values
+            assert torch.equal(got, ref), f"row {r}: values differ"
+
+
+@pytest.mark.skipif(
+    not _cutlass_primitives_available(), reason="cutlass_primitives needs CUDA SM80+"
+)
+def test_cuda_graph_cutlass_primitives():
+    """Capture and replay: the library launches on the caller's stream through the TVM-FFI
+    environment stream, so it must capture like any other backend."""
+    batch, N, top_k = 64, 65536, 1024
+    logits = (torch.randn(batch, N, device="cuda") * 2.0).contiguous()
+    seq_lens = torch.randint(
+        top_k + 1, N + 1, (batch,), dtype=torch.int32, device="cuda"
+    )
+    out = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+
+    def call():
+        flashinfer.top_k_varlen(
+            logits, seq_lens, top_k, out_indices=out, backend="cutlass_primitives"
+        )
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            call()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+    g.replay()
+    torch.cuda.synchronize()
+    _check_correct(out, logits, seq_lens, top_k, require_all_checked=True)
+    logits.copy_((torch.randn(batch, N, device="cuda") * 3.0))
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    _check_correct(out, logits, seq_lens, top_k, require_all_checked=True)

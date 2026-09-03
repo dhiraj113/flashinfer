@@ -1,0 +1,462 @@
+"""Kernel 2, clustered register-resident top-k: one row across a cluster of CTAs (16K to 128K).
+
+Kernel 1 with the row split into slices that each fit a CTA's registers.  Every CTA loads its
+slice once, counts its coarse histogram, and after one cluster barrier every CTA merges all
+peers' histograms over DSMEM (redundantly, so the crossing needs no broadcast).  Each CTA then
+classifies its own slice from registers; winners go straight to the output and ties to rank
+0's tie stage, at positions reserved with one remote atomic per CTA.  After a second cluster
+barrier rank 0 selects the ties.  This is gvr_2's reg_clus family: a batch with SMs to spare
+gives each row a cluster's worth of registers and reads the row exactly once.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, fields
+
+import cutlass
+import cutlass.cute as cute
+import torch
+from cutlass.cute.runtime import from_dlpack
+
+try:
+    from cutlass.memory.smem import SmemAllocator
+except ImportError:  # pragma: no cover
+    from cutlass.utils.smem_allocator import SmemAllocator
+try:
+    from cuda.bindings import driver as cuda_driver
+except ImportError:  # pragma: no cover
+    from cuda import cuda as cuda_driver
+
+from ...device.cluster import (
+    cluster_rank,
+    cluster_sync,
+    peer_max_u32,
+    peer_min_u32,
+    peer_shared_address,
+)
+from ...device.launch import release_dependent_grid, wait_for_prior_grid
+from ...device.timers import read_clock64
+
+from ..phases.census import COARSE_BINS
+from ..phases.cluster_crossing import cluster_crossing, summarize_groups_256
+from ..phases.elements import Elements
+from ..phases.fallback import radix_select_in_range
+from ..phases.register_row import (
+    classify_from_registers_cluster,
+    count_coarse_bins,
+    key_range_in_bin,
+    load_row_words,
+)
+from ..phases.resolve import _select_ties
+
+__all__ = [
+    "RegisterClusterConfig",
+    "RegisterClusterTopK",
+    "topk_register_cluster",
+    "register_cluster_config_for",
+    "STATUS_WORDS",
+]
+
+_DTYPES = {
+    torch.float32: cutlass.Float32,
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+}
+STATUS_WORDS = 8  # [0] fallback taken, [1] arm (0 identity, 2 cluster, 3 radix), [2] ties, [3..6] phase clocks
+
+
+@dataclass(frozen=True)
+class RegisterClusterConfig:
+    threads: int = 1024
+    words_per_thread: int = 16
+    splits: int = 2  # CTAs per row: 2, 4 or 8
+    bins: int = 4096
+    tie_capacity: int = 2048
+    ballot_limit: int = 128
+    pdl: bool = False
+    telemetry: bool = False
+
+    def slice_capacity(self, elems: Elements) -> int:
+        return self.threads * self.words_per_thread * elems.per_word
+
+    @property
+    def bin_shift(self) -> int:
+        """Right shift from a census bin (4096) to this histogram's bin."""
+        return {1024: 2, 2048: 1, 4096: 0}[self.bins]
+
+    def validate(self, k: int, elems: Elements, shared_memory_limit: int) -> None:
+        if self.threads not in (256, 512, 1024) or self.words_per_thread not in (
+            4,
+            8,
+            16,
+        ):
+            raise ValueError("threads must be 256/512/1024 and words_per_thread 4/8/16")
+        if self.splits not in (2, 4, 8):
+            raise ValueError(f"splits must be 2, 4 or 8, got {self.splits}")
+        if self.bins not in (1024, 2048, 4096):
+            raise ValueError(f"bins must be 1024, 2048 or 4096, got {self.bins}")
+        if self.threads < 256:
+            raise ValueError(
+                "the two-level cluster crossing needs at least 256 threads"
+            )
+        if (
+            self.tie_capacity < max(2 * self.threads, k)
+            or self.tie_capacity > 4 * self.threads
+        ):
+            raise ValueError(
+                "tie_capacity must be in [max(2 * threads, k), 4 * threads]"
+            )
+        if self.shared_memory_bytes() > shared_memory_limit:
+            raise ValueError(
+                f"{self.shared_memory_bytes()} B exceeds the {shared_memory_limit} B budget"
+            )
+
+    def shared_memory_bytes(self) -> int:
+        b = max(self.bins, COARSE_BINS) + 4
+        return (
+            b * 4
+            + (256 + 256 + 16) * 4
+            + 2 * self.tie_capacity * 4
+            + (self.threads // 32 + 32) * 4
+            + 512
+        )
+
+    def name(self) -> str:
+        return "_".join(f"{f.name}{getattr(self, f.name)}" for f in fields(self))
+
+
+class RegisterClusterTopK:
+    def __init__(
+        self, dtype, k: int, config: RegisterClusterConfig, shared_memory_limit: int
+    ):
+        self.elems = Elements.of(dtype)
+        self.k = k
+        self.config = config
+        config.validate(k, self.elems, shared_memory_limit)
+        self.threads = config.threads
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        lengths: cute.Tensor,
+        out: cute.Tensor,
+        status: cute.Tensor,
+    ):
+        cfg = self.config
+        elems = self.elems
+        threads = cutlass.const_expr(self.threads)
+        words = cutlass.const_expr(cfg.words_per_thread)
+        bins = cutlass.const_expr(cfg.bins)
+        splits = cutlass.const_expr(cfg.splits)
+        k = cutlass.const_expr(self.k)
+        n_cols = cutlass.const_expr(x.shape[1])
+        telemetry = cutlass.const_expr(cfg.telemetry)
+        tidx, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        rank = cluster_rank()
+
+        smem = SmemAllocator()
+        s_bins_all = smem.allocate_array(
+            cutlass.Int32, max(bins, COARSE_BINS) + 4, byte_alignment=128
+        )
+        s_bins = s_bins_all + 4  # slot -1 takes out-of-range elements
+        s_groups = smem.allocate_array(cutlass.Int32, 256, byte_alignment=128)
+        s_merged_groups = smem.allocate_array(cutlass.Int32, 256, byte_alignment=128)
+        s_fine = smem.allocate_array(cutlass.Int32, 16, byte_alignment=128)
+        s_tie_keys = smem.allocate_array(
+            cutlass.Uint32, cfg.tie_capacity, byte_alignment=128
+        )
+        s_tie_idx = smem.allocate_array(
+            cutlass.Int32, cfg.tie_capacity, byte_alignment=128
+        )
+        s_slots = smem.allocate_array(cutlass.Int32, threads // 32, byte_alignment=128)
+        s_slots_u32 = smem.allocate_array(
+            cutlass.Uint32, 2 * (threads // 32), byte_alignment=128
+        )
+        s_result = smem.allocate_array(cutlass.Int32, 16, byte_alignment=128)
+
+        if cutlass.const_expr(cfg.pdl):
+            wait_for_prior_grid()
+        mark = cutlass.Int64(0)
+        if telemetry:
+            mark = read_clock64()
+        length = lengths[row]
+        if length < 0:
+            length = cutlass.Int32(0)
+        if length > cutlass.Int32(n_cols):
+            length = cutlass.Int32(n_cols)
+        row_ptr = x.iterator + cutlass.Int64(row) * n_cols
+        out_row = out.iterator + cutlass.Int64(row) * k
+        status_row = status.iterator + cutlass.Int64(row) * STATUS_WORDS
+
+        # the direct arm is rank 0's alone; no cluster barrier or DSMEM access happens on it
+        if cutlass.Int32(k) >= length:
+            if rank == 0:
+                for i in range(tidx, k, threads):
+                    v = cutlass.Int32(-1)
+                    if i < length:
+                        v = cutlass.Int32(i)
+                    out_row[i] = v
+                if tidx == 0:
+                    status_row[0] = cutlass.Int32(0)
+                    status_row[1] = cutlass.Int32(0)
+        else:
+            # this CTA's slice: equal vector-aligned chunks, the last one shorter or empty
+            chunk = (
+                (length + cutlass.Int32(splits - 1)) // cutlass.Int32(splits)
+                + cutlass.Int32(elems.per_vector - 1)
+            ) & ~cutlass.Int32(elems.per_vector - 1)
+            start = rank * chunk
+            count = length - start
+            if count > chunk:
+                count = chunk
+            if count < 0:
+                count = cutlass.Int32(0)
+            for i in range(tidx, bins + 4, threads):
+                s_bins_all[i] = cutlass.Int32(0)
+            if tidx == 0:
+                s_result[8] = cutlass.Int32(0)  # winner cursor (rank 0's is the row's)
+                s_result[9] = cutlass.Int32(0)  # tie cursor
+                s_result[12] = cutlass.Int32(
+                    -1
+                )  # key range of the crossing bin: min (0xFFFFFFFF) ...
+                s_result[13] = cutlass.Int32(0)  # ... and max, folded in by every CTA
+            cute.arch.barrier()
+            load_len = count
+            if load_len < 1:
+                load_len = cutlass.Int32(
+                    1
+                )  # an empty slice loads one vector and masks everything
+            wordvals = load_row_words(
+                row_ptr + start, load_len, tidx, threads, words, elems.log2_per_vector
+            )
+            packed_bins = count_coarse_bins(
+                elems, wordvals, count, s_bins, tidx, threads, words, bins
+            )
+            cute.arch.barrier()
+            summarize_groups_256(s_bins, s_groups, bins, tidx)
+            cluster_sync()  # every CTA's histogram and group sums are complete
+            if telemetry:
+                if tidx == 0:
+                    status_row[3] = (read_clock64() - mark).to(cutlass.Int32)
+                mark = read_clock64()
+            cluster_crossing(
+                s_bins,
+                s_groups,
+                s_merged_groups,
+                s_fine,
+                s_result,
+                k,
+                bins,
+                splits,
+                tidx,
+            )
+            cut_bin = s_result[0]
+            above = s_result[1]
+            overflow = cutlass.Int32(
+                s_result[2] > cutlass.Int32(cfg.tie_capacity)
+            )  # cluster-uniform
+            if telemetry:
+                if tidx == 0:
+                    status_row[4] = (read_clock64() - mark).to(cutlass.Int32)
+                mark = read_clock64()
+            root = cutlass.Int32(0)
+            classify_from_registers_cluster(
+                elems,
+                wordvals,
+                packed_bins,
+                cut_bin,
+                start,
+                out_row,
+                peer_shared_address(s_tie_keys.toint(), root),
+                peer_shared_address(s_tie_idx.toint(), root),
+                peer_shared_address((s_result + 8).toint(), root),
+                cfg.tie_capacity,
+                s_slots,
+                s_result + 10,
+                tidx,
+                threads,
+                words,
+            )
+            if overflow == 1:
+                # the bin will not fit rank 0's tie stage: fold this slice's key range in the
+                # bin into rank 0's before the barrier, after which peers may exit
+                kmin, kmax = key_range_in_bin(
+                    elems,
+                    wordvals,
+                    packed_bins,
+                    cut_bin,
+                    s_slots_u32,
+                    tidx,
+                    threads,
+                    words,
+                )
+                if tidx == 0:
+                    peer_min_u32(
+                        peer_shared_address((s_result + 12).toint(), root), kmin
+                    )
+                    peer_max_u32(
+                        peer_shared_address((s_result + 13).toint(), root), kmax
+                    )
+            cluster_sync()  # winners written, ties (or ranges) landed on rank 0; peers stop touching rank 0
+            if telemetry:
+                if tidx == 0:
+                    status_row[5] = (read_clock64() - mark).to(cutlass.Int32)
+                mark = read_clock64()
+            if rank == 0:
+                ties = s_result[9]
+                ok = _select_ties(
+                    elems,
+                    k,
+                    above,
+                    ties,
+                    out_row,
+                    s_bins,
+                    s_tie_keys,
+                    s_tie_idx,
+                    cfg.tie_capacity,
+                    cfg.ballot_limit,
+                    s_slots,
+                    s_result,
+                    tidx,
+                    threads,
+                )
+                arm = cutlass.Int32(2)
+                if ok == 0:
+                    # the crossing bin overflowed the tie stage; everything above it is already in
+                    # the output, so rank 0 runs the exact select on that bin over the whole row,
+                    # by the key range merged from every slice
+                    kmin_row = cutlass.Uint32(s_result[12])
+                    kmax_row = cutlass.Uint32(s_result[13])
+                    cute.arch.barrier()
+                    radix_select_in_range(
+                        elems,
+                        row_ptr,
+                        length,
+                        cutlass.Int32(k) - above,
+                        out_row + above,
+                        kmin_row,
+                        kmax_row,
+                        s_bins,
+                        s_slots,
+                        s_result,
+                        tidx,
+                        threads,
+                    )
+                    arm = cutlass.Int32(3)
+                if telemetry:
+                    if tidx == 0:
+                        status_row[6] = (read_clock64() - mark).to(cutlass.Int32)
+                if tidx == 0:
+                    status_row[0] = cutlass.Int32(1) - ok
+                    status_row[1] = arm
+                    status_row[2] = ties
+        if cutlass.const_expr(cfg.pdl):
+            release_dependent_grid()
+
+    @cute.jit
+    def launch(
+        self,
+        x: cute.Tensor,
+        lengths: cute.Tensor,
+        out: cute.Tensor,
+        status: cute.Tensor,
+        stream: cuda_driver.CUstream,
+    ):
+        splits = self.config.splits
+        self.kernel(x, lengths, out, status).launch(
+            grid=(x.shape[0], splits, 1),
+            block=(self.threads, 1, 1),
+            cluster=(1, splits, 1),
+            use_pdl=self.config.pdl,
+            stream=stream,
+        )
+
+
+_compiled: dict = {}
+
+
+SLICE_ELEMENTS = (
+    16384  # per CTA: 16 elements per thread; the per-element work sets the CTA's time
+)
+
+
+def register_cluster_config_for(
+    facts, dtype: torch.dtype, k: int, n: int
+) -> RegisterClusterConfig:
+    """The smallest cluster (2, 4, 8) whose slices hold at most 16K elements per CTA (16 words
+    per thread for fp32, 8 for 16-bit: a 32-element slice per thread measured 12.0 us against
+    8.9 for the streaming kernel at bf16 64K b=8); N / 4 bins."""
+    per_word = 1 if dtype == torch.float32 else 2
+    for splits in (2, 4, 8):
+        if n <= splits * SLICE_ELEMENTS:
+            break
+    else:
+        raise ValueError(
+            f"row length {n} exceeds the clustered register capacity {8 * SLICE_ELEMENTS}"
+        )
+    bins = 1024
+    while bins < 4096 and bins * 4 < n:
+        bins *= 2
+    return RegisterClusterConfig(
+        words_per_thread=16 // per_word,
+        splits=splits,
+        bins=bins,
+        tie_capacity=max(2048, k),
+        pdl=facts.supports_pdl,
+    )
+
+
+def topk_register_cluster(
+    x: torch.Tensor,
+    k: int,
+    lengths: torch.Tensor | None = None,
+    config: RegisterClusterConfig | None = None,
+    out: torch.Tensor | None = None,
+    status: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Indices of the k largest of each row of ``x`` (rows, N <= 128K), same contract as
+    ``topk_streaming``.  Needs SM90 or newer (clusters)."""
+    from ...dispatch.device import device_facts
+
+    assert x.dim() == 2 and x.is_cuda and x.is_contiguous() and x.dtype in _DTYPES
+    rows, n = x.shape
+    if (n * x.element_size()) % 16:
+        raise ValueError(
+            f"row stride must be a multiple of 16 bytes (N={n}, {x.dtype})"
+        )
+    facts = device_facts(x.device)
+    if not facts.supports_clusters:
+        raise ValueError(
+            "the clustered register kernel needs thread-block clusters (SM90+)"
+        )
+    if config is None:
+        config = register_cluster_config_for(facts, x.dtype, k, n)
+    elems = Elements.of(_DTYPES[x.dtype])
+    if n > config.splits * config.slice_capacity(elems):
+        raise ValueError(
+            f"row length {n} exceeds this configuration's capacity {config.splits * config.slice_capacity(elems)}"
+        )
+    if lengths is None:
+        lengths = torch.full((rows,), n, device=x.device, dtype=torch.int32)
+    if out is None:
+        out = torch.empty(rows, k, device=x.device, dtype=torch.int32)
+    if status is None:
+        status = torch.empty(rows * STATUS_WORDS, device=x.device, dtype=torch.int32)
+    key = (x.dtype, k, rows, n, config, facts.capability)
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
+    args = (
+        from_dlpack(x),
+        from_dlpack(lengths),
+        from_dlpack(out),
+        from_dlpack(status),
+        stream,
+    )
+    if key not in _compiled:
+        kern = RegisterClusterTopK(
+            _DTYPES[x.dtype], k, config, facts.shared_memory_optin
+        )
+        _compiled[key] = cute.compile(kern.launch, *args)
+    _compiled[key](*args)
+    return out

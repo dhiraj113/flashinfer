@@ -1966,6 +1966,46 @@ def _walkfirst_primitives_top_k_varlen_check(
 _HYBRID_ANCHOR_READY: set = set()
 
 
+@supported_compute_capability(_AMPERE_PLUS_CCS)
+def _cutlass_primitives_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+    approx_ties=False,
+):
+    """The vendored cutlass_primitives library (one backend, its own router):
+    fp32/fp16/bf16, indices only, k <= 4096, row stride a multiple of 16
+    bytes, SM80+.  Hints are accepted and ignored."""
+    if not _CUTE_DSL_AVAILABLE or not isinstance(logits, torch.Tensor):
+        return False
+    from .kernels.cutlass_primitives_backend import cutlass_primitives_supported
+
+    return cutlass_primitives_supported(
+        logits, top_k, next_n, compress_ratio, return_values
+    )
+
+
+def _run_cutlass_primitives(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    out_indices: torch.Tensor,
+    pre_idx: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, None]:
+    from .kernels.cutlass_primitives_backend import run_cutlass_primitives
+
+    return run_cutlass_primitives(logits, seq_lens, top_k, out_indices, pre_idx)
+
+
 def _run_walkfirst_primitives(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2388,6 +2428,7 @@ def _run_stacked_primitives(
         "sampled_primitives": _sampled_primitives_top_k_varlen_check,
         "hint_primitives": _hint_primitives_top_k_varlen_check,
         "stacked_primitives": _stacked_primitives_top_k_varlen_check,
+        "cutlass_primitives": _cutlass_primitives_top_k_varlen_check,
     },
     heuristic_func=_top_k_varlen_heuristic,
 )
@@ -2414,6 +2455,7 @@ def top_k_varlen(
         "sampled_primitives",
         "hint_primitives",
         "stacked_primitives",
+        "cutlass_primitives",
         "auto",
     ] = "auto",
     load_balance: bool = True,
@@ -2541,6 +2583,14 @@ def top_k_varlen(
                               (fused walk-first ladder) with row-splitting
                               at any k and the exact fallback; hintless.
                               ``max_seq_len`` multiple of 4.
+        ``"cutlass_primitives"`` — the vendored cutlass-primitives library
+                              (``topk_varlen/cutlass_primitives/``, see its
+                              VENDORED.md): register-resident kernels for
+                              rows up to 16K, the streaming kernel with
+                              cluster or slab merges above, an exact
+                              fallback; its own router picks the kernel.
+                              fp32/fp16/bf16, k <= 4096, row stride a
+                              multiple of 16 bytes, SM80+; hints ignored.
         ``"sampled_primitives"`` — self-sampling pivot bracket (GVR2-style,
                               no ``pre_idx``); fastest available on
                               duplicate/flood-heavy rows.  ``max_seq_len``
@@ -2761,6 +2811,10 @@ def top_k_varlen(
     elif backend == "stacked_primitives":
         out_i, out_v = _run_stacked_primitives(
             logits, pre_idx, seq_lens, top_k, out_indices
+        )
+    elif backend == "cutlass_primitives":
+        out_i, out_v = _run_cutlass_primitives(
+            logits, seq_lens, top_k, out_indices, pre_idx
         )
     elif backend == "sglang":
         out_i, out_v = _run_sglang(
