@@ -662,18 +662,20 @@ _slabs: dict = {}
 
 
 def _slab_workspace(device, rows: int, config: StreamingConfig):
-    """Per-(device, rows, splits, stage) slab and zeroed arrival counters, kept alive so the
-    counters' self-reset carries from one launch to the next."""
-    key: tuple
+    """Per-(device, stream, rows, splits, stage) slab and zeroed arrival counters, kept alive so
+    the counters' self-reset carries from one launch to the next.  Keyed by the current stream
+    because launches on one stream are ordered and launches on two are not: two streams running
+    the same shape at once would otherwise count each other's arrivals and merge each other's
+    slab segments (see ``dispatch/workspace.py``)."""
     if config.merge != "slab" or config.splits == 1:
-        key = (device, "none")
-        if key not in _slabs:
-            _slabs[key] = (
-                torch.zeros(1, device=device, dtype=torch.int32),
-                torch.zeros(1, device=device, dtype=torch.int32),
-            )
-        return _slabs[key]
-    key = (device, rows, config.splits, config.stage)
+        return _placeholder_slab(device)
+    key = (
+        device,
+        torch.cuda.current_stream(device).cuda_stream,
+        rows,
+        config.splits,
+        config.stage,
+    )
     if key not in _slabs:
         words = rows * slab_words_per_row(config.splits, config.stage)
         _slabs[key] = (
@@ -681,6 +683,38 @@ def _slab_workspace(device, rows: int, config: StreamingConfig):
             torch.zeros(rows, device=device, dtype=torch.int32),
         )
     return _slabs[key]
+
+
+def _placeholder_slab(device):
+    """One-element slab and counters for configurations that do not merge through the slab; the
+    kernel never touches them, so sharing them across streams is safe."""
+    key = (device, "none")
+    if key not in _slabs:
+        _slabs[key] = (
+            torch.zeros(1, device=device, dtype=torch.int32),
+            torch.zeros(1, device=device, dtype=torch.int32),
+        )
+    return _slabs[key]
+
+
+def _caller_workspace(
+    workspace: torch.Tensor, x: torch.Tensor, rows: int, config: StreamingConfig
+):
+    """Buffers carved from a caller-owned workspace: status, slab and counters (placeholders when
+    the configuration does not merge through the slab) and the arena buffer for a copy."""
+    from ..dispatch.workspace import carve, workspace_layout
+    from .layout import arena_bytes
+
+    ws = carve(
+        workspace, workspace_layout("streaming", config, rows, arena_bytes(x)), x.device
+    )
+    if ws.slab is None:
+        slab, counters = _placeholder_slab(x.device)
+    else:
+        slab, counters = ws.slab, ws.counters
+        assert counters is not None
+        counters.zero_()  # the kernel needs zero arrivals at launch; the caller's memory holds anything
+    return ws.status, slab, counters, ws.arena
 
 
 _compiled: dict = {}
@@ -696,6 +730,7 @@ def topk_streaming(
     values: torch.Tensor | None = None,
     next_n: int = 1,
     compress_ratio: int = 1,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Indices of the k largest elements of each row of ``x`` (rows, N), as an int32 (rows, k)
     tensor.  ``lengths`` (rows // next_n, int32) limits each row to its first elements: row r
@@ -706,7 +741,10 @@ def topk_streaming(
     int32) and ``values`` (rows, k, x's dtype: the selected elements, -inf in padding) are
     written in place when given, so a caller in a hot loop allocates nothing; values are only
     produced when ``values`` is passed.  ``config`` defaults to the dispatcher's choice for the
-    device and problem.
+    device and problem.  ``workspace`` (a CUDA byte tensor of at least
+    ``dispatch.workspace.workspace_bytes(x, k)`` bytes) supplies the status words, the slab
+    merge's buffers and the arena for a misaligned copy, so the call allocates nothing; without
+    it those come from per-(device, stream, shape) caches (see ``dispatch/workspace.py``).
     """
     from ...dispatch.device import device_facts
 
@@ -715,10 +753,17 @@ def topk_streaming(
     assert x.dtype in _DTYPES
     check_layout(x)
     rows, n = x.shape
-    xa, col_offset = arena_view(x)
     facts = device_facts(x.device)
     if config is None:
         config = streaming_config_for(facts, x.dtype, k, n, rows)
+    arena = None
+    if workspace is not None:
+        ws_status, slab, counters, arena = _caller_workspace(workspace, x, rows, config)
+        if status is None:
+            status = ws_status
+    else:
+        slab, counters = _slab_workspace(x.device, rows, config)
+    xa, col_offset = arena_view(x, arena)
     if lengths is None:
         lengths = torch.full(
             (rows // next_n,), n * compress_ratio, device=x.device, dtype=torch.int32
@@ -742,7 +787,6 @@ def topk_streaming(
         values is not None,
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
-    slab, counters = _slab_workspace(x.device, rows, config)
     args = (
         from_dlpack(xa),
         from_dlpack(lengths),

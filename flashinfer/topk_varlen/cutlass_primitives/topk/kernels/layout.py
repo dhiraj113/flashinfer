@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["check_layout", "arena_view"]
+__all__ = ["check_layout", "arena_view", "arena_bytes"]
 
 ALIGN = 16
 
@@ -42,32 +42,67 @@ def _aligned(x: torch.Tensor) -> bool:
     return True
 
 
-def arena_view(x: torch.Tensor) -> tuple[torch.Tensor, int]:
+def _storage_view(x: torch.Tensor) -> tuple[torch.Tensor, int] | None:
+    """The compact ``(rows, stride)`` view over ``x``'s storage and ``x``'s column offset in it,
+    when the storage holds ``rows x stride`` elements from the row-aligned base; else None."""
+    rows = x.shape[0]
+    stride = x.stride(0)
+    base = x.storage_offset()
+    row_base = (
+        base - base % stride
+    )  # the storage element where x's first row's stride period begins
+    storage_numel = x.untyped_storage().nbytes() // x.element_size()
+    if row_base + rows * stride > storage_numel:
+        return None
+    view = torch.empty(0, dtype=x.dtype, device=x.device).set_(
+        x.untyped_storage(), row_base, (rows, stride), (stride, 1)
+    )
+    return view, base - row_base
+
+
+def _padded_stride(x: torch.Tensor) -> int:
+    """The row length rounded up to whole 16-byte vectors: the arena's row stride."""
+    per_align = ALIGN // x.element_size()
+    return -(-x.shape[1] // per_align) * per_align
+
+
+def arena_bytes(x: torch.Tensor) -> int:
+    """Bytes of the padded arena :func:`arena_view` copies ``x`` into; 0 when ``x`` is read in
+    place (aligned rows over a storage that holds the compact view)."""
+    if _aligned(x) and (x.is_contiguous() or _storage_view(x) is not None):
+        return 0
+    return x.shape[0] * _padded_stride(x) * x.element_size()
+
+
+def arena_view(
+    x: torch.Tensor, buffer: torch.Tensor | None = None
+) -> tuple[torch.Tensor, int]:
     """``(view, offset)``: the compact ``(rows, stride)`` tensor the kernels take and the column
     at which each row starts in it.  ``x`` itself with offset 0 when contiguous and aligned.
     A view over the storage is used when the storage holds ``rows x stride`` elements from the
     view's row-aligned base; otherwise, and whenever the rows are not 16-byte aligned, the rows
-    are copied into a padded arena (correct, one extra pass)."""
+    are copied into a padded arena (correct, one extra pass): a fresh allocation, or the first
+    :func:`arena_bytes` bytes of ``buffer`` (a uint8 tensor, 16-byte-aligned) when given."""
     rows, n = x.shape
     if _aligned(x):
         if x.is_contiguous():
             return x, 0
-        stride = x.stride(0)
-        base = x.storage_offset()
-        row_base = (
-            base - base % stride
-        )  # the storage element where x's first row's stride period begins
-        offset = base - row_base
-        storage_numel = x.untyped_storage().nbytes() // x.element_size()
-        if row_base + rows * stride <= storage_numel:
-            view = torch.empty(0, dtype=x.dtype, device=x.device).set_(
-                x.untyped_storage(), row_base, (rows, stride), (stride, 1)
+        found = _storage_view(x)
+        if found is not None:
+            return found
+    stride = _padded_stride(x)
+    if buffer is None:
+        arena = torch.empty(rows, stride, dtype=x.dtype, device=x.device)
+    else:
+        nbytes = rows * stride * x.element_size()
+        if (
+            buffer.dtype != torch.uint8
+            or buffer.numel() < nbytes
+            or buffer.data_ptr() % ALIGN
+        ):
+            raise ValueError(
+                f"arena buffer must be an aligned uint8 tensor of at least {nbytes} bytes"
             )
-            return view, offset
-    per_align = ALIGN // x.element_size()
-    stride = (
-        -(-n // per_align) * per_align
-    )  # the row length rounded up to whole 16-byte vectors
-    arena = torch.empty(rows, stride, dtype=x.dtype, device=x.device)
+        arena = buffer[:nbytes].view(x.dtype).view(rows, stride)
     arena[:, :n].copy_(x)
     return arena, 0
