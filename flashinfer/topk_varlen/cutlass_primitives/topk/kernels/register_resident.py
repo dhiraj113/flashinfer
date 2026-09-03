@@ -414,15 +414,18 @@ def topk_register(
     values: torch.Tensor | None = None,
     next_n: int = 1,
     compress_ratio: int = 1,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Indices of the k largest of each row of ``x`` (rows, N <= 16K), same contract as
-    ``topk_streaming``."""
+    ``topk_streaming`` (``workspace`` holds the status words and a misaligned copy's arena)."""
     from ...dispatch.device import device_facts
+
+    from ..dispatch.workspace import carve, workspace_layout
+    from .layout import arena_bytes
 
     assert x.dtype in _DTYPES
     check_layout(x)
     rows, n = x.shape
-    xa, col_offset = arena_view(x)
     facts = device_facts(x.device)
     if config is None:
         config = register_config_for(facts, x.dtype, k, n, rows)
@@ -431,6 +434,17 @@ def topk_register(
         raise ValueError(
             f"row length {n} exceeds this configuration's register capacity {capacity}"
         )
+    arena = None
+    if workspace is not None:
+        ws = carve(
+            workspace,
+            workspace_layout("register", config, rows, arena_bytes(x)),
+            x.device,
+        )
+        arena = ws.arena
+        if status is None:
+            status = ws.status
+    xa, col_offset = arena_view(x, arena)
     if lengths is None:
         lengths = torch.full(
             (rows // next_n,), n * compress_ratio, device=x.device, dtype=torch.int32
