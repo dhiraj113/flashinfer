@@ -31,6 +31,7 @@ import torch
 from ..cutlass_primitives.dispatch.device import device_facts
 from ..cutlass_primitives.topk.dispatch.router import choose
 from ..cutlass_primitives.topk.kernels import register_cluster as RCL
+from ..cutlass_primitives.topk.kernels.layout import arena_view
 from ..cutlass_primitives.topk.kernels import register_resident as REG
 from ..cutlass_primitives.topk.kernels import streaming as STR
 
@@ -52,20 +53,41 @@ def cutlass_primitives_supported(
     compress_ratio: int,
     return_values: bool,
 ) -> bool:
-    """Eligibility: fp32/fp16/bf16 2-D contiguous rows whose stride is a multiple of 16 bytes,
-    k up to 4096, any ``next_n`` dividing the row count and any ``compress_ratio``, values on
-    request, SM80 or newer."""
+    """Eligibility: fp32/fp16/bf16 2-D rows with unit inner stride, 16-byte-aligned row starts
+    and a row length that is a multiple of 16 bytes (the row stride may exceed the length:
+    paged arenas and sliced views), k up to 4096, any ``next_n`` dividing the row count and
+    any ``compress_ratio``, values on request, SM80 or newer."""
     if (
         logits.dim() != 2
-        or not logits.is_contiguous()
         or logits.dtype not in _CUTLASS_DTYPES
+        or logits.stride(1) != 1
     ):
         return False
-    if top_k > 4096 or next_n < 1 or compress_ratio < 1 or logits.shape[0] % next_n:
+    if top_k > 8192 or next_n < 1 or compress_ratio < 1 or logits.shape[0] % next_n:
         return False
-    if (logits.shape[1] * logits.element_size()) % 16:
+    esize = logits.element_size()
+    if (logits.shape[1] * esize) % 16 or logits.data_ptr() % 16:
         return False
-    return torch.cuda.get_device_capability(logits.device)[0] >= 8
+    if logits.shape[0] > 1 and (
+        (logits.stride(0) * esize) % 16 or logits.stride(0) < logits.shape[1]
+    ):
+        return False
+    if torch.cuda.get_device_capability(logits.device)[0] < 8:
+        return False
+    if top_k > 4096:
+        # the tie stage grows with k; whether it fits the part's shared memory is the
+        # configuration's call (99 KB parts hold k up to 4096 on long rows)
+        try:
+            choose(
+                device_facts(logits.device),
+                logits.dtype,
+                top_k,
+                logits.shape[1],
+                logits.shape[0],
+            )
+        except ValueError:
+            return False
+    return True
 
 
 def _fake(dt, shape, align=None):
@@ -82,20 +104,26 @@ def _compiled_kernel(
     dtype: torch.dtype,
     k: int,
     n: int,
+    stride: int,
+    col_offset: int,
     config,
     device: torch.device,
     next_n: int,
     compress_ratio: int,
     return_values: bool,
 ):
-    """The FlashInfer-cached compiled launcher for one (kernel, dtype, k, N, configuration,
-    next_n, compress_ratio, values) specialization."""
+    """The FlashInfer-cached compiled launcher for one (kernel, dtype, k, N, row stride and
+    column offset, configuration, next_n, compress_ratio, values) specialization.  The kernel
+    sees the logits as a compact (rows, stride) view and reads N columns of each row from
+    col_offset."""
     facts = device_facts(device)
     key = (
         kind,
         dtype,
         k,
         n,
+        stride,
+        col_offset,
         config,
         facts.capability,
         next_n,
@@ -110,7 +138,7 @@ def _compiled_kernel(
     rows = cute.sym_int()
     groups = cute.sym_int()  # rows // next_n length entries
     i32 = cutlass.Int32
-    varlen = (next_n, compress_ratio, return_values)
+    varlen = (next_n, compress_ratio, return_values, n, col_offset)
     # the values output, or a static one-element placeholder when none is requested (TVM-FFI
     # ties every symbolic dimension of one name together, so an unused (rows, k) would not do)
     values_fake = _fake(cdt, (rows, k), 16) if return_values else _fake(cdt, (1, 1), 16)
@@ -120,7 +148,7 @@ def _compiled_kernel(
         assert isinstance(config, REG.RegisterConfig)
         kern = REG.RegisterTopK(cdt, k, config, facts.shared_memory_optin, *varlen)
         fakes = (
-            _fake(cdt, (rows, n), 16),
+            _fake(cdt, (rows, stride), 16),
             _fake(i32, (groups,)),
             _fake(i32, (rows, k), 16),
             values_fake,
@@ -132,7 +160,7 @@ def _compiled_kernel(
             cdt, k, config, facts.shared_memory_optin, *varlen
         )
         fakes = (
-            _fake(cdt, (rows, n), 16),
+            _fake(cdt, (rows, stride), 16),
             _fake(i32, (groups,)),
             _fake(i32, (rows, k), 16),
             values_fake,
@@ -147,7 +175,7 @@ def _compiled_kernel(
         else:  # unused by the kernel: static one-element placeholders (TVM-FFI ties every `rows` dim together)
             slab_fakes = (_fake(i32, (1, 1), 16), _fake(i32, (1,)))
         fakes = (
-            _fake(cdt, (rows, n), 16),
+            _fake(cdt, (rows, stride), 16),
             _fake(i32, (groups,)),
             _fake(i32, (rows, k), 16),
             values_fake,
@@ -166,6 +194,8 @@ def _compiled_kernel(
     # artifact file name within the filesystem's limit
     config_hash = hashlib.sha1(config.name().encode()).hexdigest()[:12]
     tag = f"{kind}_{_DTYPE_TAGS[dtype]}_k{k}_N{n}_sm{facts.capability[0]}{facts.capability[1]}_{config_hash}"
+    if stride != n or col_offset:
+        tag += f"_stride{stride}_off{col_offset}"
     if next_n != 1 or compress_ratio != 1:
         tag += f"_nn{next_n}_cr{compress_ratio}"
     if return_values:
@@ -209,12 +239,17 @@ def run_cutlass_primitives(
         out_values = torch.empty(rows, top_k, dtype=logits.dtype, device=logits.device)
     if rows == 0:
         return out_indices, (out_values if return_values else None)
+    # a paged arena or sliced view: the kernel takes a compact (rows, stride) view over the
+    # storage and reads n columns of each row from col_offset (the library's layout rules)
+    arena, col_offset = arena_view(logits)
     kind, config = choose(device_facts(logits.device), logits.dtype, top_k, n, rows)
     compiled = _compiled_kernel(
         kind,
         logits.dtype,
         top_k,
         n,
+        arena.shape[1],
+        col_offset,
         config,
         logits.device,
         next_n,
@@ -227,7 +262,7 @@ def run_cutlass_primitives(
     if kind in ("register", "register_cluster"):
         words = REG.STATUS_WORDS if kind == "register" else RCL.STATUS_WORDS
         compiled(
-            logits,
+            arena,
             seq_lens,
             out_indices,
             values,
@@ -241,7 +276,7 @@ def run_cutlass_primitives(
         else:
             slab = slab.view(1, 1)  # placeholders matching the static one-element fakes
         compiled(
-            logits,
+            arena,
             seq_lens,
             out_indices,
             values,
