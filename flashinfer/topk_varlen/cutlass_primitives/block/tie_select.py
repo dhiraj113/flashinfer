@@ -7,7 +7,7 @@ keys and indices in shared memory.  Two methods, chosen by the caller from the t
 * ``tie_select_ballot`` (up to 128 ties): candidate c's rank is the number of candidates
   greater than it, where equal keys are ordered by ascending index so the order is total and
   the output deterministic.  One ballot + popcount per (warp, candidate) pair, no barrier.
-* ``tie_select_radix`` (up to ``4 * threads`` ties): byte-by-byte radix select over the
+* ``tie_select_radix`` (up to ``slots * threads`` ties, 4 slots by default): byte-by-byte radix select over the
   keys with a 256-bin histogram per round; candidates whose digit is above the crossing are
   winners, equal digits continue, the last round fills the remainder from exact-equal keys.
   Two barriers per round plus the crossing's.  Output order among exact-equal keys is
@@ -134,51 +134,36 @@ def tie_select_radix(
     tidx,
     threads: cutlass.Constexpr,
     shifts: cutlass.Constexpr,
+    slots: cutlass.Constexpr = 4,
 ):
-    """Emit the top ``remaining`` of ``n <= 4 * threads`` staged (key, index) pairs.
+    """Emit the top ``remaining`` of ``n <= slots * threads`` staged (key, index) pairs.
 
     ``shifts``: the digit positions, most significant first ((24, 16, 8, 0) for 32-bit keys,
     (8, 0) for 16-bit).  ``s_hist``: Int32 shared array of 512 entries (two 256-bin rounds
     double-buffered; dead on exit).  ``s_slots``: 8 entries; ``s_result``: 5 entries (3 for
-    the crossing, 2 counters).  Every thread holds up to four candidates in named registers
-    (``threads`` apart).  Barriers: two per round plus the crossing's two.  Ranks among
-    exact-equal keys at the boundary are assigned in atomic order; the set of chosen keys is
-    exact.  All threads must call it.
+    the crossing, 2 counters).  Every thread holds up to ``slots`` candidates in named
+    registers (``threads`` apart; 4 by default, 8 for tie stages of 8K).  Barriers: two per
+    round plus the crossing's two.  Ranks among exact-equal keys at the boundary are assigned
+    in atomic order; the set of chosen keys is exact.  All threads must call it.
     """
     rounds = cutlass.const_expr(len(shifts))
     s_counters = s_result + 3  # [3] winner slots handed out, [4] equal-key slots
-    c0 = tidx
-    c1 = tidx + threads
-    c2 = tidx + 2 * threads
-    c3 = tidx + 3 * threads
-    a0 = c0 < n
-    a1 = c1 < n
-    a2 = c2 < n
-    a3 = c3 < n
-    k0 = cutlass.Uint32(0)
-    k1 = cutlass.Uint32(0)
-    k2 = cutlass.Uint32(0)
-    k3 = cutlass.Uint32(0)
-    i0 = cutlass.Int32(0)
-    i1 = cutlass.Int32(0)
-    i2 = cutlass.Int32(0)
-    i3 = cutlass.Int32(0)
-    if a0:
-        k0 = cutlass.Uint32(s_keys[c0])
-        i0 = cutlass.Int32(s_idx[c0])
-    if a1:
-        k1 = cutlass.Uint32(s_keys[c1])
-        i1 = cutlass.Int32(s_idx[c1])
-    if a2:
-        k2 = cutlass.Uint32(s_keys[c2])
-        i2 = cutlass.Int32(s_idx[c2])
-    if a3:
-        k3 = cutlass.Uint32(s_keys[c3])
-        i3 = cutlass.Int32(s_idx[c3])
-    p0 = cutlass.Int32(remaining)  # sentinel: not selected
-    p1 = cutlass.Int32(remaining)
-    p2 = cutlass.Int32(remaining)
-    p3 = cutlass.Int32(remaining)
+    act = []
+    keys = []
+    idxs = []
+    pos = []
+    for s in cutlass.range_constexpr(slots):
+        c = tidx + cutlass.Int32(s * threads)
+        a = c < n
+        kk = cutlass.Uint32(0)
+        ii = cutlass.Int32(0)
+        if a:
+            kk = cutlass.Uint32(s_keys[c])
+            ii = cutlass.Int32(s_idx[c])
+        act.append(a)
+        keys.append(kk)
+        idxs.append(ii)
+        pos.append(cutlass.Int32(remaining))  # sentinel: not selected
 
     if tidx < 256:
         s_hist[tidx] = cutlass.Int32(0)
@@ -197,14 +182,9 @@ def tie_select_radix(
         # ``remain`` is block-uniform (derived from shared results), so the guarded barriers
         # are safe; it only skips dead rounds after an early exact resolution
         if remain > 0:
-            if a0:
-                shared_add(this_hist + _digit(k0, shift), 1)
-            if a1:
-                shared_add(this_hist + _digit(k1, shift), 1)
-            if a2:
-                shared_add(this_hist + _digit(k2, shift), 1)
-            if a3:
-                shared_add(this_hist + _digit(k3, shift), 1)
+            for s in cutlass.range_constexpr(slots):
+                if act[s]:
+                    shared_add(this_hist + _digit(keys[s], shift), 1)
             if cutlass.const_expr(not last):
                 if tidx < 256:
                     next_hist[tidx] = cutlass.Int32(0)
@@ -216,18 +196,13 @@ def tie_select_radix(
             in_play = s_result[2]
             remain_next = remain - above
             filled = remaining - remain_next  # winners decided so far, all rounds
-            a0, p0 = _place(a0, k0, p0, shift, bucket, s_counters, filled, last)
-            a1, p1 = _place(a1, k1, p1, shift, bucket, s_counters, filled, last)
-            a2, p2 = _place(a2, k2, p2, shift, bucket, s_counters, filled, last)
-            a3, p3 = _place(a3, k3, p3, shift, bucket, s_counters, filled, last)
+            for s in cutlass.range_constexpr(slots):
+                act[s], pos[s] = _place(
+                    act[s], keys[s], pos[s], shift, bucket, s_counters, filled, last
+                )
             remain = remain_next
         cute.arch.barrier()
 
-    if p0 < remaining:
-        out[out_base + p0] = i0
-    if p1 < remaining:
-        out[out_base + p1] = i1
-    if p2 < remaining:
-        out[out_base + p2] = i2
-    if p3 < remaining:
-        out[out_base + p3] = i3
+    for s in cutlass.range_constexpr(slots):
+        if pos[s] < remaining:
+            out[out_base + pos[s]] = idxs[s]

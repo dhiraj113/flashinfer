@@ -2582,3 +2582,68 @@ def test_cutlass_primitives_return_values(dtype, N, batch):
     assert ri.data_ptr() == out_i.data_ptr() and rv.data_ptr() == out_v.data_ptr()
     # order within a row is unspecified: compare the rows as sorted multisets
     assert torch.equal(rv.float().sort(dim=1).values, values.float().sort(dim=1).values)
+
+
+@pytest.mark.skipif(
+    not _cutlass_primitives_available(), reason="cutlass_primitives needs CUDA SM80+"
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("N, batch", [(8192, 8), (65536, 8), (262144, 16)])
+def test_cutlass_primitives_paged_rows(dtype, N, batch):
+    """Logits living in a wider arena (row stride > N) and a column-sliced view: same answers
+    as the contiguous copy; a misaligned slice is refused."""
+    top_k, pad = 1024, 64
+    arena = (torch.randn(batch, N + pad, device="cuda") * 2.0).to(dtype)
+    logits = arena[:, :N]
+    assert not logits.is_contiguous()
+    seq_lens = torch.full((batch,), N, dtype=torch.int32, device="cuda")
+    indices, values = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, backend="cutlass_primitives", return_values=True
+    )
+    ref, _ = flashinfer.top_k_varlen(
+        logits.contiguous(), seq_lens, top_k, backend="cutlass_primitives"
+    )
+    torch.cuda.synchronize()
+    _check_correct(
+        indices, logits.contiguous(), seq_lens, top_k, require_all_checked=True
+    )
+    lf = logits.float()
+    for row in range(batch):
+        got = lf[row][indices[row].long()].sort().values
+        want = lf[row][ref[row].long()].sort().values
+        assert torch.equal(got, want), f"row={row}: arena and contiguous answers differ"
+        assert torch.equal(lf[row][indices[row].long()], values[row].float())
+    shifted = arena[
+        :, 16 : 16 + N
+    ]  # a slice starting inside the arena, rows still aligned
+    out, _ = flashinfer.top_k_varlen(
+        shifted, seq_lens, top_k, backend="cutlass_primitives"
+    )
+    torch.cuda.synchronize()
+    _check_correct(out, shifted.contiguous(), seq_lens, top_k, require_all_checked=True)
+    with pytest.raises(Exception):  # 4-byte offset: rows no longer 16-byte aligned
+        flashinfer.top_k_varlen(
+            arena[:, 1 : 1 + N], seq_lens, top_k, backend="cutlass_primitives"
+        )
+
+
+@pytest.mark.skipif(
+    not _cutlass_primitives_available(), reason="cutlass_primitives needs CUDA SM80+"
+)
+@pytest.mark.parametrize("top_k", [5000, 8192])
+@pytest.mark.parametrize("N", [16384, 65536, 262144])
+def test_cutlass_primitives_large_k(top_k, N):
+    """k above 4096 where the part's shared memory holds the 8K tie stage."""
+    batch = 6
+    logits, seq_lens = _make_varlen_inputs([N] * batch, N, torch.float32, seed=47)
+    from flashinfer.topk_varlen.topk_varlen import (
+        _cutlass_primitives_top_k_varlen_check,
+    )
+
+    if not _cutlass_primitives_top_k_varlen_check(logits, seq_lens, top_k):
+        pytest.skip("the tie stage for this k does not fit this part's shared memory")
+    indices, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, backend="cutlass_primitives"
+    )
+    torch.cuda.synchronize()
+    _check_correct(indices, logits, seq_lens, top_k, require_all_checked=True)

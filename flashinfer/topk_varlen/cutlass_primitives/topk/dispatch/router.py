@@ -30,10 +30,12 @@ from ..kernels.register_cluster import (
     topk_register_cluster,
 )
 from ..kernels.register_resident import (
+    _DTYPES,
     RegisterConfig,
     register_config_for,
     topk_register,
 )
+from ..phases.elements import Elements
 from ..kernels.streaming import StreamingConfig, topk_streaming
 from .streaming_policy import streaming_config_for
 
@@ -48,7 +50,7 @@ def _cluster_kernel_wins(facts, dtype: torch.dtype, k: int, n: int, rows: int) -
     # the device's cluster cap is about the streaming kernel's long DSMEM merges; this kernel
     # merges 256 group sums and a few fine bins, and its 8-CTA form beat the alternatives even
     # on consumer Blackwell (RTX 5080 128K b=8: 11.2 us vs 12.4 streaming, 12.0 walk-first)
-    if not facts.supports_clusters or k > 4096:
+    if not facts.supports_clusters or k > 8192:
         return False
     if n <= SLICE_ELEMENTS or n > 8 * SLICE_ELEMENTS:
         return False
@@ -68,13 +70,24 @@ def _cluster_kernel_wins(facts, dtype: torch.dtype, k: int, n: int, rows: int) -
 def choose(
     facts, dtype: torch.dtype, k: int, n: int, rows: int
 ) -> tuple[str, RegisterConfig | RegisterClusterConfig | StreamingConfig]:
-    """(kernel name, configuration) for a batch of ``rows`` rows of ``n`` elements."""
+    """(kernel name, configuration) for a batch of ``rows`` rows of ``n`` elements.
+
+    Raises ``ValueError`` when no configuration fits the device (a tie stage for a large k
+    that the part's shared memory does not hold), so callers can decline the problem up front.
+    """
     per_word = 1 if dtype == torch.float32 else 2
-    if n <= REGISTER_MAX_ROW * per_word and k <= 4096:
-        return "register", register_config_for(facts, dtype, k, n, rows)
-    if _cluster_kernel_wins(facts, dtype, k, n, rows):
-        return "register_cluster", register_cluster_config_for(facts, dtype, k, n)
-    return "streaming", streaming_config_for(facts, dtype, k, n, rows)
+    config: RegisterConfig | RegisterClusterConfig | StreamingConfig
+    if n <= REGISTER_MAX_ROW * per_word and k <= 8192:
+        kernel, config = "register", register_config_for(facts, dtype, k, n, rows)
+    elif _cluster_kernel_wins(facts, dtype, k, n, rows):
+        kernel, config = (
+            "register_cluster",
+            register_cluster_config_for(facts, dtype, k, n),
+        )
+    else:
+        kernel, config = "streaming", streaming_config_for(facts, dtype, k, n, rows)
+    config.validate(k, Elements.of(_DTYPES[dtype]), facts.shared_memory_optin)
+    return kernel, config
 
 
 def topk(

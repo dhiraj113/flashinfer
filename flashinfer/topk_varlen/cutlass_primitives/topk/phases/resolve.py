@@ -151,6 +151,7 @@ def _select_ties(
                     tidx,
                     threads,
                     elems.key_shifts,
+                    tie_capacity // threads,
                 )
     return ok
 
