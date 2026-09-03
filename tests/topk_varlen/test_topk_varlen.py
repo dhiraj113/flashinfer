@@ -2672,3 +2672,465 @@ def test_cutlass_primitives_large_k(top_k, N):
     )
     torch.cuda.synchronize()
     _check_correct(indices, logits, seq_lens, top_k, require_all_checked=True)
+
+
+# ---------------------------------------------------------------------------
+# cutlass_primitives: memory ownership and stream isolation
+#
+# Adversarial by design: garbage-filled workspaces, one workspace reused across every shape,
+# graphs replayed after the workspace was scribbled on, several streams running one shape at
+# once through replayed graphs (the only way to make launches overlap from Python), and a check
+# that a call with a workspace and preallocated outputs touches the allocator not at all.
+# Every combination of the API's options (next_n, compress_ratio, return_values, layout,
+# dtype, preallocated or returned outputs, workspace or default) is exercised.
+# ---------------------------------------------------------------------------
+
+_CP_K = 512
+_CP_OPTIONS = [  # (next_n, compress_ratio, return_values)
+    (1, 1, False),
+    (2, 1, True),
+    (1, 4, False),
+    (4, 2, True),
+]
+_CP_LAYOUTS = ["contiguous", "paged", "misaligned"]
+
+
+def _cp_cells():
+    """One (N, batch) per kernel the library's router can pick on this device: register,
+    clustered register (or streaming where clusters are unavailable), streaming with the cluster
+    merge, and streaming with the slab merge when some shape takes it here."""
+    if not _cutlass_primitives_available():
+        return {}
+    from flashinfer.topk_varlen.cutlass_primitives.dispatch.device import device_facts
+    from flashinfer.topk_varlen.cutlass_primitives.topk.dispatch.router import choose
+
+    cells = {"register": (4096, 8), "cluster": (65536, 8), "streaming": (262144, 64)}
+    facts = device_facts(torch.device("cuda"))
+    for n, rows in ((1 << 20, 8), (1 << 20, 16), (1 << 18, 8), (1 << 18, 64)):
+        kind, config = choose(facts, torch.float32, _CP_K, n, rows)
+        if kind == "streaming" and config.merge == "slab" and config.splits > 1:
+            cells["slab"] = (n, rows)
+            break
+    return cells
+
+
+_CP_CELLS = _cp_cells()
+
+
+def _cp_logits(cell, dtype, layout, seed):
+    """Logits for a cell in one of the three layouts the backend distinguishes: contiguous
+    (read in place), a paged arena with wider rows (read in place through a storage view), and
+    a slice at an odd column (copied into a padded arena)."""
+    n, batch = _CP_CELLS[cell]
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    if layout == "contiguous":
+        return (torch.randn(batch, n, device="cuda", generator=g) * 2.0).to(dtype)
+    arena = (torch.randn(batch, n + 64, device="cuda", generator=g) * 2.0).to(dtype)
+    return arena[:, :n] if layout == "paged" else arena[:, 1 : 1 + n]
+
+
+def _cp_seq_lens(cell, next_n, compress_ratio, seed):
+    """Ragged token lengths under which every row still holds a full top-k."""
+    n, batch = _CP_CELLS[cell]
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    lo, hi = _CP_K * compress_ratio + next_n, n * compress_ratio + 1
+    return torch.randint(lo, hi, (batch // next_n,), device="cuda", generator=g).to(
+        torch.int32
+    )
+
+
+def _cp_workspace(logits, top_k=_CP_K, fill=0xA5, slack=0):
+    from flashinfer.topk_varlen.kernels.cutlass_primitives_backend import (
+        cutlass_primitives_workspace_bytes,
+    )
+
+    ws = torch.empty(
+        cutlass_primitives_workspace_bytes(logits, top_k) + slack,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    return ws.fill_(fill)  # the backend must not rely on any prior content
+
+
+def _cp_verify(
+    indices, values, logits, seq_lens, next_n, compress_ratio, return_values
+):
+    _check_correct(
+        indices,
+        logits,
+        seq_lens,
+        _CP_K,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        require_all_checked=True,
+    )
+    if return_values:
+        assert values is not None and values.dtype == logits.dtype
+        for row in range(indices.shape[0]):
+            assert torch.equal(logits[row][indices[row].long()], values[row]), (
+                f"row={row}"
+            )
+    else:
+        assert values is None
+
+
+def _cp_run(
+    logits, seq_lens, next_n, compress_ratio, return_values, workspace=None, **kw
+):
+    return flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        _CP_K,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        return_values=return_values,
+        backend="cutlass_primitives",
+        workspace=workspace,
+        **kw,
+    )
+
+
+@pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
+@pytest.mark.parametrize("cell", list(_CP_CELLS))
+@pytest.mark.parametrize("layout", _CP_LAYOUTS)
+@pytest.mark.parametrize(
+    "next_n, compress_ratio, return_values",
+    _CP_OPTIONS,
+    ids=[f"nn{a}_cr{b}_{'vals' if c else 'idx'}" for a, b, c in _CP_OPTIONS],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["f32", "bf16"])
+def test_cutlass_primitives_workspace_every_option(
+    cell, layout, next_n, compress_ratio, return_values, dtype
+):
+    """Every option combination, once through the default caches and once through a
+    garbage-filled caller workspace with preallocated outputs; both exact, and identical as
+    multisets."""
+    if dtype == torch.bfloat16 and cell not in ("register", "slab"):
+        pytest.skip("16-bit covered on the register and slab cells")
+    logits = _cp_logits(cell, dtype, layout, seed=11)
+    seq_lens = _cp_seq_lens(cell, next_n, compress_ratio, seed=12)
+    idx_a, val_a = _cp_run(logits, seq_lens, next_n, compress_ratio, return_values)
+    ws = _cp_workspace(logits, fill=0xFF)
+    rows = logits.shape[0]
+    out_i = torch.full((rows, _CP_K), -9, dtype=torch.int32, device="cuda")
+    out_v = torch.empty(rows, _CP_K, dtype=dtype, device="cuda")
+    idx_b, val_b = _cp_run(
+        logits,
+        seq_lens,
+        next_n,
+        compress_ratio,
+        return_values,
+        workspace={"cutlass_primitives_workspace": ws, "gvr2_workspace": None},
+        out_indices=out_i,
+        out_values=out_v,
+    )
+    torch.cuda.synchronize()
+    assert idx_b.data_ptr() == out_i.data_ptr()
+    for idx, val in ((idx_a, val_a), (idx_b, val_b)):
+        _cp_verify(idx, val, logits, seq_lens, next_n, compress_ratio, return_values)
+    lf = logits.float()
+    for row in range(rows):
+        got = lf[row][idx_b[row].long()].sort().values
+        want = lf[row][idx_a[row].long()].sort().values
+        assert torch.equal(got, want), (
+            f"row={row}: workspace and default answers differ"
+        )
+
+
+@pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
+@pytest.mark.parametrize("cell", list(_CP_CELLS))
+def test_cutlass_primitives_workspace_bytes_and_validation(cell):
+    """The reported size works and one byte less is refused before any launch; wrong device,
+    non-contiguous, misaligned and non-tensor workspaces are refused; any dtype is accepted;
+    a dict without our key, or with only other backends' keys, takes the default path."""
+    from flashinfer.topk_varlen.kernels.cutlass_primitives_backend import (
+        cutlass_primitives_workspace_bytes,
+    )
+
+    logits = _cp_logits(cell, torch.float32, "contiguous", seed=13)
+    seq_lens = _cp_seq_lens(cell, 1, 1, seed=13)
+    nbytes = cutlass_primitives_workspace_bytes(logits, _CP_K)
+    assert nbytes > 0 and nbytes % 256 == 0
+    # the misaligned layout needs the arena on top
+    odd = _cp_logits(cell, torch.float32, "misaligned", seed=13)
+    assert cutlass_primitives_workspace_bytes(odd, _CP_K) >= nbytes + odd.numel() * 4
+
+    def run(ws):
+        return _cp_run(logits, seq_lens, 1, 1, False, workspace=ws)
+
+    idx, _ = run({"cutlass_primitives_workspace": _cp_workspace(logits)})
+    torch.cuda.synchronize()
+    _check_correct(idx, logits, seq_lens, _CP_K, require_all_checked=True)
+    with pytest.raises(ValueError, match="needed"):
+        run(
+            {
+                "cutlass_primitives_workspace": torch.empty(
+                    nbytes - 1, dtype=torch.uint8, device="cuda"
+                )
+            }
+        )
+    with pytest.raises(ValueError, match="live on"):
+        run({"cutlass_primitives_workspace": torch.empty(nbytes, dtype=torch.uint8)})
+    with pytest.raises(ValueError, match="contiguous"):
+        run(
+            {
+                "cutlass_primitives_workspace": torch.empty(
+                    2 * nbytes, dtype=torch.uint8, device="cuda"
+                )[::2]
+            }
+        )
+    with pytest.raises(ValueError, match="aligned"):
+        run(
+            {
+                "cutlass_primitives_workspace": torch.empty(
+                    nbytes + 16, dtype=torch.uint8, device="cuda"
+                )[4:]
+            }
+        )
+    with pytest.raises(TypeError):
+        run({"cutlass_primitives_workspace": bytearray(nbytes)})
+    for dtype in (torch.float32, torch.int64, torch.bfloat16):
+        esize = torch.tensor([], dtype=dtype).element_size()
+        ws = torch.empty(-(-nbytes // esize), dtype=dtype, device="cuda")
+        idx, _ = run({"cutlass_primitives_workspace": ws})
+        torch.cuda.synchronize()
+        _check_correct(idx, logits, seq_lens, _CP_K, require_all_checked=True)
+    big = torch.empty(1024 + nbytes, dtype=torch.uint8, device="cuda")
+    idx, _ = run(
+        {"cutlass_primitives_workspace": big[768:]}
+    )  # a 256-byte multiple into a larger buffer
+    torch.cuda.synchronize()
+    _check_correct(idx, logits, seq_lens, _CP_K, require_all_checked=True)
+    for ws in ({}, {"gvr2_workspace": torch.empty(8, device="cuda")}, None):
+        idx, _ = run(ws)
+        torch.cuda.synchronize()
+        _check_correct(idx, logits, seq_lens, _CP_K, require_all_checked=True)
+    # zero rows: nothing needed, nothing launched
+    empty = logits[:0]
+    assert cutlass_primitives_workspace_bytes(empty, _CP_K) == 0
+    idx, _ = _cp_run(
+        empty,
+        seq_lens[:0],
+        1,
+        1,
+        False,
+        workspace={"cutlass_primitives_workspace": big},
+    )
+    assert idx.shape == (0, _CP_K)
+
+
+@pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
+@pytest.mark.parametrize("cell", list(_CP_CELLS))
+@pytest.mark.parametrize("layout", _CP_LAYOUTS)
+def test_cutlass_primitives_workspace_call_allocates_nothing(cell, layout):
+    """With outputs and workspace supplied, a warmed call touches the allocator not at all: the
+    caller fully controls device memory, including the padded copy of a misaligned input."""
+    logits = _cp_logits(cell, torch.float32, layout, seed=14)
+    seq_lens = _cp_seq_lens(cell, 1, 1, seed=14)
+    rows = logits.shape[0]
+    ws = {"cutlass_primitives_workspace": _cp_workspace(logits)}
+    out_i = torch.empty(rows, _CP_K, dtype=torch.int32, device="cuda")
+    out_v = torch.empty(rows, _CP_K, dtype=torch.float32, device="cuda")
+    kw = dict(workspace=ws, out_indices=out_i, out_values=out_v)
+    _cp_run(logits, seq_lens, 1, 1, True, **kw)  # compiles
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    for _ in range(3):
+        _cp_run(logits, seq_lens, 1, 1, True, **kw)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == before
+    _cp_verify(out_i, out_v, logits, seq_lens, 1, 1, True)
+
+
+@pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
+def test_cutlass_primitives_one_workspace_serves_every_shape():
+    """A workspace sized for the largest need serves every cell, dtype, layout and option in
+    any order, with garbage written between calls."""
+    from flashinfer.topk_varlen.kernels.cutlass_primitives_backend import (
+        cutlass_primitives_workspace_bytes,
+    )
+
+    problems = []
+    for cell in _CP_CELLS:
+        for dtype in (torch.float32, torch.bfloat16):
+            for layout in ("contiguous", "misaligned"):
+                problems.append((cell, _cp_logits(cell, dtype, layout, seed=15)))
+    need = max(cutlass_primitives_workspace_bytes(x, _CP_K) for _, x in problems)
+    ws = torch.empty(need, dtype=torch.uint8, device="cuda")
+    for i, (cell, logits) in enumerate(problems + problems[::-1]):
+        next_n, compress_ratio, return_values = _CP_OPTIONS[i % len(_CP_OPTIONS)]
+        seq_lens = _cp_seq_lens(cell, next_n, compress_ratio, seed=16 + i)
+        ws.fill_(0xC3)
+        idx, val = _cp_run(
+            logits,
+            seq_lens,
+            next_n,
+            compress_ratio,
+            return_values,
+            workspace={"cutlass_primitives_workspace": ws},
+        )
+        torch.cuda.synchronize()
+        _cp_verify(idx, val, logits, seq_lens, next_n, compress_ratio, return_values)
+
+
+@pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
+@pytest.mark.parametrize("cell", list(_CP_CELLS))
+@pytest.mark.parametrize("with_workspace", [False, True], ids=["cached", "workspace"])
+def test_cutlass_primitives_cuda_graph_scribbled_workspace(cell, with_workspace):
+    """A graph captured with a workspace re-zeroes the counters on every replay, so scribbling
+    on the workspace between replays cannot break the merge; the cached path replays too."""
+    logits = _cp_logits(cell, torch.float32, "paged", seed=17)
+    seq_lens = _cp_seq_lens(cell, 2, 1, seed=17)
+    rows = logits.shape[0]
+    ws = _cp_workspace(logits) if with_workspace else None
+    wsd = {"cutlass_primitives_workspace": ws} if with_workspace else None
+    out_i = torch.empty(rows, _CP_K, dtype=torch.int32, device="cuda")
+    out_v = torch.empty(rows, _CP_K, dtype=torch.float32, device="cuda")
+
+    def call():
+        _cp_run(
+            logits,
+            seq_lens,
+            2,
+            1,
+            True,
+            workspace=wsd,
+            out_indices=out_i,
+            out_values=out_v,
+        )
+
+    s = torch.cuda.Stream()
+    torch.cuda.synchronize()  # inputs and workspace come from the default stream
+    with torch.cuda.stream(s):
+        call()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        call()
+    for fill in (0xFF, 0x01, 0x80):
+        if ws is not None:
+            ws.fill_(fill)
+        out_i.fill_(-9)
+        g.replay()
+        torch.cuda.synchronize()
+        _cp_verify(out_i, out_v, logits, seq_lens, 2, 1, True)
+        logits.copy_(_cp_logits(cell, torch.float32, "paged", seed=fill))
+
+
+def _cp_concurrent_streams(cell, nstreams, workspaces, launches=12):
+    """nstreams graphs of one shape, each replayed on its own stream at the same time; every
+    stream's answer must be exact.  Replayed graphs are the only launches cheap enough to
+    overlap from Python; they exercise exactly the overlap the per-stream buffers must survive."""
+    xs = [
+        _cp_logits(cell, torch.float32, "contiguous", seed=100 + i)
+        for i in range(nstreams)
+    ]
+    seq_lens = _cp_seq_lens(cell, 1, 1, seed=100)
+    rows = xs[0].shape[0]
+    outs = [torch.full((rows, _CP_K), -9, dtype=torch.int32, device="cuda") for _ in xs]
+    wsds = [
+        {"cutlass_primitives_workspace": _cp_workspace(x)} if workspaces else None
+        for x in xs
+    ]
+    streams = [torch.cuda.Stream() for _ in xs]
+    # the inputs were produced on the default stream: order the side streams behind it (the
+    # usual cross-stream rule; without it a busy GPU lets a launch read lengths still being
+    # generated and pad the row)
+    torch.cuda.synchronize()
+    graphs = []
+    for x, out, wsd, s in zip(xs, outs, wsds, streams, strict=True):
+        with torch.cuda.stream(s):
+            _cp_run(
+                x, seq_lens, 1, 1, False, workspace=wsd, out_indices=out
+            )  # this stream's cache
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            for _ in range(launches):
+                _cp_run(x, seq_lens, 1, 1, False, workspace=wsd, out_indices=out)
+        graphs.append(g)
+    for _ in range(3):
+        for out in outs:
+            out.fill_(-9)
+        torch.cuda.synchronize()  # the fills ran on the default stream
+        for g, s in zip(graphs, streams, strict=True):
+            with torch.cuda.stream(s):
+                g.replay()
+        torch.cuda.synchronize()
+        for x, out in zip(xs, outs, strict=True):
+            _check_correct(out, x, seq_lens, _CP_K, require_all_checked=True)
+
+
+@pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
+@pytest.mark.parametrize("cell", list(_CP_CELLS))
+@pytest.mark.parametrize("nstreams", [2, 4])
+def test_cutlass_primitives_default_buffers_are_stream_private(cell, nstreams):
+    """The default path with no caller involvement: two to four streams running the same shape
+    at once must not share slab, counters or status (they did before the per-stream keying:
+    the slab cell then merged mixed segments and returned wrong indices)."""
+    _cp_concurrent_streams(cell, nstreams, workspaces=False)
+
+
+@pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
+@pytest.mark.parametrize("cell", list(_CP_CELLS))
+def test_cutlass_primitives_caller_workspaces_one_per_stream(cell):
+    _cp_concurrent_streams(cell, 3, workspaces=True)
+
+
+@pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
+def test_cutlass_primitives_streams_and_shapes_interleaved():
+    """Shapes, options and streams interleaved in one loop through the default caches: no
+    buffer is ever picked up by the wrong shape or stream."""
+    from flashinfer.topk_varlen.kernels import cutlass_primitives_backend as CPB
+
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    problems = []
+    for i, cell in enumerate(_CP_CELLS):
+        next_n, compress_ratio, return_values = _CP_OPTIONS[i % len(_CP_OPTIONS)]
+        logits = _cp_logits(cell, torch.float32, "contiguous", seed=20 + i)
+        seq_lens = _cp_seq_lens(cell, next_n, compress_ratio, seed=20 + i)
+        problems.append(
+            (cell, logits, seq_lens, next_n, compress_ratio, return_values, [])
+        )
+    torch.cuda.synchronize()  # inputs come from the default stream; the launches go to others
+    for _ in range(3):
+        for (
+            _,
+            logits,
+            seq_lens,
+            next_n,
+            compress_ratio,
+            return_values,
+            results,
+        ) in problems:
+            for s in streams:
+                with torch.cuda.stream(s):
+                    results.append(
+                        _cp_run(logits, seq_lens, next_n, compress_ratio, return_values)
+                    )
+    torch.cuda.synchronize()
+    for (
+        cell,
+        logits,
+        seq_lens,
+        next_n,
+        compress_ratio,
+        return_values,
+        results,
+    ) in problems:
+        for j, (idx, val) in enumerate(results):
+            try:
+                _cp_verify(
+                    idx, val, logits, seq_lens, next_n, compress_ratio, return_values
+                )
+            except AssertionError as e:
+                pytest.fail(
+                    f"{cell} {_CP_CELLS[cell]} nn={next_n} cr={compress_ratio} "
+                    f"vals={return_values} launch {j}: {e}"
+                )
+    # the status cache holds one entry per stream for each (rows, words)
+    handles = {s.cuda_stream for s in streams}
+    for _, logits, *_ in problems:
+        rows = logits.shape[0]
+        seen = {key[1] for key in CPB._status if key[2] == rows}
+        assert handles <= seen, f"rows={rows}: status buffers not keyed per stream"

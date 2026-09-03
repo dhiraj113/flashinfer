@@ -457,15 +457,19 @@ def topk_register_cluster(
     values: torch.Tensor | None = None,
     next_n: int = 1,
     compress_ratio: int = 1,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Indices of the k largest of each row of ``x`` (rows, N <= 128K), same contract as
-    ``topk_streaming``.  Needs SM90 or newer (clusters)."""
+    ``topk_streaming`` (``workspace`` holds the status words and a misaligned copy's arena).
+    Needs SM90 or newer (clusters)."""
     from ...dispatch.device import device_facts
+
+    from ..dispatch.workspace import carve, workspace_layout
+    from .layout import arena_bytes
 
     assert x.dtype in _DTYPES
     check_layout(x)
     rows, n = x.shape
-    xa, col_offset = arena_view(x)
     facts = device_facts(x.device)
     if not facts.supports_clusters:
         raise ValueError(
@@ -478,6 +482,17 @@ def topk_register_cluster(
         raise ValueError(
             f"row length {n} exceeds this configuration's capacity {config.splits * config.slice_capacity(elems)}"
         )
+    arena = None
+    if workspace is not None:
+        ws = carve(
+            workspace,
+            workspace_layout("register_cluster", config, rows, arena_bytes(x)),
+            x.device,
+        )
+        arena = ws.arena
+        if status is None:
+            status = ws.status
+    xa, col_offset = arena_view(x, arena)
     if lengths is None:
         lengths = torch.full(
             (rows // next_n,), n * compress_ratio, device=x.device, dtype=torch.int32

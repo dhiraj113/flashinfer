@@ -7,7 +7,10 @@ kernels and their router; this file owns everything FlashInfer-specific:
 * compilation through ``build_and_load_cute_dsl_kernel`` so artifacts persist in FlashInfer's
   DSL cache, with dynamic row counts (``cute.sym_int``) and the TVM-FFI environment stream,
   instead of the library's in-process ``cute.compile`` cache and explicit torch stream;
-* the small per-call buffers (status words, slab workspace) FlashInfer callers never see.
+* the small per-call buffers (status words, slab workspace): cached per (device, stream,
+  shape) so concurrent streams never share one, or carved from the caller's
+  ``workspace["cutlass_primitives_workspace"]`` (sized by ``cutlass_primitives_workspace_bytes``)
+  when the caller wants to own every byte the backend touches.
 
 Routing is the library's: rows that fit a CTA's registers take the register-resident kernel,
 rows up to eight register slices in batches that fit one wave of clusters take its clustered
@@ -30,10 +33,13 @@ import torch
 
 from ..cutlass_primitives.dispatch.device import device_facts
 from ..cutlass_primitives.topk.dispatch.router import choose
+from ..cutlass_primitives.topk.dispatch.workspace import carve, workspace_layout
 from ..cutlass_primitives.topk.kernels import register_cluster as RCL
-from ..cutlass_primitives.topk.kernels.layout import arena_view
+from ..cutlass_primitives.topk.kernels.layout import arena_bytes, arena_view
 from ..cutlass_primitives.topk.kernels import register_resident as REG
 from ..cutlass_primitives.topk.kernels import streaming as STR
+
+WORKSPACE_KEY = "cutlass_primitives_workspace"
 
 _CUTLASS_DTYPES = {
     torch.float32: cutlass.Float32,
@@ -201,10 +207,50 @@ def _compiled_kernel(
 
 
 def _status_buffer(rows: int, words: int, device: torch.device) -> torch.Tensor:
-    key = (device, rows, words)
+    """The cached (rows, words) status buffer for the current stream.  Keyed by the stream so
+    two streams running the same shape at once never write one buffer (launches on one stream
+    are ordered; on two they are not)."""
+    key = (device, torch.cuda.current_stream(device).cuda_stream, rows, words)
     if key not in _status:
         _status[key] = torch.empty(rows, words, dtype=torch.int32, device=device)
     return _status[key]
+
+
+def cutlass_primitives_workspace_bytes(logits: torch.Tensor, top_k: int) -> int:
+    """Bytes the ``cutlass_primitives`` backend needs in ``workspace["cutlass_primitives_workspace"]``
+    for ``logits`` (its shape, dtype, device and layout all count) at ``top_k``.
+
+    The size follows the library's kernel choice for the row count, so an engine that runs
+    several batch sizes takes the maximum over them (each query is a cheap host computation).
+    With a workspace the call allocates nothing: the status words, the slab merge's buffers
+    and the padded copy of a misaligned input all come out of it.  Zero rows need none.
+    """
+    rows, n = logits.shape
+    if rows == 0:
+        return 0
+    kind, config = choose(device_facts(logits.device), logits.dtype, top_k, n, rows)
+    return workspace_layout(kind, config, rows, arena_bytes(logits)).total_bytes
+
+
+def _caller_buffers(
+    workspace: torch.Tensor,
+    logits: torch.Tensor,
+    kind: str,
+    config,
+    words: int,
+    rows: int,
+):
+    """(status (rows, words), slab (rows, slab words) or None, counters or None, arena bytes or
+    None) carved from the caller's workspace; the counters are zeroed on the stream because the
+    kernel needs zero arrivals at launch and the caller's memory may hold anything."""
+    layout = workspace_layout(kind, config, rows, arena_bytes(logits))
+    ws = carve(workspace, layout, logits.device)
+    slab = counters = None
+    if ws.slab is not None:
+        assert ws.counters is not None
+        slab, counters = ws.slab.view(rows, -1), ws.counters
+        counters.zero_()
+    return ws.status.view(rows, words), slab, counters, ws.arena
 
 
 def run_cutlass_primitives(
@@ -217,21 +263,39 @@ def run_cutlass_primitives(
     out_indices: torch.Tensor,
     out_values: Optional[torch.Tensor],
     pre_idx: Optional[torch.Tensor] = None,
+    workspace: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Top-k indices of each row of ``logits`` into ``out_indices`` (rows, top_k, int32), and
     the selected values into ``out_values`` when ``return_values``.  Row r sees
     ``(seq_lens[r // next_n] - next_n + r % next_n + 1) // compress_ratio`` elements (the
     ``radix`` backends' semantics); rows shorter than top_k are padded with -1 (values: -inf).
+    ``workspace["cutlass_primitives_workspace"]`` (a contiguous CUDA tensor of at least
+    ``cutlass_primitives_workspace_bytes(logits, top_k)`` bytes, 256-byte-aligned base, any
+    dtype, any content) supplies every buffer the backend would otherwise cache or allocate.
     """
     rows, n = logits.shape
     if return_values and out_values is None:
         out_values = torch.empty(rows, top_k, dtype=logits.dtype, device=logits.device)
     if rows == 0:
         return out_indices, (out_values if return_values else None)
-    # a paged arena or sliced view: the kernel takes a compact (rows, stride) view over the
-    # storage and reads n columns of each row from col_offset (the library's layout rules)
-    arena, col_offset = arena_view(logits)
     kind, config = choose(device_facts(logits.device), logits.dtype, top_k, n, rows)
+    words = {
+        "register": REG.STATUS_WORDS,
+        "register_cluster": RCL.STATUS_WORDS,
+        "streaming": STR.STATUS_WORDS,
+    }[kind]
+    caller_ws = workspace.get(WORKSPACE_KEY) if workspace else None
+    arena_buf = slab = counters = None
+    if caller_ws is not None:
+        status, slab, counters, arena_buf = _caller_buffers(
+            caller_ws, logits, kind, config, words, rows
+        )
+    else:
+        status = _status_buffer(rows, words, logits.device)
+    # a paged arena or sliced view: the kernel takes a compact (rows, stride) view over the
+    # storage and reads n columns of each row from col_offset (the library's layout rules);
+    # misaligned rows are copied into a padded arena (the caller's workspace when given)
+    arena, col_offset = arena_view(logits, arena_buf)
     compiled = _compiled_kernel(
         kind,
         logits.dtype,
@@ -249,30 +313,18 @@ def run_cutlass_primitives(
         out_values if return_values else _no_values_buffer(logits.device, logits.dtype)
     )
     if kind in ("register", "register_cluster"):
-        words = REG.STATUS_WORDS if kind == "register" else RCL.STATUS_WORDS
-        compiled(
-            arena,
-            seq_lens,
-            out_indices,
-            values,
-            _status_buffer(rows, words, logits.device),
-        )
+        compiled(arena, seq_lens, out_indices, values, status)
     else:
         assert isinstance(config, STR.StreamingConfig)
-        slab, counters = STR._slab_workspace(logits.device, rows, config)
-        if config.merge == "slab" and config.splits > 1:
-            slab = slab.view(rows, -1)
-        else:
-            slab = slab.view(1, 1)  # placeholders matching the static one-element fakes
-        compiled(
-            arena,
-            seq_lens,
-            out_indices,
-            values,
-            _status_buffer(rows, STR.STATUS_WORDS, logits.device),
-            slab,
-            counters,
-        )
+        if slab is None:
+            # the library's per-(device, stream, shape) cache, or its shared one-element
+            # placeholders for configurations that do not merge through the slab
+            slab, counters = STR._slab_workspace(logits.device, rows, config)
+            if config.merge == "slab" and config.splits > 1:
+                slab = slab.view(rows, -1)
+            else:
+                slab = slab.view(1, 1)  # matching the static one-element fakes
+        compiled(arena, seq_lens, out_indices, values, status, slab, counters)
     return out_indices, (out_values if return_values else None)
 
 

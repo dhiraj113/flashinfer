@@ -98,6 +98,7 @@ def topk(
     values: torch.Tensor | None = None,
     next_n: int = 1,
     compress_ratio: int = 1,
+    workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Indices of the k largest elements of each row of ``x`` (rows, N), int32 (rows, k).
 
@@ -105,7 +106,10 @@ def topk(
     ``(lengths[r // next_n] - next_n + r % next_n + 1) // compress_ratio`` of them (both default
     to 1: ``lengths[r]``).  Rows shorter than k are padded with -1.  NaN ranks above +inf.
     Order within a row is unspecified.  ``values`` (rows, k, x's dtype), when given, receives
-    the selected elements (-inf in padding).
+    the selected elements (-inf in padding).  ``workspace`` (CUDA byte tensor of at least
+    ``workspace.workspace_bytes(x, k)`` bytes) makes the call allocation-free and stream-private
+    under the caller's control; without it the kernels use per-(device, stream, shape) caches
+    (``dispatch/workspace.py``).
     """
     rows, n = x.shape
     kernel, config = choose(device_facts(x.device), x.dtype, k, n, rows)
@@ -115,6 +119,7 @@ def topk(
         "values": values,
         "next_n": next_n,
         "compress_ratio": compress_ratio,
+        "workspace": workspace,
     }
     if isinstance(config, RegisterConfig):
         return topk_register(x, k, config=config, **extra)

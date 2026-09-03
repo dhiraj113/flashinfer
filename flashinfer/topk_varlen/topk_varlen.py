@@ -2092,6 +2092,7 @@ def _run_cutlass_primitives(
     out_indices: torch.Tensor,
     out_values: Optional[torch.Tensor],
     pre_idx: Optional[torch.Tensor] = None,
+    workspace: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     from .kernels.cutlass_primitives_backend import run_cutlass_primitives
 
@@ -2105,6 +2106,7 @@ def _run_cutlass_primitives(
         out_indices,
         out_values,
         pre_idx,
+        workspace,
     )
 
 
@@ -2702,9 +2704,10 @@ def top_k_varlen(
         kernel (MSD radix-select) on the same stream: rows that miss
         on-device verification are re-solved exactly on device, sync-free,
         so the calls are CUDA-graph capturable once warmed up.  Like the
-        GVR workspace, the internal slab/status buffers are shared
-        per-device — do not call these backends concurrently from multiple
-        streams:
+        GVR workspace, the internal slab/status buffers of the
+        ``walkfirst``/``sampled``/``hint``/``stacked`` selectors are shared
+        per-device — do not call those concurrently from multiple streams
+        (``cutlass_primitives`` keys its buffers by stream and is safe):
 
         ``"gvr_2"``         — self-sampling GVR V2 (TRT-LLM #17821 port;
                               Blackwell sm_100/103 only, fp32,
@@ -2721,10 +2724,11 @@ def top_k_varlen(
                               rows up to 16K, the streaming kernel with
                               cluster or slab merges above, an exact
                               fallback; its own router picks the kernel.
-                              fp32/fp16/bf16, k <= 4096, row stride a
-                              multiple of 16 bytes, SM80+; ``next_n``,
-                              ``compress_ratio`` and ``return_values``
-                              supported; hints ignored.
+                              fp32/fp16/bf16, k <= 8192, any 2-D layout,
+                              SM80+; ``next_n``, ``compress_ratio`` and
+                              ``return_values`` supported; hints ignored;
+                              optional caller-owned memory through
+                              ``workspace["cutlass_primitives_workspace"]``.
         ``"sampled_primitives"`` — self-sampling pivot bracket (GVR2-style,
                               no ``pre_idx``); fastest available on
                               duplicate/flood-heavy rows.  ``max_seq_len``
@@ -2768,6 +2772,16 @@ def top_k_varlen(
         = 20,973,568 bytes, zero-initialized before first use, 16-byte
         aligned) overrides the per-device cached slab.
 
+        For the ``"cutlass_primitives"`` backend the optional key
+        ``"cutlass_primitives_workspace"`` (a contiguous CUDA tensor of any
+        dtype and any content, 256-byte-aligned base, at least
+        ``flashinfer.topk_varlen.kernels.cutlass_primitives_backend.cutlass_primitives_workspace_bytes(logits, top_k)``
+        bytes; take the maximum over the batch sizes an engine runs) makes the
+        call allocation-free: the status words, the slab merge's buffers and
+        the padded copy of a misaligned input all come out of it.  Without
+        it the backend caches those buffers per (device, stream, shape), so
+        the default is already safe for concurrent streams.
+
         .. warning::
             Do **not** share the same workspace dict across concurrent CUDA
             streams — each stream must have its own workspace to avoid races
@@ -2782,7 +2796,10 @@ def top_k_varlen(
             CUDA graphs replayed concurrently — race on it. Every concurrently
             active stream, and every CUDA graph that may replay concurrently
             with another launch, must pass its own ``"gvr2_workspace"``;
-            stream-ordered use needs nothing.
+            stream-ordered use needs nothing.  For ``"cutlass_primitives"``
+            the default caches are keyed by stream and need nothing either.
+            A CUDA graph captures the workspace it was given, so replays of
+            one graph must not overlap each other.
 
     approx_ties : bool, optional
         Permit approximate resolution of boundary ties.  Default ``False``
@@ -3058,6 +3075,7 @@ def top_k_varlen(
             out_indices,
             out_values,
             pre_idx,
+            workspace,
         )
     elif backend == "sglang":
         out_i, out_v = _run_sglang(
