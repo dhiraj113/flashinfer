@@ -44,6 +44,7 @@ from ..phases.register_row import (
 )
 from ..phases.resolve import _select_ties
 from ..phases.varlen import effective_length, gather_values
+from .layout import arena_view, check_layout
 
 __all__ = [
     "RegisterConfig",
@@ -94,10 +95,11 @@ class RegisterConfig:
             )
         if (
             self.tie_capacity < max(2 * self.threads, k)
-            or self.tie_capacity > 4 * self.threads
+            or self.tie_capacity > 8 * self.threads
+            or self.tie_capacity % self.threads
         ):
             raise ValueError(
-                f"tie_capacity must be in [max(2 * threads, k), 4 * threads] = [{max(2 * self.threads, k)}, {4 * self.threads}]"
+                f"tie_capacity must be a multiple of threads in [max(2 * threads, k), 8 * threads] = [{max(2 * self.threads, k)}, {8 * self.threads}]"
             )
         if k >= self.row_capacity(elems):
             raise ValueError(
@@ -131,6 +133,8 @@ class RegisterTopK:
         next_n: int = 1,
         compress_ratio: int = 1,
         return_values: bool = False,
+        row_length: int | None = None,
+        col_offset: int = 0,
     ):
         self.dtype = dtype
         self.elems = Elements.of(dtype)
@@ -141,6 +145,8 @@ class RegisterTopK:
         self.next_n = next_n
         self.compress_ratio = compress_ratio
         self.return_values = return_values
+        self.row_length = row_length  # None: the tensor's width; else the row is row_length columns from col_offset (paged arenas)
+        self.col_offset = col_offset
 
     @cute.kernel
     def kernel(
@@ -157,7 +163,10 @@ class RegisterTopK:
         words = cutlass.const_expr(cfg.words_per_thread)
         bins = cutlass.const_expr(cfg.bins)
         k = cutlass.const_expr(self.k)
-        n_cols = cutlass.const_expr(x.shape[1])
+        row_stride = cutlass.const_expr(x.shape[1])
+        n_cols = cutlass.const_expr(
+            self.row_length if self.row_length is not None else x.shape[1]
+        )
         telemetry = cutlass.const_expr(cfg.telemetry)
         tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
@@ -186,7 +195,7 @@ class RegisterTopK:
         mark = cutlass.Int64(0)
         if telemetry:
             mark = read_clock64()
-        row_ptr = x.iterator + cutlass.Int64(row) * n_cols
+        row_ptr = x.iterator + cutlass.Int64(row) * row_stride + self.col_offset
         out_row = out.iterator + cutlass.Int64(row) * k
         status_row = status.iterator + cutlass.Int64(row) * STATUS_WORDS
         # the row's words are loaded before the length is known: every vector of the row buffer
@@ -373,8 +382,10 @@ def register_config_for(
     words = _words_for(threads, n, per_word)
     if words is None:
         raise ValueError(f"row length {n} exceeds the register-resident capacity")
-    tie_capacity = max(2 * threads, k)
-    if tie_capacity > 4 * threads:
+    tie_capacity = max(
+        2 * threads, -(-k // threads) * threads
+    )  # a multiple of threads (candidate slots per thread)
+    if tie_capacity > 8 * threads:
         raise ValueError(f"k={k} exceeds the register kernel's tie stage")
     bins = 1024
     while bins < 4096 and bins * 4 < n:
@@ -408,12 +419,10 @@ def topk_register(
     ``topk_streaming``."""
     from ...dispatch.device import device_facts
 
-    assert x.dim() == 2 and x.is_cuda and x.is_contiguous() and x.dtype in _DTYPES
+    assert x.dtype in _DTYPES
+    check_layout(x)
     rows, n = x.shape
-    if (n * x.element_size()) % 16:
-        raise ValueError(
-            f"row stride must be a multiple of 16 bytes (N={n}, {x.dtype})"
-        )
+    xa, col_offset = arena_view(x)
     facts = device_facts(x.device)
     if config is None:
         config = register_config_for(facts, x.dtype, k, n, rows)
@@ -436,6 +445,8 @@ def topk_register(
         k,
         rows,
         n,
+        xa.shape[1],
+        col_offset,
         config,
         facts.capability,
         next_n,
@@ -444,7 +455,7 @@ def topk_register(
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     args = (
-        from_dlpack(x),
+        from_dlpack(xa),
         from_dlpack(lengths),
         from_dlpack(out),
         from_dlpack(vals),
@@ -460,6 +471,8 @@ def topk_register(
             next_n,
             compress_ratio,
             values is not None,
+            n,
+            col_offset,
         )
         _compiled[key] = cute.compile(kern.launch, *args)
     _compiled[key](*args)

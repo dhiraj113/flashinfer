@@ -149,7 +149,9 @@ def streaming_config_for(
     elem_bytes = 4 if dtype == torch.float32 else 2
     row_bytes = n * elem_bytes
     threads = 1024
-    tie_capacity = max(2 * threads, k)
+    tie_capacity = max(
+        2 * threads, -(-k // threads) * threads
+    )  # a multiple of threads: the radix select's slots per thread
     packed = dtype == torch.float16 or (
         dtype == torch.bfloat16 and facts.packed_bf16_compare
     )
@@ -178,7 +180,7 @@ def streaming_config_for(
                 "threads": 512,
                 "ctas_per_sm": 2,
                 "stage": wide_stage,
-                "tie_capacity": max(1024, k),
+                "tie_capacity": max(1024, -(-k // 512) * 512),
                 "unroll": _unroll_for(facts, 512, n, per_vector),
             }
         )
@@ -193,6 +195,11 @@ def streaming_config_for(
             )
             if 2 * small.shared_memory_bytes() <= facts.shared_memory_optin:
                 return small
+    # large k: k must sit below three quarters of the stage (the balanced aim needs room on
+    # both sides), so k above 6144 at one CTA per row takes the next stage size that holds it
+    if k >= 3 * cfg.stage * splits // 4:
+        stage = -(-(k * 4 // 3 + 256) // 256) * 256
+        cfg = StreamingConfig(**{**cfg.__dict__, "stage": stage})
     if _needs_big_stage(k, n, rows, threads, cfg.stage, splits):
         big = StreamingConfig(**{**cfg.__dict__, "stage": 16384})
         if big.shared_memory_bytes() <= facts.shared_memory_optin:
