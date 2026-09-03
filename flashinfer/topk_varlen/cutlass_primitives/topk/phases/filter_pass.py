@@ -1,0 +1,210 @@
+"""Filter pass: one streaming pass over the CTA's slice keeping everything above the threshold.
+
+Structure (gvr_2's, adopted after two measured dead ends: unconditional per-element side
+effects were 1.4-3x slower at 3-6% survivor rates, and a monolithic predicated-asm emit lost
+ptxas's scheduling and ran 20% behind):
+
+* Each iteration a thread loads ``unroll`` 16-byte vectors ``threads`` vectors apart and
+  classifies every element into one bit of a dead mask: one compare, no memory effect.  For
+  16-bit rows the packed compare handles eight elements in four instructions.
+* The survivors of the warp are counted with a popcount and staged with one
+  ``warp_reserve`` per warp per iteration.
+* A divergent bit-walk over the survivors re-loads each one with a scalar load (holding all
+  the loaded values live across the walk spills; the reload hits L1), writes key bits and
+  index to the stage, and counts its survivor bin.  Overflow beyond the stage capacity goes
+  to a trash slot; the count still grows, so the caller sees the overflow.
+* The trip count is CTA-uniform (full iterations unguarded, the boundary iteration clamps
+  addresses and masks validity) so the warp collectives are always converged.
+
+Loop invariants are pinned (``device.compiler``) so NVVM does not rematerialize their defining
+chains inside the loop at the 64-register wall.  Measured: an L2 prefetch of the next tile
+made this pass slower (issue-bound, ~1 us per 64 KB tile per SM regardless of CTA count).
+"""
+
+import cutlass
+import cutlass.cute as cute
+
+from ...block.reduce import warp_reserve
+from ...device.atomics import shared_add, shared_count
+from ...device.compiler import pin_i32, pin_i64, pin_shared_address
+from ...device.keys import below_or_equal_mask_16x8, pack_threshold_16
+from ...device.memory import load_global_readonly_16
+
+from .binning import survivor_bin
+
+__all__ = ["filter_pass"]
+
+
+@cute.jit
+def _classify_vector(
+    elems,
+    dead,
+    w0,
+    w1,
+    w2,
+    w3,
+    bar,
+    packed_bar,
+    base_bit: cutlass.Constexpr,
+    packed: cutlass.Constexpr,
+):
+    """OR into ``dead`` one bit per element of the vector that is <= bar (NaN never dies)."""
+    if cutlass.const_expr(packed):
+        dead = below_or_equal_mask_16x8(
+            dead, w0, w1, w2, w3, packed_bar, base_bit, elems.is_bf16
+        )
+    else:
+        for j in cutlass.range_constexpr(4):
+            for h in cutlass.range_constexpr(elems.per_word):
+                v = elems.value(elems.bits((w0, w1, w2, w3)[j], h))
+                dead = dead | (
+                    cutlass.Int32(v <= bar) << (base_bit + j * elems.per_word + h)
+                )
+    return dead
+
+
+@cute.jit
+def _stage(
+    elems,
+    row_ptr,
+    idx,
+    pos,
+    capacity: cutlass.Constexpr,
+    bar,
+    scale,
+    hist_base,
+    s_keys,
+    s_idx,
+):
+    """Write one survivor to the stage (slot ``capacity`` is the overflow trash) and count its bin."""
+    bits = elems.load_bits(row_ptr, idx)
+    slot = pos
+    if slot > cutlass.Int32(capacity):
+        slot = cutlass.Int32(capacity)
+    s_keys[slot] = bits.bitcast(cutlass.Int32)
+    s_idx[slot] = idx
+    shared_count(hist_base + survivor_bin(elems.value(bits), bar, scale) * 4)
+
+
+@cute.jit
+def filter_pass(
+    elems,
+    row_ptr,
+    start,
+    count,
+    bar,
+    scale,
+    packed: cutlass.Constexpr,
+    capacity: cutlass.Constexpr,
+    s_count,
+    s_hist,
+    s_keys,
+    s_idx,
+    tidx,
+    threads: cutlass.Constexpr,
+    unroll: cutlass.Constexpr,
+):
+    """Stage every element of ``row[start, start + count)`` that is not <= ``bar``.
+
+    On exit (after the closing barrier): ``s_count[0]`` = survivor count (may exceed
+    ``capacity``), ``s_keys/s_idx[0, min(count, capacity))`` = survivor bits and indices,
+    ``s_hist`` = 256-bin survivor histogram over ALL survivors (staged or not).  ``s_keys``
+    and ``s_idx`` need ``capacity + 1`` slots.  Two barriers (one to zero, one to publish).
+    ``unroll * per_vector`` must be at most 32 (the mask width).
+    """
+    if tidx == 0:
+        s_count[0] = cutlass.Int32(0)
+    if tidx < 256:
+        s_hist[tidx] = cutlass.Int32(0)
+    cute.arch.barrier()
+
+    per_vector = cutlass.const_expr(elems.per_vector)
+    lg = cutlass.const_expr(elems.log2_per_vector)
+    per_iter = cutlass.const_expr(unroll * threads)  # vectors per iteration
+    all_valid = cutlass.const_expr(
+        -1 if unroll * per_vector == 32 else (1 << (unroll * per_vector)) - 1
+    )
+    lane = tidx % 32
+    hist_base = pin_shared_address(s_hist.toint())
+    base = pin_i64(row_ptr.toint() + cutlass.Int64(start) * cutlass.Int64(elems.bytes))
+    n_vectors = count >> cutlass.Int32(lg)
+    last_vector = pin_i32(n_vectors - 1)
+    n_iter = pin_i32(
+        (n_vectors + cutlass.Int32(per_iter - 1)) // cutlass.Int32(per_iter)
+    )
+    n_full = pin_i32(n_vectors // cutlass.Int32(per_iter))
+    stride = cutlass.Int64(threads * 16)
+    packed_bar = cutlass.Uint32(0)
+    if cutlass.const_expr(packed):
+        packed_bar = pack_threshold_16(bar, elems.is_bf16)
+
+    it = cutlass.Int32(0)
+    vbase = cutlass.Int32(tidx)  # first vector index of this thread this iteration
+    vaddr = base + cutlass.Int64(tidx) * 16
+    while it < n_iter:
+        dead = cutlass.Int32(0)
+        valid = cutlass.Int32(all_valid)
+        if it < n_full:
+            words = [load_global_readonly_16(vaddr + stride * u) for u in range(unroll)]
+            for u in cutlass.range_constexpr(unroll):
+                dead = _classify_vector(
+                    elems, dead, *words[u], bar, packed_bar, u * per_vector, packed
+                )
+        else:  # boundary iteration: clamp addresses, mask validity
+            valid = cutlass.Int32(0)
+            for u in cutlass.range_constexpr(unroll):
+                vi = vbase + cutlass.Int32(u * threads)
+                clamped = vi
+                if clamped > last_vector:
+                    clamped = last_vector
+                w0, w1, w2, w3 = load_global_readonly_16(
+                    base + cutlass.Int64(clamped) * 16
+                )
+                if vi < n_vectors:
+                    valid = valid | (
+                        cutlass.Int32((1 << per_vector) - 1) << (u * per_vector)
+                    )
+                    dead = _classify_vector(
+                        elems,
+                        dead,
+                        w0,
+                        w1,
+                        w2,
+                        w3,
+                        bar,
+                        packed_bar,
+                        u * per_vector,
+                        packed,
+                    )
+        alive = (~dead) & valid
+        pos = warp_reserve(cutlass.Int32(cute.arch.popc(alive)), lane, s_count)
+        while alive != 0:
+            bit = cutlass.Int32(
+                cute.arch.popc((alive & (cutlass.Int32(0) - alive)) - cutlass.Int32(1))
+            )
+            alive = alive & (alive - cutlass.Int32(1))
+            vec = vbase + (bit >> cutlass.Int32(lg)) * cutlass.Int32(threads)
+            idx = (
+                start
+                + (vec << cutlass.Int32(lg))
+                + (bit & cutlass.Int32(per_vector - 1))
+            )
+            _stage(
+                elems, row_ptr, idx, pos, capacity, bar, scale, hist_base, s_keys, s_idx
+            )
+            pos = pos + cutlass.Int32(1)
+        vbase = vbase + cutlass.Int32(per_iter)
+        vaddr = vaddr + stride * unroll
+        it = it + cutlass.Int32(1)
+
+    # elements past the last full vector (fewer than per_vector of them)
+    tail_start = n_vectors << cutlass.Int32(lg)
+    for i in range(tidx, count - tail_start, threads):
+        idx = start + tail_start + i
+        bits = elems.load_bits(row_ptr, idx)
+        if not (elems.value(bits) <= bar):
+            pos = shared_add(s_count, 1)
+            _stage(
+                elems, row_ptr, idx, pos, capacity, bar, scale, hist_base, s_keys, s_idx
+            )
+    cute.arch.barrier()
