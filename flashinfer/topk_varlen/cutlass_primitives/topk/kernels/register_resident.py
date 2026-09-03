@@ -43,6 +43,7 @@ from ..phases.register_row import (
     load_row_words,
 )
 from ..phases.resolve import _select_ties
+from ..phases.varlen import effective_length, gather_values
 
 __all__ = [
     "RegisterConfig",
@@ -121,12 +122,25 @@ class RegisterConfig:
 
 
 class RegisterTopK:
-    def __init__(self, dtype, k: int, config: RegisterConfig, shared_memory_limit: int):
+    def __init__(
+        self,
+        dtype,
+        k: int,
+        config: RegisterConfig,
+        shared_memory_limit: int,
+        next_n: int = 1,
+        compress_ratio: int = 1,
+        return_values: bool = False,
+    ):
+        self.dtype = dtype
         self.elems = Elements.of(dtype)
         self.k = k
         self.config = config
         config.validate(k, self.elems, shared_memory_limit)
         self.threads = config.threads
+        self.next_n = next_n
+        self.compress_ratio = compress_ratio
+        self.return_values = return_values
 
     @cute.kernel
     def kernel(
@@ -134,6 +148,7 @@ class RegisterTopK:
         x: cute.Tensor,
         lengths: cute.Tensor,
         out: cute.Tensor,
+        values: cute.Tensor,
         status: cute.Tensor,
     ):
         cfg = self.config
@@ -181,11 +196,9 @@ class RegisterTopK:
         wordvals = load_row_words(
             row_ptr, cutlass.Int32(n_cols), tidx, threads, words, elems.log2_per_vector
         )
-        length = lengths[row]
-        if length < 0:
-            length = cutlass.Int32(0)
-        if length > cutlass.Int32(n_cols):
-            length = cutlass.Int32(n_cols)
+        length = effective_length(
+            lengths, row, n_cols, self.next_n, self.compress_ratio
+        )
 
         if cutlass.Int32(k) >= length:
             for i in range(tidx, k, threads):
@@ -297,6 +310,17 @@ class RegisterTopK:
                 status_row[0] = cutlass.Int32(1) - ok
                 status_row[1] = arm
                 status_row[2] = ties
+        if cutlass.const_expr(self.return_values):
+            cute.arch.barrier()  # every output index of the row is written
+            gather_values(
+                self.dtype,
+                row_ptr,
+                out_row,
+                values.iterator + cutlass.Int64(row) * k,
+                k,
+                tidx,
+                threads,
+            )
         if cutlass.const_expr(cfg.pdl):
             release_dependent_grid()
 
@@ -306,10 +330,11 @@ class RegisterTopK:
         x: cute.Tensor,
         lengths: cute.Tensor,
         out: cute.Tensor,
+        values: cute.Tensor,
         status: cute.Tensor,
         stream: cuda_driver.CUstream,
     ):
-        self.kernel(x, lengths, out, status).launch(
+        self.kernel(x, lengths, out, values, status).launch(
             grid=(x.shape[0], 1, 1),
             block=(self.threads, 1, 1),
             min_blocks_per_mp=self.config.ctas_per_sm,
@@ -375,6 +400,9 @@ def topk_register(
     config: RegisterConfig | None = None,
     out: torch.Tensor | None = None,
     status: torch.Tensor | None = None,
+    values: torch.Tensor | None = None,
+    next_n: int = 1,
+    compress_ratio: int = 1,
 ) -> torch.Tensor:
     """Indices of the k largest of each row of ``x`` (rows, N <= 16K), same contract as
     ``topk_streaming``."""
@@ -395,22 +423,55 @@ def topk_register(
             f"row length {n} exceeds this configuration's register capacity {capacity}"
         )
     if lengths is None:
-        lengths = torch.full((rows,), n, device=x.device, dtype=torch.int32)
+        lengths = torch.full(
+            (rows // next_n,), n * compress_ratio, device=x.device, dtype=torch.int32
+        )
     if out is None:
         out = torch.empty(rows, k, device=x.device, dtype=torch.int32)
     if status is None:
         status = torch.empty(rows * STATUS_WORDS, device=x.device, dtype=torch.int32)
-    key = (x.dtype, k, rows, n, config, facts.capability)
+    vals = values if values is not None else _no_values(x.device, x.dtype)
+    key = (
+        x.dtype,
+        k,
+        rows,
+        n,
+        config,
+        facts.capability,
+        next_n,
+        compress_ratio,
+        values is not None,
+    )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     args = (
         from_dlpack(x),
         from_dlpack(lengths),
         from_dlpack(out),
+        from_dlpack(vals),
         from_dlpack(status),
         stream,
     )
     if key not in _compiled:
-        kern = RegisterTopK(_DTYPES[x.dtype], k, config, facts.shared_memory_optin)
+        kern = RegisterTopK(
+            _DTYPES[x.dtype],
+            k,
+            config,
+            facts.shared_memory_optin,
+            next_n,
+            compress_ratio,
+            values is not None,
+        )
         _compiled[key] = cute.compile(kern.launch, *args)
     _compiled[key](*args)
     return out
+
+
+_placeholders: dict = {}
+
+
+def _no_values(device, dtype) -> torch.Tensor:
+    """A one-element stand-in for the values tensor when none is requested (never written)."""
+    key = (device, dtype)
+    if key not in _placeholders:
+        _placeholders[key] = torch.empty(1, 1, device=device, dtype=dtype)
+    return _placeholders[key]

@@ -41,6 +41,8 @@ from ..phases.repair import verdict_and_repair, verdict_and_repair_cluster
 from ..phases.resolve import emit_and_select, emit_and_select_cluster
 from ..phases.sample import Threshold, sample_probe, sample_threshold
 from ..phases.slab import merge_slab, publish_and_arrive, slab_words_per_row
+from ..phases.varlen import effective_length, gather_values
+from .register_resident import _no_values
 from ...device.cluster import cluster_rank
 
 __all__ = ["StreamingConfig", "StreamingTopK", "topk_streaming"]
@@ -152,8 +154,16 @@ class StreamingTopK:
     """A compiled streaming top-k for one (dtype, k, config); call it on (rows, N) inputs."""
 
     def __init__(
-        self, dtype, k: int, config: StreamingConfig, shared_memory_limit: int
+        self,
+        dtype,
+        k: int,
+        config: StreamingConfig,
+        shared_memory_limit: int,
+        next_n: int = 1,
+        compress_ratio: int = 1,
+        return_values: bool = False,
     ):
+        self.dtype = dtype
         self.elems = Elements.of(dtype)
         self.k = k
         self.config = config
@@ -161,6 +171,9 @@ class StreamingTopK:
         self.aim_policy = aim_tight if config.aim == "tight" else aim_wide
         self.threads = config.threads
         self.warps = config.threads // 32
+        self.next_n = next_n
+        self.compress_ratio = compress_ratio
+        self.return_values = return_values
 
     @cute.jit
     def exact_select(
@@ -208,6 +221,7 @@ class StreamingTopK:
         x: cute.Tensor,
         lengths: cute.Tensor,
         out: cute.Tensor,
+        values: cute.Tensor,
         status: cute.Tensor,
         slab: cute.Tensor,
         counters: cute.Tensor,
@@ -267,16 +281,18 @@ class StreamingTopK:
         probe = sample_probe(
             elems, row_ptr, n_cols, tidx, threads, cfg.sample_vectors
         )  # in flight while the length loads
-        length = lengths[row]
-        if length < 0:
-            length = cutlass.Int32(0)
-        if length > cutlass.Int32(n_cols):
-            length = cutlass.Int32(n_cols)
+        length = effective_length(
+            lengths, row, n_cols, self.next_n, self.compress_ratio
+        )
+        emitter = cutlass.Int32(
+            0
+        )  # 1 on the CTA that wrote this row's indices (for the values gather)
 
         # the two direct arms are rank 0's alone; peers of a cluster idle through them (no
         # cluster barrier or DSMEM access happens on these arms)
         if cutlass.Int32(k) >= length:
             if rank == 0:
+                emitter = cutlass.Int32(1)
                 for i in range(tidx, k, threads):
                     v = cutlass.Int32(-1)
                     if i < length:
@@ -288,6 +304,7 @@ class StreamingTopK:
         else:
             if length <= cutlass.Int32(cfg.short_cutoff):
                 if rank == 0:
+                    emitter = cutlass.Int32(1)
                     arm = self.exact_select(
                         row_ptr,
                         length,
@@ -554,6 +571,7 @@ class StreamingTopK:
                     mark = read_clock64()
                 arm = cutlass.Int32(2)
                 if finisher == 1:
+                    emitter = cutlass.Int32(1)
                     if ok == 0:
                         arm = self.exact_select(
                             row_ptr,
@@ -580,6 +598,21 @@ class StreamingTopK:
                         status_row[0] = cutlass.Int32(1) - ok
                         status_row[1] = arm
                         status_row[2] = survivors
+        if cutlass.const_expr(self.return_values):
+            # the emitter wrote the ties and the fallback itself; in a cluster the peers' winners
+            # preceded the cluster barrier, in a slab the last arriver copied everything: after
+            # this block barrier every index of the row is visible to the emitter
+            if emitter == 1:
+                cute.arch.barrier()
+                gather_values(
+                    self.dtype,
+                    row_ptr,
+                    out_row,
+                    values.iterator + cutlass.Int64(row) * k,
+                    k,
+                    tidx,
+                    threads,
+                )
         if cutlass.const_expr(cfg.pdl):
             release_dependent_grid()
 
@@ -589,6 +622,7 @@ class StreamingTopK:
         x: cute.Tensor,
         lengths: cute.Tensor,
         out: cute.Tensor,
+        values: cute.Tensor,
         status: cute.Tensor,
         slab: cute.Tensor,
         counters: cute.Tensor,
@@ -598,7 +632,7 @@ class StreamingTopK:
         stream ordering with the surrounding torch work both hold)."""
         splits = self.config.splits
         if cutlass.const_expr(splits > 1 and self.config.merge == "cluster"):
-            self.kernel(x, lengths, out, status, slab, counters).launch(
+            self.kernel(x, lengths, out, values, status, slab, counters).launch(
                 grid=(x.shape[0], splits, 1),
                 block=(self.threads, 1, 1),
                 cluster=(1, splits, 1),
@@ -607,7 +641,7 @@ class StreamingTopK:
                 stream=stream,
             )
         else:
-            self.kernel(x, lengths, out, status, slab, counters).launch(
+            self.kernel(x, lengths, out, values, status, slab, counters).launch(
                 grid=(x.shape[0], splits, 1),
                 block=(self.threads, 1, 1),
                 min_blocks_per_mp=self.config.ctas_per_sm,
@@ -651,13 +685,20 @@ def topk_streaming(
     config: StreamingConfig | None = None,
     out: torch.Tensor | None = None,
     status: torch.Tensor | None = None,
+    values: torch.Tensor | None = None,
+    next_n: int = 1,
+    compress_ratio: int = 1,
 ) -> torch.Tensor:
     """Indices of the k largest elements of each row of ``x`` (rows, N), as an int32 (rows, k)
-    tensor.  ``lengths`` (rows, int32) limits each row to its first ``lengths[r]`` elements;
-    rows shorter than k are padded with -1.  NaN ranks above +inf, as in torch.  Order within
-    a row is unspecified.  ``out`` and ``status`` (rows * STATUS_WORDS, int32) are written in
-    place when given, so a caller in a hot loop allocates nothing.  ``config`` defaults to the
-    dispatcher's choice for the device and problem.
+    tensor.  ``lengths`` (rows // next_n, int32) limits each row to its first elements: row r
+    sees ``(lengths[r // next_n] - next_n + r % next_n + 1) // compress_ratio`` of them (the
+    speculative-decode stride and the KV-index compression; both default to 1, when it is
+    ``lengths[r]``).  Rows shorter than k are padded with -1.  NaN ranks above +inf, as in
+    torch.  Order within a row is unspecified.  ``out``, ``status`` (rows * STATUS_WORDS,
+    int32) and ``values`` (rows, k, x's dtype: the selected elements, -inf in padding) are
+    written in place when given, so a caller in a hot loop allocates nothing; values are only
+    produced when ``values`` is passed.  ``config`` defaults to the dispatcher's choice for the
+    device and problem.
     """
     from ...dispatch.device import device_facts
 
@@ -673,25 +714,47 @@ def topk_streaming(
     if config is None:
         config = streaming_config_for(facts, x.dtype, k, n, rows)
     if lengths is None:
-        lengths = torch.full((rows,), n, device=x.device, dtype=torch.int32)
+        lengths = torch.full(
+            (rows // next_n,), n * compress_ratio, device=x.device, dtype=torch.int32
+        )
     if out is None:
         out = torch.empty(rows, k, device=x.device, dtype=torch.int32)
     if status is None:
         status = torch.empty(rows * STATUS_WORDS, device=x.device, dtype=torch.int32)
-    key = (x.dtype, k, rows, n, config, facts.capability)
+    vals = values if values is not None else _no_values(x.device, x.dtype)
+    key = (
+        x.dtype,
+        k,
+        rows,
+        n,
+        config,
+        facts.capability,
+        next_n,
+        compress_ratio,
+        values is not None,
+    )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     slab, counters = _slab_workspace(x.device, rows, config)
     args = (
         from_dlpack(x),
         from_dlpack(lengths),
         from_dlpack(out),
+        from_dlpack(vals),
         from_dlpack(status),
         from_dlpack(slab),
         from_dlpack(counters),
         stream,
     )
     if key not in _compiled:
-        kern = StreamingTopK(_DTYPES[x.dtype], k, config, facts.shared_memory_optin)
+        kern = StreamingTopK(
+            _DTYPES[x.dtype],
+            k,
+            config,
+            facts.shared_memory_optin,
+            next_n,
+            compress_ratio,
+            values is not None,
+        )
         _compiled[key] = cute.compile(kern.launch, *args)
     _compiled[key](*args)
     return out
