@@ -124,6 +124,24 @@ def splits_for(
     return 1, "slab"
 
 
+def _unroll_for(
+    facts: DeviceFacts, threads: int, slice_elems: int, per_vector: int
+) -> int:
+    """Vectors per thread per filter iteration: the device's fact (8 where bytes in flight pay,
+    see ``device.py``; 8 for 512-thread CTAs on the A100 too, where the register headroom
+    lets it pay), never more than the dead mask holds (32 elements) nor more than the slice
+    gives each thread (a slice of one iteration is walked as a boundary iteration otherwise:
+    B200 64K b=8 in 4-CTA clusters 7.37 -> 8.21 us at unroll 8)."""
+    unroll = facts.filter_unroll
+    if threads == 512 and facts.capability == (8, 0):
+        unroll = 8
+    unroll = min(unroll, 32 // per_vector)
+    per_thread = max(1, (slice_elems // per_vector) // threads)
+    while unroll > 1 and unroll > per_thread:
+        unroll //= 2
+    return unroll
+
+
 def streaming_config_for(
     facts: DeviceFacts, dtype: torch.dtype, k: int, n: int, rows: int = 0
 ) -> StreamingConfig:
@@ -137,6 +155,7 @@ def streaming_config_for(
     )
     splits, merge = splits_for(facts, rows, n, elem_bytes) if rows else (1, "cluster")
     aim = "wide" if (merge == "slab" and splits > 1) else "tight"
+    per_vector = 16 // elem_bytes
     cfg = StreamingConfig(
         threads=threads,
         tie_capacity=tie_capacity,
@@ -145,6 +164,7 @@ def streaming_config_for(
         splits=splits,
         merge=merge,
         aim=aim,
+        unroll=_unroll_for(facts, threads, n // splits, per_vector),
     )
     row_kb = row_bytes >> 10
     wide_batch = rows > facts.sm_count and (
@@ -159,10 +179,20 @@ def streaming_config_for(
                 "ctas_per_sm": 2,
                 "stage": wide_stage,
                 "tie_capacity": max(1024, k),
+                "unroll": _unroll_for(facts, 512, n, per_vector),
             }
         )
         if 2 * wide.shared_memory_bytes() <= facts.shared_memory_optin:
             return wide
+        if k == 2048:
+            # 99 KB parts: the 8K stage does not fit two CTAs per SM; a 3584-entry stage does,
+            # and a second sample vector keeps its tails at 3.6 sigma with the balanced aim
+            # (the tight aim would sit at the cap: docs/measured-worse.md, 4K stage at k=2048)
+            small = StreamingConfig(
+                **{**wide.__dict__, "stage": 3584, "sample_vectors": 2}
+            )
+            if 2 * small.shared_memory_bytes() <= facts.shared_memory_optin:
+                return small
     if row_bytes // splits >= BIG_ROW_BYTES:  # the slice a CTA walks, not the row
         big = StreamingConfig(**{**cfg.__dict__, "stage": 16384})
         if big.shared_memory_bytes() <= facts.shared_memory_optin:
