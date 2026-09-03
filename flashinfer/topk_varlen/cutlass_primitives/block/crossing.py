@@ -45,19 +45,33 @@ def _bin_word(v0, v1, v2, v3, v4, v5, v6, v7, j: cutlass.Constexpr):
 
 
 @cute.jit
-def crossing_256_warp(s_hist, target_a, target_b, lane, clear: cutlass.Constexpr):
+def crossing_256_warp(
+    s_hist,
+    target_a,
+    target_b,
+    lane,
+    clear: cutlass.Constexpr,
+    copies: cutlass.Constexpr = 1,
+):
     """Crossing bins of two target ranks over a 256-bin Int32 histogram, by one warp.
 
     Contract: exactly one warp calls this with all 32 lanes; ``s_hist`` is 16-byte aligned
-    and complete (a barrier separates the last increment from this call).  With ``clear``
-    the histogram is zero on return (the caller's next barrier publishes the zeros).
+    and complete (a barrier separates the last increment from this call).  With ``copies``
+    above one the histogram is the sum of ``copies`` consecutive 256-bin arrays (a privatized
+    histogram; the lanes sum them while loading).  With ``clear`` the histogram (every copy) is
+    zero on return (the caller's next barrier publishes the zeros).
     Returns ``(bin_a, above_a, count_a, bin_b, above_b, count_b)`` on every lane.
-    Cost: two 16-byte shared loads, one warp scan, 8 steps of compares, three shuffles.
+    Cost: two 16-byte shared loads per copy, one warp scan, 8 steps of compares, three shuffles.
     """
     base_bin = lane * 8
     addr = s_hist.toint() + lane * 32
     v0, v1, v2, v3 = load_shared_16(addr)
     v4, v5, v6, v7 = load_shared_16(addr + 16)
+    for c in cutlass.range_constexpr(1, copies):
+        u0, u1, u2, u3 = load_shared_16(addr + c * 1024)
+        u4, u5, u6, u7 = load_shared_16(addr + c * 1024 + 16)
+        v0, v1, v2, v3 = v0 + u0, v1 + u1, v2 + u2, v3 + u3
+        v4, v5, v6, v7 = v4 + u4, v5 + u5, v6 + u6, v7 + u7
     mine = (v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7).to(cutlass.Int32)
     incl = warp_inclusive_scan_add(mine, lane)
     total = warp_broadcast(incl, 31)
@@ -83,8 +97,9 @@ def crossing_256_warp(s_hist, target_a, target_b, lane, clear: cutlass.Constexpr
                 count_b = c
         above = above + c
     if cutlass.const_expr(clear):
-        clear_shared_16(addr)
-        clear_shared_16(addr + 16)
+        for c in cutlass.range_constexpr(copies):
+            clear_shared_16(addr + c * 1024)
+            clear_shared_16(addr + c * 1024 + 16)
     # exactly one lane hit each target (or lane 0 by the bin-0 rule); the bin doubles as the
     # lane address for the broadcast
     bin_a = warp_max_u32(cutlass.Uint32(hit_a)).to(cutlass.Int32)
@@ -146,16 +161,33 @@ def crossing_wide_pair(
     Thread t owns bins ``t * items .. (t + 1) * items`` with ``items = bins // threads``.
     ``s_slots``: Int32 shared array of ``warps`` entries.  Targets above the total are clamped
     to it.  Publishes ``s_result[0..2]`` for ``target_a`` and ``s_result[3..5]`` for
-    ``target_b`` as (bin, above, count); ends with a block barrier.  Two barriers, two
-    passes over the thread's bins.
+    ``target_b`` as (bin, above, count); ends with a block barrier.  Two barriers, one
+    16-byte shared load per four bins (values kept for the second pass).
     """
     items = cutlass.const_expr(bins // threads)
     warps = cutlass.const_expr(threads // 32)
     lane = tidx % 32
     warp = tidx // 32
+    # the thread's bins in one 16-byte load per four (a scalar load per bin is a four-way
+    # bank conflict at this stride), kept in registers for the second pass
+    vals: list = []
+    if cutlass.const_expr(items % 4 == 0):
+        for q in cutlass.range_constexpr(items // 4):
+            v0, v1, v2, v3 = load_shared_16(s_hist.toint() + (tidx * items + 4 * q) * 4)
+            vals.extend(
+                (
+                    v0.to(cutlass.Int32),
+                    v1.to(cutlass.Int32),
+                    v2.to(cutlass.Int32),
+                    v3.to(cutlass.Int32),
+                )
+            )
+    else:
+        for i in cutlass.range_constexpr(items):
+            vals.append(s_hist[tidx * items + i])
     mine = cutlass.Int32(0)
     for i in cutlass.range_constexpr(items):
-        mine = mine + s_hist[tidx * items + i]
+        mine = mine + vals[i]
     incl = warp_inclusive_scan_add(mine, lane)
     if lane == 31:
         s_slots[warp] = incl
@@ -175,7 +207,7 @@ def crossing_wide_pair(
     if tb > total:
         tb = total
     for i in cutlass.range_constexpr(items):
-        c = s_hist[tidx * items + i]
+        c = vals[i]
         below = below + c
         above = total - below
         if above < ta:
