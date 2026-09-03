@@ -2,14 +2,14 @@
 
 Rules, each with its measurement:
 
-* Stage 16K candidates when the slice one CTA walks is 1 MB or more, 8K below.  At 1M fp32
-  elements the tight aim is 6144 and its spread reaches 10K survivors on some rows; with an
-  8K stage one row in a batch of 148 overflowed, re-walked (75 us) and set the batch time:
-  174 us against 105 us with the larger stage.  Below 1 MB the aim stays under 3K and 8K never
-  overflows.  Split rows keep 8K whatever the row: each CTA stages about aim / splits, and the
-  larger carveout leaves less L1 for the walk (B200: 1M b=8 slab 16 13.47 -> 13.02 us, 1M
-  b=12 cluster 8 15.16 -> 14.95, 256K b=8 slab 16 9.77 -> 9.53, 256K b=64 cluster 2 22.3 ->
-  21.8).
+* Stage 16K candidates only where the aim plus three sigma of the survivor count would cross
+  the 8K stage's cap (``_needs_big_stage``: 1M fp32 rows and up at one CTA per row).  At 1M
+  fp32 elements the tight aim is 6144 and its spread reaches 10K survivors on some rows; with
+  an 8K stage one row in a batch of 148 overflowed, re-walked (75 us) and set the batch time:
+  174 us against 105 us with the larger stage.  Everywhere else the larger carveout only costs
+  L1 for the walk (A100 256K b=64 75.2 -> 70.3 us at 8K; B200: 1M b=8 slab 16 13.47 -> 13.02,
+  1M b=12 cluster 8 15.16 -> 14.95, 256K b=8 slab 16 9.77 -> 9.53, 256K b=64 cluster 2 22.3
+  -> 21.8).
 * The larger stage needs about 150 KB of shared memory; parts with a 99 KB budget (L40S,
   RTX 5080) keep 8K and sample four adjacent vectors per thread instead (one 64-byte fetch, a
   16K sample): the survivor count's spread around the aim halves, and with the balanced aim
@@ -193,10 +193,38 @@ def streaming_config_for(
             )
             if 2 * small.shared_memory_bytes() <= facts.shared_memory_optin:
                 return small
-    if row_bytes // splits >= BIG_ROW_BYTES:  # the slice a CTA walks, not the row
+    if _needs_big_stage(k, n, rows, threads, cfg.stage, splits):
         big = StreamingConfig(**{**cfg.__dict__, "stage": 16384})
         if big.shared_memory_bytes() <= facts.shared_memory_optin:
             cfg = big
         else:  # the stage cannot grow: shrink the survivor spread instead (a 16K sample)
             cfg = StreamingConfig(**{**cfg.__dict__, "sample_vectors": 4})
     return cfg
+
+
+def _needs_big_stage(
+    k: int, n: int, rows: int, threads: int, stage: int, splits: int
+) -> bool:
+    """Whether the tight aim plus three sigma of the survivor count would cross three quarters
+    of ``stage`` (the aim's cap), so that a row's survivors would overflow it and re-walk.
+
+    The survivor count spreads with sigma ``sqrt(aim * length / samples)``; at 1M fp32 rows
+    (aim 6144, sigma 1250) an 8K stage overflows one row in ten, at 256K rows (aim about 2400,
+    sigma 390) never.  The larger stage is not free: it takes the L1 the filter's survivor
+    re-reads use (A100 256K b=64: 75.2 us with the 16K stage, 70.3 with 8K), so it is taken
+    only where the spread demands it.  Mirrors ``phases/aim.py``: the fixed margin, the
+    3.5-sigma floor for batches of 32 rows or more.
+    """
+    import math
+
+    samples = (
+        threads * 4
+    )  # 16-byte vectors of fp32; 16-bit rows sample twice as many, which only helps
+    per_sample = n / samples
+    aim = k + max(k // 2, n // 256)
+    if rows >= 32:
+        zq = 3.5 * math.sqrt(per_sample)
+        root = (zq + math.sqrt(zq * zq + 4.0 * k)) * 0.5
+        aim = max(aim, int(root * root) + 1)
+    sigma = math.sqrt(aim * per_sample)
+    return aim + 3.0 * sigma > 0.75 * stage * splits
