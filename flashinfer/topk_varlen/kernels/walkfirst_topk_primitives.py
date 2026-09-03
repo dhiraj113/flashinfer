@@ -59,8 +59,9 @@ from .fallback_topk_primitives import GatedExactFallback
 from .radix_topk_primitives import (
     gmem_atomic_add,
     gmem_red_add,
-    read_globaltimer,
+    read_clock64,
     smem_atomic_add,
+    smem_red_max_u32,
     warp_inclusive_sum,
     warp_sum,
 )
@@ -253,7 +254,7 @@ class WalkFirstTopK(SampledPivotTopK):
     psamp: int = PSAMP
     # Compile-time phase-telemetry switch (plain Python bool, read at
     # trace time): when False (production default) every
-    # read_globaltimer() and the status-buffer phase writes (blocks 5-9)
+    # read_clock64() and the status-buffer phase writes (blocks 5-9)
     # are never traced -- zero instructions in the compiled kernel.
     # Enabled per-specialization by get_walkfirst_kernel(telemetry=True)
     # or FLASHINFER_TOPK_WF_TELEMETRY=1 (used by phase_walkfirst.py).
@@ -672,6 +673,13 @@ class WalkFirstTopK(SampledPivotTopK):
                     b0, b1, b2, b3 = ld_global_nc_v4_u32(va + stride16)
                     c0, c1, c2, c3 = ld_global_nc_v4_u32(va + stride16 * 2)
                     d0, d1, d2, d3 = ld_global_nc_v4_u32(va + stride16 * 3)
+                    # (An L2 prefetch of the next tile here -- 4 x
+                    # prefetch.global.L2, no registers -- was built and
+                    # MEASURED: walk 5.26 -> 5.48us at 64K.  The walk takes
+                    # the same ~1us per 64KB tile with 8 CTAs or 148 on the
+                    # GPU, so it is issue-bound on the classify + survivor
+                    # bit-walk, not waiting on HBM; prefetching only adds
+                    # instructions.  Removed.)
                     if cutlass.const_expr(self.wf_pair16):
                         bf = cutlass.const_expr(self.dtype == cutlass.BFloat16)
                         dead = wf_dead_v4_16(dead, a0, a1, a2, a3, tf2, 0, bf)
@@ -847,12 +855,30 @@ class WalkFirstTopK(SampledPivotTopK):
         slab_h = slab_k + 2 * GCAP  # row survivor histogram: 256 ints
         slab_t = slab_h + 256  # per-CTA publish tables (S > 1 gmem path)
         mc_row = mc_ptr + row64 * 8
+        tel_k = cutlass.const_expr(self.wf_telemetry)
+        # Sub-phase telemetry uses ONE running mark (ts_m): each mark writes
+        # its delta straight into the status buffer instead of holding its
+        # own timestamp.  The DSL traces even a const-false `if tel:` region
+        # and carries every name assigned inside it as a region result, so
+        # each extra Int64 timestamp is a live value in PRODUCTION too --
+        # eight of them measured +0.3us at 256K b=1 on the register-bound
+        # S=16 kernel.  Blocks: 16 entry->PDL, 17 PDL->ts0, 10-13 sample
+        # sub-phases, 19 aim math, 21 tie select.
+        ts_m = cutlass.Int64(0)
+        if tel_k:
+            ts_m = read_clock64()
         # PDL (SM90+, compiled out otherwise): the launch/prologue above may
         # overlap the previous kernel in the stream; wait before the first
         # global read (seqlen, hints, inputs, and this kernel's own self-
         # resetting slab/mc_state from the previous launch).
         if cutlass.const_expr(self.enable_pdl):
             griddepcontrol_wait()
+        if tel_k:
+            if tidx == 0:
+                st_ptr[num_rows_dbg * 16 + row] = (read_clock64() - ts_m).to(
+                    cutlass.Int32
+                )
+            ts_m = read_clock64()
 
         length = seq_ptr[row]
         if length < 0:
@@ -911,9 +937,10 @@ class WalkFirstTopK(SampledPivotTopK):
             else:
                 tel = cutlass.const_expr(self.wf_telemetry)
                 # pre-define timestamps: the DSL's staged-control-flow rewriter
-                # requires names used inside an if region to exist beforehand,
-                # even under a const-false condition; these are dead movs in
-                # production (ptxas eliminates them)
+                # requires names assigned inside an if region to exist
+                # beforehand, even under a const-false condition, and carries
+                # them as region results (see ts_m at the kernel top) -- keep
+                # this set minimal
                 ts0 = cutlass.Int64(0)
                 ts1 = cutlass.Int64(0)
                 ts2 = cutlass.Int64(0)
@@ -922,7 +949,10 @@ class WalkFirstTopK(SampledPivotTopK):
                 ts3b = cutlass.Int64(0)
                 ts4 = cutlass.Int64(0)
                 if tel:
-                    ts0 = read_globaltimer()
+                    ts0 = read_clock64()
+                    if tidx == 0:  # block 17: PDL released -> ts0 (seqlen + geometry)
+                        st_ptr[num_rows_dbg * 17 + row] = (ts0 - ts_m).to(cutlass.Int32)
+                    ts_m = ts0
                 # slice geometry (walk + sample share it)
                 chunk = (
                     (length + cutlass.Int32(S) - 1) // cutlass.Int32(S)
@@ -1047,6 +1077,12 @@ class WalkFirstTopK(SampledPivotTopK):
                                     nk = n2
                     kk = warp_max_u32(kk)
                     nk = warp_max_u32(nk)
+                    if tel:  # block 10: sample vector loaded + folded
+                        if tidx == 0:
+                            st_ptr[num_rows_dbg * 10 + row] = (
+                                read_clock64() - ts_m
+                            ).to(cutlass.Int32)
+                        ts_m = read_clock64()
                     lane_s = tidx % 32
                     warp_s = tidx // 32
                     if lane_s == 0:
@@ -1063,12 +1099,22 @@ class WalkFirstTopK(SampledPivotTopK):
                                 s_hm[64 + warp_s] = hg_cnt
                     if tidx < 256:
                         s_h256[tidx] = cutlass.Int32(0)
+                    if tel:
+                        if tidx == 0:
+                            s_misc[3] = cutlass.Int32(0)  # max per-thread walk time
+                            s_misc[5] = cutlass.Int32(0)  # 0x7FFFFFFF - min walk time
                     cute.arch.barrier()  # B1: partials + hist zeros
                     # cross-warp fold: ONE lane-indexed load + ONE redux per
                     # value (a 32-iteration serial loop here was measured slow)
                     kmax = warp_max_u32(cutlass.Uint32(s_warp_sums[lane_s]))
                     kminc = warp_max_u32(cutlass.Uint32(s_count[lane_s]))
                     kmin = ~kminc
+                    if tel:  # block 11: B1 + cross-warp fold
+                        if tidx == 0:
+                            st_ptr[num_rows_dbg * 11 + row] = (
+                                read_clock64() - ts_m
+                            ).to(cutlass.Int32)
+                        ts_m = read_clock64()
                     smin_f = self._wf_val_of_key(kmin)
                     smax_f = self._wf_val_of_key(kmax)
                     span = smax_f - smin_f
@@ -1091,6 +1137,12 @@ class WalkFirstTopK(SampledPivotTopK):
                                     bs = cutlass.Int32(255)
                                 smem_atomic_add(s_h256 + bs, 1)
                     cute.arch.barrier()  # B2: sample histogram
+                    if tel:  # block 12: sample histogram + B2
+                        if tidx == 0:
+                            st_ptr[num_rows_dbg * 12 + row] = (
+                                read_clock64() - ts_m
+                            ).to(cutlass.Int32)
+                        ts_m = read_clock64()
                     retry_cap = cutlass.const_expr(
                         self.mc_splits == 1 or (self.wf_cluster and self.mc_splits <= 4)
                     )
@@ -1172,9 +1224,21 @@ class WalkFirstTopK(SampledPivotTopK):
                     if r3 > self.psamp:
                         r3 = cutlass.Int32(self.psamp)
                     # ONE warp-0 pass: both ladder crossings + free re-zero of
-                    # s_h256 for the walk's survivor histogram
+                    # s_h256 for the walk's survivor histogram.  (Two
+                    # alternatives were built and MEASURED WORSE or equal on
+                    # B200 at 64K: a 256-thread scan with a named barrier
+                    # (0.73us, same) and a redundant per-warp scan without the
+                    # B3 barrier (1.3us: 32 warps issuing the same ~900-cycle
+                    # dependent chain saturate the 4 schedulers, so idling 31
+                    # warps behind one barrier is the cheaper shape).)
                     self._wf_scan_cross0_2t(s_h256, r_aim, r3, tidx, s_misc)
                     cute.arch.barrier()  # B3: scan publish + zeros
+                    if tel:  # block 13: crossing scan + B3
+                        if tidx == 0:
+                            st_ptr[num_rows_dbg * 13 + row] = (
+                                read_clock64() - ts_m
+                            ).to(cutlass.Int32)
+                        ts_m = read_clock64()
                     bkt = s_misc[RES_B]
                     bkt3 = s_misc[RES_B2]
                     w_bin = span / cutlass.Float32(256.0)
@@ -1227,7 +1291,9 @@ class WalkFirstTopK(SampledPivotTopK):
                     if sspan3 > cutlass.Float32(0.0):
                         sc3 = cutlass.Float32(255.0) / sspan3
                 if tel:
-                    ts1 = read_globaltimer()
+                    ts1 = read_clock64()
+                    if tidx == 0:  # block 19: aim / threshold arithmetic
+                        st_ptr[num_rows_dbg * 19 + row] = (ts1 - ts_m).to(cutlass.Int32)
                 self._wf_walk_slice(
                     row_in,
                     start,
@@ -1242,7 +1308,11 @@ class WalkFirstTopK(SampledPivotTopK):
                     tidx,
                 )
                 if tel:
-                    ts2 = read_globaltimer()
+                    ts2 = read_clock64()
+                    # per-thread walk-time spread (straggler diagnosis)
+                    wdt = cutlass.Uint32((ts2 - ts1).to(cutlass.Int32))
+                    smem_red_max_u32(s_misc + 3, wdt)
+                    smem_red_max_u32(s_misc + 5, cutlass.Uint32(0x7FFFFFFF) - wdt)
 
                 if cutlass.const_expr(self.wf_cluster and S > 1):
                     # ---- CLUSTER EPILOGUE (the S CTAs of a row = one hw
@@ -1272,7 +1342,7 @@ class WalkFirstTopK(SampledPivotTopK):
                         s_count[4] = cutlass.Int32(0)  # tie cursor (rank 0)
                     _cluster_sync_aligned()
                     if tel:
-                        ts3 = read_globaltimer()
+                        ts3 = read_clock64()
                         ts3a = ts3
                         ts3b = ts3
                     # replicated peer reads: identical result on every CTA,
@@ -1365,7 +1435,7 @@ class WalkFirstTopK(SampledPivotTopK):
                         cl_binb = s_misc[0]
                         cl_above = s_misc[1]
                         if tel:
-                            ts3a = read_globaltimer()
+                            ts3a = read_clock64()
                         # distributed classify of this CTA's OWN candidates
                         cl_wcur = _mapa_shared_cluster(
                             s_misc, cutlass.Int32(0)
@@ -1403,7 +1473,7 @@ class WalkFirstTopK(SampledPivotTopK):
                                         )
                     _cluster_sync_aligned()
                     if tel:
-                        ts3b = read_globaltimer()
+                        ts3b = read_clock64()
                     if sl == 0:
                         if cl_ok == 1:  # CTA-uniform on rank 0
                             cl_nb = s_count[4]
@@ -1476,7 +1546,7 @@ class WalkFirstTopK(SampledPivotTopK):
                                 tidx,
                             )
                         if tel:
-                            ts4 = read_globaltimer()
+                            ts4 = read_clock64()
                         if tidx == 0:
                             st_ptr[row] = cutlass.Int32(1) - cl_ok
                             st_ptr[num_rows_dbg + row] = cutlass.Int32(6)
@@ -1498,6 +1568,10 @@ class WalkFirstTopK(SampledPivotTopK):
                                 st_ptr[num_rows_dbg * 9 + row] = (ts3b - ts3a).to(
                                     cutlass.Int32
                                 )
+                                st_ptr[num_rows_dbg * 14 + row] = (ts3 - ts2).to(
+                                    cutlass.Int32
+                                )
+                                st_ptr[num_rows_dbg * 15 + row] = s_count[4]  # ties
                 else:
                     # bulk publish: one range reservation + copies + 256 red.adds.
                     # S == 1 SHORT-CIRCUIT: the sole CTA is its own last arriver
@@ -1563,7 +1637,7 @@ class WalkFirstTopK(SampledPivotTopK):
                     # ---- 3. last-arriver epilogue (no spins anywhere) ----
                     cute.arch.barrier()
                     if tel:
-                        ts3 = read_globaltimer()
+                        ts3 = read_clock64()
                     if tidx == 0:
                         s_misc[11] = cutlass.Int32(0)
                         if cutlass.const_expr(S > 1):
@@ -1696,7 +1770,7 @@ class WalkFirstTopK(SampledPivotTopK):
                             binb = s_misc[0]
                             above = s_misc[1]
                             if tel:
-                                ts3a = read_globaltimer()  # hist gather + scan done
+                                ts3a = read_clock64()  # hist gather + scan done
                             # emit winners above bin B; stage bin-B ties for the
                             # exact key-space sub-select
                             if tidx == 0:
@@ -1705,7 +1779,17 @@ class WalkFirstTopK(SampledPivotTopK):
                             cute.arch.barrier()
                             if cutlass.const_expr(S == 1):
                                 # candidates never left shared memory: classify
-                                # straight from s_cv/s_ci
+                                # straight from s_cv/s_ci with one same-address
+                                # shared atomic per winner / tie.  Two warp-
+                                # aggregated forms were built here and MEASURED
+                                # SLOWER on B200 (64K, k=2048, ~3.1k candidates):
+                                # a 5-step shuffle scan per warp (1.1 -> 2.0us)
+                                # and ballot + popc + lane-0 atomic + shuffle
+                                # (1.1 -> 1.5us).  The hardware already
+                                # coalesces same-address shared atomics well
+                                # enough that the extra collectives and the
+                                # uniform-trip-count loop cost more than they
+                                # save; keep the plain form.
                                 for t in range(tidx, cand, self.nt):
                                     wv = cutlass.Uint32(s_cv[t])
                                     val = self._wf_f32(wv)
@@ -1795,9 +1879,11 @@ class WalkFirstTopK(SampledPivotTopK):
                                     s_count[4] = bm_nt
                             cute.arch.barrier()
                             if tel:
-                                ts3b = read_globaltimer()  # emit pass done
+                                ts3b = read_clock64()  # emit pass done
                             nb = s_count[4]  # bin-B members (== hist[binb] if fit)
                             remaining = top_k - above
+                            if tel:
+                                ts_m = read_clock64()  # tie select start
                             if remaining < 0 or remaining > nb or nb > self.tie_cap:
                                 ok = cutlass.Int32(0)  # bin-B overflow: fallback
                             else:
@@ -1852,6 +1938,11 @@ class WalkFirstTopK(SampledPivotTopK):
                                             out_idx_row,
                                             tidx,
                                         )
+                            if tel:  # block 21: tie select alone
+                                if tidx == 0:
+                                    st_ptr[num_rows_dbg * 21 + row] = (
+                                        read_clock64() - ts_m
+                                    ).to(cutlass.Int32)
                         if ok == 0:
                             # ---- inline exact fallback (fused; no 2nd launch) ----
                             # CTA-uniform (ok derives from uniform smem/gmem reads),
@@ -1878,7 +1969,7 @@ class WalkFirstTopK(SampledPivotTopK):
                                 tidx,
                             )
                         if tel:
-                            ts4 = read_globaltimer()
+                            ts4 = read_clock64()
                         if tidx == 0:
                             st_ptr[row] = cutlass.Int32(1) - ok
                             st_ptr[num_rows_dbg + row] = cutlass.Int32(
@@ -1903,6 +1994,20 @@ class WalkFirstTopK(SampledPivotTopK):
                                 )
                                 st_ptr[num_rows_dbg * 9 + row] = (ts3b - ts3a).to(
                                     cutlass.Int32
+                                )
+                                # epilogue wait: walk end -> last-arriver verdict
+                                st_ptr[num_rows_dbg * 14 + row] = (ts3 - ts2).to(
+                                    cutlass.Int32
+                                )
+                                st_ptr[num_rows_dbg * 15 + row] = s_count[4]  # ties
+                                st_ptr[num_rows_dbg * 18 + row] = (
+                                    read_clock64() - ts4
+                                ).to(cutlass.Int32)  # select end -> status writes done
+                                # per-thread walk time: max / min across the CTA
+                                st_ptr[num_rows_dbg * 4 + row] = s_misc[3]
+                                st_ptr[num_rows_dbg * 20 + row] = cutlass.Int32(
+                                    cutlass.Uint32(0x7FFFFFFF)
+                                    - cutlass.Uint32(s_misc[5])
                                 )
                             # self-reset: counters + the row histogram (S == 1
                             # never touched mc_row or slab_h -- nothing to reset)
@@ -2079,6 +2184,15 @@ def get_walkfirst_kernel(
     # back at 1M).  gvr_2's small-k edge is its leaner fused pipeline,
     # not block shape.  The parameterization stays as an experimentation
     # hook; production uses 1024 threads at every k.
+    #
+    # Wide batches (b > SMs) are the case where block shape WOULD matter: a
+    # 1024-thread CTA at 64 regs fills the register file, so one CTA per SM
+    # and a 256-row batch on 148 SMs runs as two waves, while gvr_2 routes
+    # those batches to 256/512-thread CTAs and wins 1.3-1.6x at 32K-128K.
+    # Measured 2026-09-02: forcing nt=512 here is NOT a usable shortcut --
+    # the walk/cluster/fallback paths carry 1024-thread assumptions beyond
+    # tie_cap (wrong results at k=512 S=2 without any fallback, mass
+    # fallbacks above 32K), so a 512-thread variant is a real port.
     nt = 1024
     cdt = {
         None: cutlass.Float32,
@@ -2090,7 +2204,7 @@ def get_walkfirst_kernel(
     dt_tag = {cutlass.Float32: "f32", cutlass.Float16: "f16", cutlass.BFloat16: "bf16"}[
         cdt
     ]
-    assert top_k <= 2 * nt and N % vec_elems == 0
+    assert top_k <= max(2 * nt, 2048) and N % vec_elems == 0
     assert splits in (1, 2, 3, 4, 6, 8, 16, 32)
     # cs=8 was built and MEASURED WORSE (B200 1M b=16: 18.1 -> 28.3us):
     # an 8-CTA cluster must pack into one GPC, and at 1 CTA/SM occupancy
@@ -2164,6 +2278,9 @@ def get_walkfirst_kernel(
         nt=nt,
     )
     kern.mc_splits = splits
+    # the tie stage must hold a full rank-k bin regardless of block shape
+    # (the base class sizes it 2*nt; the 512-thread shape needs >= k)
+    kern.tie_cap = max(2 * nt, top_k)
     kern.wf_telemetry = telemetry
     kern.wf_cluster = use_cluster
     force_retry = os.environ.get("FLASHINFER_TOPK_WF_FORCE_RETRY") == "1"
