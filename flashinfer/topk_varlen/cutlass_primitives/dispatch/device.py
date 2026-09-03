@@ -23,6 +23,7 @@ class DeviceFacts:
     sm_count: int
     shared_memory_optin: int  # bytes per block with the opt-in attribute
     supports_clusters: bool  # thread-block clusters and DSMEM (SM90+)
+    max_fast_cluster: int  # largest cluster whose DSMEM merge beats the slab merge here (0: none; see _facts)
     supports_pdl: bool  # programmatic dependent launch (SM90+)
     packed_bf16_compare: bool  # setp.le.bf16x2 (SM90+); fp16x2 is available everywhere
 
@@ -38,6 +39,11 @@ def _facts(index: int) -> DeviceFacts:
         sm_count=props.multi_processor_count,
         shared_memory_optin=getattr(props, "shared_memory_per_block_optin", 48 * 1024),
         supports_clusters=cc[0] >= 9,
+        # Measured on the RTX 5080 (SM120, 84 SMs): clusters of 2 beat the slab (64K b=32: 12.4
+        # vs 15.1 us; 256K b=32: 21.5 vs 23.9) but clusters of 6 and 8 lose badly (256K b=8:
+        # 16.5 vs 12.7; 1M b=8: 45.6 vs 23.7).  The data-center parts (SM90, SM100, SM107) win
+        # with clusters up to 8.
+        max_fast_cluster=0 if cc[0] < 9 else (4 if cc[0] == 12 else 8),
         supports_pdl=cc[0] >= 9,
         packed_bf16_compare=cc[0] >= 9,
     )

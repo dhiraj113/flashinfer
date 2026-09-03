@@ -408,6 +408,9 @@ def register_cluster_config_for(
     )
 
 
+__all__ = list(__all__) + ["SLICE_ELEMENTS"]
+
+
 def topk_register_cluster(
     x: torch.Tensor,
     k: int,
