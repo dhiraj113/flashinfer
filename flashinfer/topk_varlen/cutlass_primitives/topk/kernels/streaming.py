@@ -39,7 +39,7 @@ from ..phases.fallback import exact_select_row
 from ..phases.filter_pass import filter_pass
 from ..phases.repair import verdict_and_repair, verdict_and_repair_cluster
 from ..phases.resolve import emit_and_select, emit_and_select_cluster
-from ..phases.sample import Threshold, sample_threshold
+from ..phases.sample import Threshold, sample_probe, sample_threshold
 from ..phases.slab import merge_slab, publish_and_arrive, slab_words_per_row
 from ...device.cluster import cluster_rank
 
@@ -69,6 +69,7 @@ class StreamingConfig:
     aim: str = "tight"  # "tight" | "wide"
     floor_multiple: int = 2
     span_ext: float = 1.5
+    sample_vectors: int = 1  # adjacent 16-byte vectors per thread in the sample (1, 2 or 4): the survivor spread shrinks with the square root
     # stage
     stage: int = 8192
     tie_capacity: int = 2048
@@ -92,6 +93,8 @@ class StreamingConfig:
             )
         if self.aim not in ("tight", "wide"):
             raise ValueError(f"unknown aim policy {self.aim!r}")
+        if self.sample_vectors not in (1, 2, 4):
+            raise ValueError("sample_vectors must be 1, 2 or 4")
         if self.stage < 4096 or self.stage % 256:
             raise ValueError(
                 "stage must be a multiple of 256 and at least 4096 (the census histogram aliases it)"
@@ -245,14 +248,17 @@ class StreamingTopK:
         if telemetry:
             mark = read_clock64()
 
+        row_ptr = x.iterator + cutlass.Int64(row) * n_cols
+        out_row = out.iterator + cutlass.Int64(row) * k
+        status_row = status.iterator + cutlass.Int64(row) * STATUS_WORDS
+        probe = sample_probe(
+            elems, row_ptr, n_cols, tidx, threads, cfg.sample_vectors
+        )  # in flight while the length loads
         length = lengths[row]
         if length < 0:
             length = cutlass.Int32(0)
         if length > cutlass.Int32(n_cols):
             length = cutlass.Int32(n_cols)
-        row_ptr = x.iterator + cutlass.Int64(row) * n_cols
-        out_row = out.iterator + cutlass.Int64(row) * k
-        status_row = status.iterator + cutlass.Int64(row) * STATUS_WORDS
 
         # the two direct arms are rank 0's alone; peers of a cluster idle through them (no
         # cluster barrier or DSMEM access happens on these arms)
@@ -297,7 +303,9 @@ class StreamingTopK:
                     count = chunk
                 if count < 0:
                     count = cutlass.Int32(0)
-                samples = cutlass.const_expr(threads * elems.per_vector)
+                samples = cutlass.const_expr(
+                    threads * elems.per_vector * cfg.sample_vectors
+                )
                 aim = self.aim_policy(
                     k, length, rows, samples, 3 * cfg.stage * splits // 4
                 )
@@ -306,6 +314,8 @@ class StreamingTopK:
                         elems,
                         row_ptr,
                         length,
+                        n_cols,
+                        probe,
                         aim,
                         cfg.floor_multiple,
                         cfg.span_ext,
@@ -315,6 +325,7 @@ class StreamingTopK:
                         tidx,
                         threads,
                         cfg.telemetry,
+                        cfg.sample_vectors,
                     )
                 )
                 if telemetry:
@@ -401,6 +412,7 @@ class StreamingTopK:
                             cfg.stage,
                             out_row,
                             s_keys,
+                            s_idx,
                             s_merged,
                             s_tie_keys,
                             s_tie_idx,

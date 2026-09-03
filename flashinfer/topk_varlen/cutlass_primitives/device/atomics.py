@@ -28,6 +28,7 @@ __all__ = [
     "shared_count",
     "shared_add_noreturn",
     "global_add",
+    "global_add_acq_rel",
     "global_add_noreturn",
     "fence_release_gpu",
     "global_store_release",
@@ -81,6 +82,20 @@ def global_add(ptr, val):
     publishes earlier writes.
     """
     return cute.arch.atomic_add(ptr, cutlass.Int32(val), sem="relaxed", scope="gpu")
+
+
+@cute.jit
+def global_add_acq_rel(ptr, val):
+    """Add ``val`` (Int32) at global pointer ``ptr`` with acquire-release semantics, GPU scope;
+    return the old value.
+
+    ``atom.acq_rel.gpu.global.add``: the arrival handshake in one instruction.  Release orders
+    this thread's earlier writes (the published slab) before the add; acquire makes every
+    earlier arriver's published writes visible to the thread that sees the final count.
+    Replaces a ``fence_release_gpu`` + relaxed add + ``fence.acq_rel`` triple (two memory-
+    pipeline drains, one of them paid by every CTA; measured 0.2 us per row at 1M b=8).
+    """
+    return cute.arch.atomic_add(ptr, cutlass.Int32(val), sem="acq_rel", scope="gpu")
 
 
 @cute.jit

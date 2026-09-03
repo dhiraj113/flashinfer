@@ -267,7 +267,11 @@ def classify_from_registers(
     ``packed_bins`` is what ``count_coarse_bins`` returned.  Positions come from one block
     scan of per-thread (winner, tie) counts packed in one Int32 (16 bits each; at most 32
     elements per thread).  ``s_slots``: warps Int32 scratch.  Two barriers, inside the scan;
-    the caller barriers before reading the tie stage.
+    the caller barriers before reading the tie stage.  (Warp-aggregated tickets on two shared
+    cursors instead of the scan measured 0.15 us slower at 16K b=64 on B200: the two extra
+    warp scans and atomics cost more than the two barriers they remove; tickets for the winners
+    alone with per-tie atomics gained 0.07 us at 16K b=64 but lost 0.1-0.2 us at 4K b=256 and
+    8K b=64.)
     """
     pairs = cutlass.const_expr(words * elems.per_word // 2)
     win_mask, tie_mask = _masks(packed_bins, cut_bin, pairs)
