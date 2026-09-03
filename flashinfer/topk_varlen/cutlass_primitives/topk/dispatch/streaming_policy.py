@@ -62,7 +62,7 @@ import torch
 
 from ...dispatch.device import DeviceFacts, cluster_capacity
 
-from ..kernels.streaming import StreamingConfig
+from ..kernels.streaming import EXACT_ONLY, StreamingConfig
 
 __all__ = ["streaming_config_for", "splits_for"]
 
@@ -149,9 +149,9 @@ def streaming_config_for(
     elem_bytes = 4 if dtype == torch.float32 else 2
     row_bytes = n * elem_bytes
     threads = 1024
-    tie_capacity = max(
-        2 * threads, -(-k // threads) * threads
-    )  # a multiple of threads: the radix select's slots per thread
+    # a multiple of threads (the radix select's slots per thread), holding k where eight slots
+    # per thread suffice; a wider crossing bin takes the exact select
+    tie_capacity = min(8 * threads, max(2 * threads, -(-k // threads) * threads))
     packed = dtype == torch.float16 or (
         dtype == torch.bfloat16 and facts.packed_bf16_compare
     )
@@ -195,18 +195,109 @@ def streaming_config_for(
             )
             if 2 * small.shared_memory_bytes() <= facts.shared_memory_optin:
                 return small
-    # large k: k must sit below three quarters of the stage (the balanced aim needs room on
-    # both sides), so k above 6144 at one CTA per row takes the next stage size that holds it
+    # large k: k must sit below three quarters of the stage x splits (the balanced aim needs
+    # room on both sides).  The stage grows first, to what the part's shared memory holds; then
+    # the row is split across more CTAs through the slab; a k that no stage x splits holds
+    # takes the exact select for every row.
     if k >= 3 * cfg.stage * splits // 4:
-        stage = -(-(k * 4 // 3 + 256) // 256) * 256
-        cfg = StreamingConfig(**{**cfg.__dict__, "stage": stage})
-    if _needs_big_stage(k, n, rows, threads, cfg.stage, splits):
+        cfg = _fit_large_k(facts, cfg, k, n, per_vector)
+    if (
+        not cfg.exact_only
+        and cfg.stage < 16384
+        and _needs_big_stage(k, n, rows, threads, cfg.stage, cfg.splits)
+    ):
         big = StreamingConfig(**{**cfg.__dict__, "stage": 16384})
-        if big.shared_memory_bytes() <= facts.shared_memory_optin:
+        if big.shared_memory_bytes() * big.ctas_per_sm <= facts.shared_memory_optin:
             cfg = big
         else:  # the stage cannot grow: shrink the survivor spread instead (a 16K sample)
             cfg = StreamingConfig(**{**cfg.__dict__, "sample_vectors": 4})
+    return _fit_shared_memory(facts, cfg)
+
+
+def _fit_shared_memory(facts: DeviceFacts, cfg: StreamingConfig) -> StreamingConfig:
+    """Shrink the tie stage, a thread's worth at a time down to two slots per thread, until the
+    configuration fits the part's shared memory: on 99 KB parts an 8K survivor stage and an 8K
+    tie stage do not both fit, and the survivor stage is the one the sampled path needs (an
+    overflowing crossing bin only sends the row to the exact select)."""
+    while (
+        cfg.shared_memory_bytes() * cfg.ctas_per_sm > facts.shared_memory_optin
+        and cfg.tie_capacity > 2 * cfg.threads
+    ):
+        cfg = StreamingConfig(
+            **{**cfg.__dict__, "tie_capacity": cfg.tie_capacity - cfg.threads}
+        )
     return cfg
+
+
+def _largest_stage(facts: DeviceFacts, cfg: StreamingConfig) -> int:
+    """The largest stage (multiple of 256) whose configuration fits the part's shared memory."""
+    other = cfg.shared_memory_bytes() - 2 * (cfg.stage + 4) * 4
+    budget = facts.shared_memory_optin // cfg.ctas_per_sm - other
+    return max(2048, (budget // 8 - 4) // 256 * 256)
+
+
+def _fit_large_k(
+    facts: DeviceFacts, cfg: StreamingConfig, k: int, n: int, per_vector: int
+) -> StreamingConfig:
+    """A configuration whose stage x splits holds k with the balanced aim's margin, or the
+    exact-only configuration.
+
+    Two stages compete for shared memory.  The survivor stage must hold 2k / splits per CTA
+    (the cap, 3/4 of stage x splits, then sits at 1.5k and the balanced aim has k/4 of room on
+    each side; at a third of margin the cap sat within 1.4% of k at 1M k=200000 and every row
+    fell back).  The tie stage must hold the crossing bin among the survivors, which at these k
+    is survivors / 256 times the density peak near the bar: a few thousand entries at k=200000
+    (with 2048 slots every row fell back to the exact select, 772 us on B200).  So: the widest
+    tie stage first, the fewest extra splits that let the survivor stage fit beside it; splits
+    beyond one wave are accepted (a second wave of split rows beats one CTA streaming the row
+    several times).  When nothing fits, every row takes the exact select."""
+
+    def stage_for(splits: int) -> int:
+        return -(-(2 * k + 256) // (256 * splits)) * 256
+
+    candidates = [cfg.splits] + [
+        s for s in (8, 16, 32) if s > cfg.splits and n // s >= MIN_SLICE
+    ]
+    for tie in (8 * cfg.threads, 4 * cfg.threads, 2 * cfg.threads):
+        if tie < k // 32:
+            # the crossing bin among ~1.5k survivors spread over 256 bins, at the density peak:
+            # a tie stage below k / 32 overflowed on every row at 1M k=400000 (2048 slots, 679 us
+            # against 300 us for the exact select)
+            break
+        base = StreamingConfig(**{**cfg.__dict__, "tie_capacity": tie})
+        limit = _largest_stage(facts, base)
+        for splits in candidates:
+            stage = max(
+                2048, 256 * splits, stage_for(splits)
+            )  # the slab merge's scratch needs 256 x splits
+            if stage > limit:
+                continue
+            if splits == cfg.splits:
+                return StreamingConfig(
+                    **{**base.__dict__, "stage": max(cfg.stage, stage)}
+                )
+            return StreamingConfig(
+                **{
+                    **base.__dict__,
+                    "splits": splits,
+                    "merge": "slab",
+                    "aim": "wide",
+                    "stage": stage,
+                    "unroll": _unroll_for(facts, cfg.threads, n // splits, per_vector),
+                }
+            )
+    # the exact select's tie stage is its census's: eight slots per thread
+    return StreamingConfig(
+        **{
+            **cfg.__dict__,
+            "splits": 1,
+            "merge": "cluster",
+            "aim": "tight",
+            "stage": 2048,
+            "short_cutoff": EXACT_ONLY,
+            "tie_capacity": 8 * cfg.threads,
+        }
+    )
 
 
 def _needs_big_stage(
