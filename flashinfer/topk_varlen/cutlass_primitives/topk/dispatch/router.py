@@ -7,9 +7,11 @@ This is what a consumer sees as a single backend.  The rules, each from ledger c
    fit one wave, on any part with clusters: the clustered register-resident kernel.  It won
    or tied the streaming kernel on every measured cell of that grid (B200, k=1024: 32K b=8
    7.87 vs 8.07 us, 32K b=32 8.07 vs 8.69, 128K b=8 8.48 vs 8.90, bf16 64K b=32 8.48 vs
-   9.71) except fp32 64K rows in batches under 32 at k <= 1024 (8.48 vs 8.28, 8.28 vs 7.87),
-   which stay with the streaming kernel.  A second wave of clusters costs the whole gain
-   (128K b=16: 14.8 vs 8.9), hence the occupancy bound.
+   9.71) except fp32 64K rows in batches under 32 at k <= 1024 on H100 and B200 (8.28 vs 7.87;
+   H100 13.7 vs 12.5), which stay with the streaming kernel there; on Rubin and the RTX 5080
+   the cluster kernel wins that cell too (6.25 vs 6.42; 8.94 vs 11.0), recorded as the device
+   fact ``cheap_small_clusters``.  A second wave of clusters costs the whole gain (128K b=16:
+   14.8 vs 8.9), hence the occupancy bound.
 3. Everything else: the streaming kernel, whose own policy picks the split and merge.
 
 All three share the output contract, so the choice is invisible to the caller.
@@ -19,7 +21,7 @@ from __future__ import annotations
 
 import torch
 
-from ...dispatch.device import device_facts, max_active_clusters
+from ...dispatch.device import cluster_capacity, device_facts
 
 from ..kernels.register_cluster import (
     SLICE_ELEMENTS,
@@ -51,7 +53,7 @@ def _cluster_kernel_wins(facts, dtype: torch.dtype, k: int, n: int, rows: int) -
     if n <= SLICE_ELEMENTS or n > 8 * SLICE_ELEMENTS:
         return False
     splits = next(s for s in (2, 4, 8) if n <= s * SLICE_ELEMENTS)
-    if rows > max_active_clusters(facts.index, splits):
+    if rows > cluster_capacity(facts.index, splits):
         return False
     if (
         dtype == torch.float32
@@ -59,7 +61,7 @@ def _cluster_kernel_wins(facts, dtype: torch.dtype, k: int, n: int, rows: int) -
         and rows < 32
         and k <= 1024
     ):
-        return False  # the measured exception: fp32 64K rows in small batches
+        return facts.cheap_small_clusters  # fp32 64K rows in small batches: the streaming kernel wins on H100 and B200 (device fact)
     return True
 
 

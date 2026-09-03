@@ -11,17 +11,23 @@ Rules, each with its measurement:
 * Programmatic dependent launch and the packed bf16 compare on SM90 and newer; the packed
   fp16 compare everywhere.
 * Row splits, cluster merge (SM90+): when one CTA per row leaves SMs idle, the row is shared
-  by the largest cluster shape whose clusters all fit one wave by the driver's occupancy query
-  (never ``SMs // size``: B200 fits 45 clusters of 3, not 49) and whose slices keep at least
-  4096 elements.  Shapes above 4 only pay off from 4 MB rows (the wider merge outweighs the
-  shorter slice below that; measured on Rubin 256K b=32: 4 -> 6 went 8.6 -> 8.9 us), and
-  below 1 MB shape 3 already loses (64K b=64: 7.0 -> 7.6 us), so the allowed set narrows with
-  the row size.
+  by the largest cluster shape whose clusters all fit one wave (``cluster_capacity``: the
+  driver's occupancy query, corrected for small shapes where it under-reports; never plain
+  ``SMs // size``: B200 fits 45 clusters of 3, not 49) and whose slices keep at least 4096
+  elements.  Shapes above 4 only pay off from 4 MB rows (the wider merge outweighs the shorter
+  slice below that; measured on Rubin 256K b=32: 4 -> 6 went 8.6 -> 8.9 us), and below 1 MB
+  shape 3 already loses (64K b=64: 7.0 -> 7.6 us), so the allowed set narrows with the row
+  size.  When no shape fits one wave, the largest shape whose CTAs fit the SM count is taken
+  anyway: its second partial wave costs at most twice a wave, which is never worse than one
+  CTA per row (H100 1M b=64: cluster 2 95.7 us, one CTA 155; Rubin 1M b=64: cluster 3 38.0,
+  cluster 2 43.8).
 * Row splits, slab merge, small batches of long rows on any part: 16 CTAs per row from 1 MB
   and 32 from 4 MB when the grid fits one wave.  The cluster merge caps at 8 CTAs and the slab
   slices are shorter; measured on B200 1M b=8: cluster 8 15.7 us, slab 16 13.8; b=1: cluster 8
-  15.6, slab 32 12.2; 256K b=8: cluster 6 10.3, slab 16 10.1.  The slab form cannot re-walk
-  an undershoot, so it takes the wide aim.
+  15.6, slab 32 12.2; 256K b=8: cluster 6 10.3, slab 16 10.1.  Between 16-way slabs and 8-way
+  slabs sits the 8-CTA cluster where it fits one wave (1M b=12: B200 16.5 vs slab 8 18.3, H100
+  29.9 vs 33.4; Rubin 1M b=16: 13.0 vs 15.3).  The slab form cannot re-walk an undershoot, so
+  it takes the wide aim.
 * Row splits, slab merge, parts without clusters: the largest of 8/4/2 CTAs per row that
   keeps the grid within one wave and slices of at least 4096 elements.  Cluster shapes are
   capped by the device fact ``max_fast_cluster`` (4 on consumer Blackwell, where clusters of 6
@@ -44,7 +50,7 @@ from __future__ import annotations
 
 import torch
 
-from ...dispatch.device import DeviceFacts, max_active_clusters
+from ...dispatch.device import DeviceFacts, cluster_capacity
 
 from ..kernels.streaming import StreamingConfig
 
@@ -64,9 +70,16 @@ def splits_for(
     # long rows in small batches: wide slab splits beat the widest cluster (B200 1M b=8: slab
     # 16 13.8 us, cluster 8 15.7; RTX 5080 1M b=8: slab 8 23.7, cluster 8 45.6)
     if row_bytes >= BIG_ROW_BYTES:
-        for s in (32, 16, 8) if row_bytes >= 4 * BIG_ROW_BYTES else (16, 8):
+        for s in (32, 16) if row_bytes >= 4 * BIG_ROW_BYTES else (16,):
             if n // s >= MIN_SLICE and rows * s <= facts.sm_count:
                 return s, "slab"
+        # below 16 CTAs per row the widest cluster beats the 8-way slab (1M b=12: B200 16.5 vs
+        # 18.3 us, H100 29.9 vs 33.4; Rubin 1M b=16: 13.0 vs 15.3), and the slab beats a cluster
+        # that would need a second wave (B200 1M b=16: slab 8 18.3, cluster 8 30.6)
+        if facts.max_fast_cluster >= 8 and rows <= cluster_capacity(facts.index, 8):
+            return 8, "cluster"
+        if n // 8 >= MIN_SLICE and rows * 8 <= facts.sm_count:
+            return 8, "slab"
     if facts.max_fast_cluster >= 2:
         shapes: tuple
         if row_bytes >= 4 * BIG_ROW_BYTES:
@@ -79,7 +92,17 @@ def splits_for(
             if (
                 s <= facts.max_fast_cluster
                 and n // s >= MIN_SLICE
-                and rows <= max_active_clusters(facts.index, s)
+                and rows <= cluster_capacity(facts.index, s)
+            ):
+                return s, "cluster"
+        # no shape fits one wave: a second wave of a few small clusters still beats one CTA per
+        # row on half the SMs (H100 1M b=64: cluster 2 95.7 us, one CTA 155; the split rows
+        # take at most twice a wave, which is never worse than the unsplit row)
+        for s in shapes:
+            if (
+                s <= facts.max_fast_cluster
+                and n // s >= MIN_SLICE
+                and rows * s <= facts.sm_count
             ):
                 return s, "cluster"
         return 1, "cluster"
