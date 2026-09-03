@@ -53,24 +53,13 @@ def cutlass_primitives_supported(
     compress_ratio: int,
     return_values: bool,
 ) -> bool:
-    """Eligibility: fp32/fp16/bf16 2-D rows with unit inner stride, 16-byte-aligned row starts
-    and a row length that is a multiple of 16 bytes (the row stride may exceed the length:
-    paged arenas and sliced views), k up to 4096, any ``next_n`` dividing the row count and
-    any ``compress_ratio``, values on request, SM80 or newer."""
-    if (
-        logits.dim() != 2
-        or logits.dtype not in _CUTLASS_DTYPES
-        or logits.stride(1) != 1
-    ):
+    """Eligibility: fp32/fp16/bf16 2-D logits in any layout (aligned rows and paged arenas are
+    read in place, anything else is copied once into a padded arena), k up to 8192 where the
+    part's shared memory holds the tie stage, any ``next_n`` dividing the row count and any
+    ``compress_ratio``, values on request, SM80 or newer."""
+    if logits.dim() != 2 or logits.dtype not in _CUTLASS_DTYPES:
         return False
     if top_k > 8192 or next_n < 1 or compress_ratio < 1 or logits.shape[0] % next_n:
-        return False
-    esize = logits.element_size()
-    if (logits.shape[1] * esize) % 16 or logits.data_ptr() % 16:
-        return False
-    if logits.shape[0] > 1 and (
-        (logits.stride(0) * esize) % 16 or logits.stride(0) < logits.shape[1]
-    ):
         return False
     if torch.cuda.get_device_capability(logits.device)[0] < 8:
         return False

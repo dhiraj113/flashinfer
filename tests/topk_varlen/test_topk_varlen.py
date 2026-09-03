@@ -2621,10 +2621,35 @@ def test_cutlass_primitives_paged_rows(dtype, N, batch):
     )
     torch.cuda.synchronize()
     _check_correct(out, shifted.contiguous(), seq_lens, top_k, require_all_checked=True)
-    with pytest.raises(Exception):  # 4-byte offset: rows no longer 16-byte aligned
-        flashinfer.top_k_varlen(
-            arena[:, 1 : 1 + N], seq_lens, top_k, backend="cutlass_primitives"
-        )
+    odd = arena[
+        :, 1 : 1 + N
+    ]  # 4-byte offset: misaligned rows, copied into a padded arena
+    out, _ = flashinfer.top_k_varlen(odd, seq_lens, top_k, backend="cutlass_primitives")
+    torch.cuda.synchronize()
+    _check_correct(out, odd.contiguous(), seq_lens, top_k, require_all_checked=True)
+
+
+@pytest.mark.skipif(
+    not _cutlass_primitives_available(), reason="cutlass_primitives needs CUDA SM80+"
+)
+@pytest.mark.parametrize(
+    "N, dtype", [(4100, torch.float32), (16386, torch.bfloat16), (65541, torch.float32)]
+)
+def test_cutlass_primitives_unaligned_row_length(N, dtype):
+    """Row lengths that are not whole 16-byte vectors: exact, ragged, with values."""
+    top_k, batch = 512, 6
+    logits, seq_lens = _make_varlen_inputs([N] * batch, N, dtype, seed=49)
+    g = torch.Generator(device="cuda").manual_seed(49)
+    seq_lens = torch.randint(top_k + 1, N + 1, (batch,), device="cuda", generator=g).to(
+        torch.int32
+    )
+    indices, values = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, backend="cutlass_primitives", return_values=True
+    )
+    torch.cuda.synchronize()
+    _check_correct(indices, logits, seq_lens, top_k, require_all_checked=True)
+    for row in range(batch):
+        assert torch.equal(logits[row][indices[row].long()], values[row])
 
 
 @pytest.mark.skipif(
