@@ -102,13 +102,15 @@ class RegisterClusterConfig:
             raise ValueError(
                 "the two-level cluster crossing needs at least 256 threads"
             )
+        # the tie stage need not hold k: an overflowing crossing bin takes the radix select over
+        # the bin's key range on rank 0, exact for any k
         if (
-            self.tie_capacity < max(2 * self.threads, k)
+            self.tie_capacity < 2 * self.threads
             or self.tie_capacity > 8 * self.threads
             or self.tie_capacity % self.threads
         ):
             raise ValueError(
-                "tie_capacity must be a multiple of threads in [max(2 * threads, k), 8 * threads]"
+                "tie_capacity must be a multiple of threads in [2 * threads, 8 * threads]"
             )
         if self.shared_memory_bytes() > shared_memory_limit:
             raise ValueError(
@@ -439,7 +441,7 @@ def register_cluster_config_for(
         words_per_thread=16 // per_word,
         splits=splits,
         bins=bins,
-        tie_capacity=max(2048, -(-k // 1024) * 1024),
+        tie_capacity=min(8192, max(2048, -(-k // 1024) * 1024)),
         pdl=facts.supports_pdl,
     )
 

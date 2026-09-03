@@ -93,13 +93,15 @@ class RegisterConfig:
             raise ValueError(
                 f"bins must be 1024, 2048 or 4096 and at least the thread count, got {self.bins}"
             )
+        # the tie stage need not hold k: a crossing bin wider than it sends the row to the radix
+        # select over the bin's key range, which streams the row and is exact for any k
         if (
-            self.tie_capacity < max(2 * self.threads, k)
+            self.tie_capacity < 2 * self.threads
             or self.tie_capacity > 8 * self.threads
             or self.tie_capacity % self.threads
         ):
             raise ValueError(
-                f"tie_capacity must be a multiple of threads in [max(2 * threads, k), 8 * threads] = [{max(2 * self.threads, k)}, {8 * self.threads}]"
+                f"tie_capacity must be a multiple of threads in [2 * threads, 8 * threads] = [{2 * self.threads}, {8 * self.threads}]"
             )
         if k >= self.row_capacity(elems):
             raise ValueError(
@@ -382,11 +384,9 @@ def register_config_for(
     words = _words_for(threads, n, per_word)
     if words is None:
         raise ValueError(f"row length {n} exceeds the register-resident capacity")
-    tie_capacity = max(
-        2 * threads, -(-k // threads) * threads
-    )  # a multiple of threads (candidate slots per thread)
-    if tie_capacity > 8 * threads:
-        raise ValueError(f"k={k} exceeds the register kernel's tie stage")
+    # a multiple of threads (candidate slots per thread), holding k where it can; beyond eight
+    # slots per thread the crossing bin takes the radix refine when it does not fit
+    tie_capacity = min(8 * threads, max(2 * threads, -(-k // threads) * threads))
     bins = 1024
     while bins < 4096 and bins * 4 < n:
         bins *= 2
