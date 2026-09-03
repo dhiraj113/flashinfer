@@ -2466,28 +2466,49 @@ class CoarseHistTopKPrimitivesKernel:
         tidx,
     ):
         """Block-wide byte-radix select over the exact ordered keys, in smem.
-        Each thread owns TIE_CAP/NUM_THREADS = 2 strided candidates in
-        registers.  Reuses s_hist[0..511] as the double-buffered 256-bin
+        Each thread owns tie_cap/nt strided candidates in registers (2 at
+        1024 threads, 4 at 512 -- the tie stage is sized by k, not by block
+        shape).  Reuses s_hist[0..511] as the double-buffered 256-bin
         histogram (the coarse histogram is dead by now).  s_misc slots:
         [0..2] scan results, [6] = gt scatter counter, [7] = eq counter.
         """
-        # Per-thread candidate state (Python-unrolled: exactly 2 items).
+        # Per-thread candidate state: FOUR strided slots, written out as plain
+        # variables because the DSL's staged control flow tracks variable
+        # names, not Python list elements.  Slot j holds candidate tidx +
+        # j*nt; at 1024 threads slots 2/3 start beyond tie_cap = 2048 and are
+        # never active (num_ties <= tie_cap), at 512 threads all four are.
         t0 = tidx
         t1 = tidx + self.nt
+        t2 = tidx + 2 * self.nt
+        t3 = tidx + 3 * self.nt
         active0 = t0 < num_ties
         active1 = t1 < num_ties
+        active2 = t2 < num_ties
+        active3 = t3 < num_ties
         key0 = cutlass.Uint32(0)
         key1 = cutlass.Uint32(0)
+        key2 = cutlass.Uint32(0)
+        key3 = cutlass.Uint32(0)
         idx0 = cutlass.Int32(0)
         idx1 = cutlass.Int32(0)
+        idx2 = cutlass.Int32(0)
+        idx3 = cutlass.Int32(0)
         if active0:
             key0 = cutlass.Uint32(s_tie_keys[t0])
             idx0 = cutlass.Int32(s_tie_idx[t0])
         if active1:
             key1 = cutlass.Uint32(s_tie_keys[t1])
             idx1 = cutlass.Int32(s_tie_idx[t1])
+        if active2:
+            key2 = cutlass.Uint32(s_tie_keys[t2])
+            idx2 = cutlass.Int32(s_tie_idx[t2])
+        if active3:
+            key3 = cutlass.Uint32(s_tie_keys[t3])
+            idx3 = cutlass.Int32(s_tie_idx[t3])
         pos0 = cutlass.Int32(remaining)  # sentinel: >= remaining => not selected
         pos1 = cutlass.Int32(remaining)
+        pos2 = cutlass.Int32(remaining)
+        pos3 = cutlass.Int32(remaining)
 
         if tidx < 256:
             s_hist[tidx] = cutlass.Int32(0)
@@ -2517,6 +2538,16 @@ class CoarseHistTopKPrimitivesKernel:
                 if active1:
                     b = cutlass.Int32(
                         (key1 >> cutlass.Uint32(shift)) & cutlass.Uint32(0xFF)
+                    )
+                    smem_atomic_add(s_hist + (hist_off + b), 1)
+                if active2:
+                    b = cutlass.Int32(
+                        (key2 >> cutlass.Uint32(shift)) & cutlass.Uint32(0xFF)
+                    )
+                    smem_atomic_add(s_hist + (hist_off + b), 1)
+                if active3:
+                    b = cutlass.Int32(
+                        (key3 >> cutlass.Uint32(shift)) & cutlass.Uint32(0xFF)
                     )
                     smem_atomic_add(s_hist + (hist_off + b), 1)
                 if cutlass.const_expr(r + 1 < num_rounds):
@@ -2568,6 +2599,34 @@ class CoarseHistTopKPrimitivesKernel:
                             if cutlass.const_expr(r + 1 == num_rounds):
                                 eqp = smem_atomic_add(s_misc + 7, 1)
                                 pos1 = (remaining - remain_next) + eqp
+                if active2:
+                    b2 = cutlass.Int32(
+                        (key2 >> cutlass.Uint32(shift)) & cutlass.Uint32(0xFF)
+                    )
+                    if b2 > bucket:
+                        pos2 = smem_atomic_add(s_misc + 6, 1)
+                        active2 = False
+                    else:
+                        if b2 < bucket:
+                            active2 = False
+                        else:
+                            if cutlass.const_expr(r + 1 == num_rounds):
+                                eqp = smem_atomic_add(s_misc + 7, 1)
+                                pos2 = (remaining - remain_next) + eqp
+                if active3:
+                    b3 = cutlass.Int32(
+                        (key3 >> cutlass.Uint32(shift)) & cutlass.Uint32(0xFF)
+                    )
+                    if b3 > bucket:
+                        pos3 = smem_atomic_add(s_misc + 6, 1)
+                        active3 = False
+                    else:
+                        if b3 < bucket:
+                            active3 = False
+                        else:
+                            if cutlass.const_expr(r + 1 == num_rounds):
+                                eqp = smem_atomic_add(s_misc + 7, 1)
+                                pos3 = (remaining - remain_next) + eqp
                 remain = remain_next
             cute.arch.barrier()
 
@@ -2583,6 +2642,14 @@ class CoarseHistTopKPrimitivesKernel:
             out_idx_row[out_base + pos1] = idx1
             if cutlass.const_expr(self.has_values):
                 out_val_row[out_base + pos1] = self.value_from_key(key1)
+        if pos2 < remaining:
+            out_idx_row[out_base + pos2] = idx2
+            if cutlass.const_expr(self.has_values):
+                out_val_row[out_base + pos2] = self.value_from_key(key2)
+        if pos3 < remaining:
+            out_idx_row[out_base + pos3] = idx3
+            if cutlass.const_expr(self.has_values):
+                out_val_row[out_base + pos3] = self.value_from_key(key3)
 
     # ------------------------------------------------------------------
     # Single-CTA kernel (one block per row)
