@@ -2,12 +2,22 @@
 
 Rules, each with its measurement:
 
-* Stage 16K candidates for rows of 1 MB or more, 8K below.  At 1M fp32 elements the tight
-  aim is 6144 and its spread reaches 10K survivors on some rows; with an 8K stage one row in
-  a batch of 148 overflowed, re-walked (75 us) and set the batch time: 174 us against 105 us
-  with the larger stage.  Below 1 MB the aim stays under 3K and 8K never overflows.
+* Stage 16K candidates when the slice one CTA walks is 1 MB or more, 8K below.  At 1M fp32
+  elements the tight aim is 6144 and its spread reaches 10K survivors on some rows; with an
+  8K stage one row in a batch of 148 overflowed, re-walked (75 us) and set the batch time:
+  174 us against 105 us with the larger stage.  Below 1 MB the aim stays under 3K and 8K never
+  overflows.  Split rows keep 8K whatever the row: each CTA stages about aim / splits, and the
+  larger carveout leaves less L1 for the walk (B200: 1M b=8 slab 16 13.47 -> 13.02 us, 1M
+  b=12 cluster 8 15.16 -> 14.95, 256K b=8 slab 16 9.77 -> 9.53, 256K b=64 cluster 2 22.3 ->
+  21.8).
 * The larger stage needs about 150 KB of shared memory; parts with a 99 KB budget (L40S,
-  RTX 5080) keep 8K.
+  RTX 5080) keep 8K and sample four adjacent vectors per thread instead (one 64-byte fetch, a
+  16K sample): the survivor count's spread around the aim halves, and with the balanced aim
+  (``phases/aim.py``) both stage tails sit beyond five sigma, so the 8K stage stops overflowing
+  at 1M rows.  Measured: L40S 1M b=142 k=2048 had one row in ten re-walking (median 1006 us
+  against an 847 us phase sum); with two vectors one outlier row of 142 still overflowed at
+  3.5 sigma; RTX 5080 1M b=84 k=2048 1297 -> 1195 us.  The extra bin increments cost about
+  0.8 us per vector per row, which only long rows can afford.
 * Programmatic dependent launch and the packed bf16 compare on SM90 and newer; the packed
   fp16 compare everywhere.
 * Row splits, cluster merge (SM90+): when one CTA per row leaves SMs idle, the row is shared
@@ -153,8 +163,10 @@ def streaming_config_for(
         )
         if 2 * wide.shared_memory_bytes() <= facts.shared_memory_optin:
             return wide
-    if row_bytes >= BIG_ROW_BYTES:
+    if row_bytes // splits >= BIG_ROW_BYTES:  # the slice a CTA walks, not the row
         big = StreamingConfig(**{**cfg.__dict__, "stage": 16384})
         if big.shared_memory_bytes() <= facts.shared_memory_optin:
             cfg = big
+        else:  # the stage cannot grow: shrink the survivor spread instead (a 16K sample)
+            cfg = StreamingConfig(**{**cfg.__dict__, "sample_vectors": 4})
     return cfg

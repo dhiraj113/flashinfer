@@ -28,12 +28,7 @@ import cutlass
 import cutlass.cute as cute
 
 from ...block.crossing import crossing_256_warp
-from ...device.atomics import (
-    fence_release_gpu,
-    global_add,
-    global_store_release,
-    shared_add,
-)
+from ...device.atomics import global_add_acq_rel, shared_add
 from ...device.memory import load_global_l2_i32
 from ...device.timers import read_clock64
 from ...device.warp import warp_inclusive_scan_add
@@ -108,8 +103,11 @@ def publish_and_arrive(
             slab_idx[pos] = s_idx[t]
     cute.arch.barrier()
     if tidx == 0:
-        fence_release_gpu()
-        arrived = global_add(counter, 1)
+        # one acq_rel atomic is the whole handshake: release for this CTA's segment, acquire
+        # for the last arriver over everyone else's (the block barrier above orders the other
+        # threads' slab stores before this thread's release at CTA scope, the release lifts
+        # them to GPU scope)
+        arrived = global_add_acq_rel(counter, 1)
         s_result[10] = cutlass.Int32(0)
         if arrived == cutlass.Int32(splits - 1):
             s_result[10] = cutlass.Int32(1)
@@ -123,6 +121,16 @@ def _table_word(tables, r, w):
 
 
 @cute.jit
+def _prefix(s_pref, s_staged, r, b):
+    """Segment ``r``'s exclusive prefix of bin ``b`` in 0..256 from the shared copies: bins
+    0..255 from the table copy, 256 (one past the last bin) is the segment's staged count."""
+    v = s_staged[r]
+    if b < 256:
+        v = s_pref[r * 256 + b]
+    return v
+
+
+@cute.jit
 def merge_slab(
     elems,
     k: cutlass.Constexpr,
@@ -130,6 +138,7 @@ def merge_slab(
     capacity: cutlass.Constexpr,
     out_row,
     s_scratch,
+    s_pref,
     s_merged,
     s_tie_keys,
     s_tie_idx,
@@ -148,28 +157,28 @@ def merge_slab(
     """On the last arriver: merge the row and write its k winners; return 1, or 0 when any
     segment overflowed, the row undershot k, or the ties overflowed the stage.
 
-    ``s_scratch``: >= 768 Int32 (the dead stage: range descriptors, then the radix select's
-    histogram); ``s_merged``: 256 Int32; ``s_result``: 16 Int32.  Resets the arrival counter.
-    Reads slab words with L1-bypassing loads.  Barriers: three plus the tie select's.  With
-    ``telemetry`` the sub-phase clocks (gather, ranges, copy, select) land in
-    ``s_result[12..15]``.
+    ``s_scratch``: >= 768 Int32 (the dead key stage: staged counts, range descriptors, then
+    the radix select's histogram); ``s_pref``: >= 256 * splits Int32 (the dead index stage:
+    the segments' prefix tables); ``s_merged``: 256 Int32; ``s_result``: 16 Int32.  Resets
+    the arrival counter.  Reads slab words with L1-bypassing loads.  Barriers: four plus the
+    tie select's.  With ``telemetry`` the sub-phase clocks (gather, ranges, copy, select) land
+    in ``s_result[12..15]``.
     """
     mark = cutlass.Int64(0)
     if cutlass.const_expr(telemetry):
         mark = read_clock64()
-    cute.arch.fence_acq_rel_gpu()  # acquire side of the arrival handshake
-    # (Copying the whole segment tables into shared memory here, to spare the range lookup
-    # its own trip to L2, measured worse: 4-8 dependent scalar loads per thread cost 0.9-2.2 us
-    # against the 0.34 us the lookup saved.  See docs/measured-worse.md.)
-    if tidx < 256:  # merged histogram: sum over segments of prefix[b+1] - prefix[b]
-        total = cutlass.Int32(0)
+    # The arrival atomic (acq_rel) was the acquire; the other threads of this block read the
+    # slab after the block barrier that followed it, which is enough at CTA scope.
+    # Segment prefix tables: thread t loads prefix[t] of every segment (one independent L2
+    # load per segment) into shared memory, where both the merged histogram and, after the
+    # crossing, the per-segment ranges read them; a second L2 round trip for the ranges
+    # measured 0.58 us at 1M b=8.  (An earlier copy of the tables issued 4-8 dependent loads
+    # per thread and measured worse; these loads are independent.)
+    if (
+        tidx < 256
+    ):  # prefix[b] of every segment; prefix[256] is the segment's staged count
         for r in cutlass.range_constexpr(splits):
-            total = (
-                total
-                + _table_word(tables, r, 2 + tidx)
-                - _table_word(tables, r, 1 + tidx)
-            )
-        s_merged[tidx] = total
+            s_pref[r * 256 + tidx] = _table_word(tables, r, 1 + tidx)
     if tidx < 32:  # per-segment staged counts (lane r) and the overflow / total verdict
         staged = cutlass.Int32(0)
         if tidx < cutlass.Int32(splits):
@@ -184,6 +193,14 @@ def merge_slab(
         if tidx == 31:
             s_result[8] = total
             s_result[9] = nbad
+    cute.arch.barrier()
+    if tidx < 256:  # merged histogram: sum over segments of prefix[b+1] - prefix[b]
+        total = cutlass.Int32(0)
+        for r in cutlass.range_constexpr(splits):
+            total = (
+                total + _prefix(s_pref, s_scratch, r, tidx + 1) - s_pref[r * 256 + tidx]
+            )
+        s_merged[tidx] = total
     cute.arch.barrier()
     if cutlass.const_expr(telemetry):
         if tidx == 0:
@@ -203,8 +220,8 @@ def merge_slab(
             tie_src = cutlass.Int32(0)
             tie_cnt = cutlass.Int32(0)
             if tidx < cutlass.Int32(splits):
-                p_b = _table_word(tables, tidx, 1 + b)
-                p_b1 = _table_word(tables, tidx, 2 + b)
+                p_b = s_pref[tidx * 256 + b]
+                p_b1 = _prefix(s_pref, s_scratch, tidx, b + 1)
                 win_src = p_b1
                 win_cnt = s_scratch[tidx] - p_b1
                 tie_src = p_b
@@ -277,5 +294,8 @@ def merge_slab(
             if tidx == 0:
                 s_result[15] = (read_clock64() - mark).to(cutlass.Int32)
     if tidx == 0:
-        global_store_release(counter.toint(), 0)
+        # a plain store: nobody reads the counter again in this launch, and the kernel boundary
+        # orders it before the next one.  The release store used before waited for every
+        # outstanding output store to drain first: 1.0 us per row at 1M b=8.
+        counter[0] = cutlass.Int32(0)
     return ok

@@ -171,14 +171,21 @@ class RegisterTopK:
         mark = cutlass.Int64(0)
         if telemetry:
             mark = read_clock64()
+        row_ptr = x.iterator + cutlass.Int64(row) * n_cols
+        out_row = out.iterator + cutlass.Int64(row) * k
+        status_row = status.iterator + cutlass.Int64(row) * STATUS_WORDS
+        # the row's words are loaded before the length is known: every vector of the row buffer
+        # is in-bounds memory whatever the length, and only the count of valid elements depends
+        # on it, so the two global latencies overlap instead of adding (the length load alone
+        # is a dependent ~1 us round trip at the head of the kernel)
+        wordvals = load_row_words(
+            row_ptr, cutlass.Int32(n_cols), tidx, threads, words, elems.log2_per_vector
+        )
         length = lengths[row]
         if length < 0:
             length = cutlass.Int32(0)
         if length > cutlass.Int32(n_cols):
             length = cutlass.Int32(n_cols)
-        row_ptr = x.iterator + cutlass.Int64(row) * n_cols
-        out_row = out.iterator + cutlass.Int64(row) * k
-        status_row = status.iterator + cutlass.Int64(row) * STATUS_WORDS
 
         if cutlass.Int32(k) >= length:
             for i in range(tidx, k, threads):
@@ -190,9 +197,6 @@ class RegisterTopK:
                 status_row[0] = cutlass.Int32(0)
                 status_row[1] = cutlass.Int32(0)
         else:
-            wordvals = load_row_words(
-                row_ptr, length, tidx, threads, words, elems.log2_per_vector
-            )
             for i in range(tidx, bins + 4, threads):
                 s_bins_all[i] = cutlass.Int32(0)
             cute.arch.barrier()
