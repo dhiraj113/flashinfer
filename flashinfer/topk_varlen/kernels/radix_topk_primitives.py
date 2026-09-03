@@ -235,6 +235,25 @@ def read_globaltimer(*, loc=None, ip=None):
     return cutlass.Int64(v)
 
 
+@dsl_user_op
+def read_clock64(*, loc=None, ip=None):
+    """Read the 64-bit SM cycle counter (%clock64).  Debug only: intra-CTA
+    phase timing at cycle resolution (globaltimer ticks at ~0.3-1us on
+    B200/L40S, too coarse for sub-microsecond phases).  Not comparable
+    across SMs."""
+    v = llvm.inline_asm(
+        T.i64(),
+        [],
+        "mov.u64 $0, %clock64;",
+        "=l",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int64(v)
+
+
 @cute.jit
 def warp_inclusive_sum(val, lane_id):
     """Inclusive prefix sum across a warp via shfl.up.sync (5 steps)."""

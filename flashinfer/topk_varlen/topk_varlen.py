@@ -1849,8 +1849,8 @@ def _experimental_prim_buffers(num_rows, device):
         .view(num_rows, 2 * GCAP)
     )
     status = _get_cache_buf(
-        f"topk_experimental_status_{tag}", 10 * num_rows * 4, device
-    )[: 10 * num_rows * 4].view(torch.int32)[: 10 * num_rows]
+        f"topk_experimental_status_{tag}", 24 * num_rows * 4, device
+    )[: 24 * num_rows * 4].view(torch.int32)[: 24 * num_rows]
     _experimental_prim_buf_views[key] = (slab, status)
     return slab, status
 
