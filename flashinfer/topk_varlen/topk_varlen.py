@@ -2348,7 +2348,30 @@ def _run_walkfirst_primitives(
             .view(num_rows, top_k)
         )
         has_hints = 0
-    get_walkfirst_kernel(top_k, N, splits, dtype=logits.dtype)(
+    # Block shape: 512 threads (2 CTAs/SM) when the batch is wider than the SM
+    # count, each row has one CTA, and rows are at most 512 KB (128K fp32).
+    # The 1024-thread CTA's full register file allows one CTA per SM, so 256
+    # rows on 148 SMs ran as two waves.  A 512-thread CTA solves a row ~20%
+    # slower on its own (b<=SMs: 1.1-1.6x worse, hence the width gate) but
+    # two co-resident per SM make the wide batch one wave.  Measured B200,
+    # ragged rows, 1024 -> 512 threads: 32K b=256 k=2048 20.6 -> 16.5us
+    # (gvr_2 16.8), 64K b=256 25.1 -> 21.6 (15.6), 128K b=256 36.7 -> 34.4
+    # (25.7); at 256K the two shapes tie and at 1M the smaller stage
+    # overflows, hence the byte gate.  Rubin (208 SMs) at 128K: b=256 flat,
+    # b=512 +6% (two waves either way), so rows of 256-512 KB take the shape
+    # only when the batch fits the doubled slot count.
+    # FLASHINFER_TOPK_WF_WIDE512=0 keeps 1024 threads everywhere (A/B switch).
+    _wf_nt = None
+    _sms = get_device_sm_count(logits.device)
+    _row_kb = N * logits.element_size() >> 10
+    if (
+        splits == 1
+        and num_rows > _sms
+        and (_row_kb <= 256 or (_row_kb <= 512 and num_rows <= 2 * _sms))
+        and os.environ.get("FLASHINFER_TOPK_WF_WIDE512", "1") != "0"
+    ):
+        _wf_nt = 512
+    get_walkfirst_kernel(top_k, N, splits, dtype=logits.dtype, nt=_wf_nt)(
         logits,
         seq_lens,
         out_indices,

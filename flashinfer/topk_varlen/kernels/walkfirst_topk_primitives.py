@@ -1106,8 +1106,16 @@ class WalkFirstTopK(SampledPivotTopK):
                     cute.arch.barrier()  # B1: partials + hist zeros
                     # cross-warp fold: ONE lane-indexed load + ONE redux per
                     # value (a 32-iteration serial loop here was measured slow)
-                    kmax = warp_max_u32(cutlass.Uint32(s_warp_sums[lane_s]))
-                    kminc = warp_max_u32(cutlass.Uint32(s_count[lane_s]))
+                    # lane-indexed partial reads: only nw warps wrote a slot
+                    # (16 at 512 threads); lanes beyond contribute 0 (neutral
+                    # for both maxes)
+                    kmx_p = cutlass.Uint32(0)
+                    kmn_p = cutlass.Uint32(0)
+                    if lane_s < cutlass.Int32(self.nw):
+                        kmx_p = cutlass.Uint32(s_warp_sums[lane_s])
+                        kmn_p = cutlass.Uint32(s_count[lane_s])
+                    kmax = warp_max_u32(kmx_p)
+                    kminc = warp_max_u32(kmn_p)
                     kmin = ~kminc
                     if tel:  # block 11: B1 + cross-warp fold
                         if tidx == 0:
@@ -2162,7 +2170,12 @@ _compiled: dict = {}
 
 
 def get_walkfirst_kernel(
-    top_k: int, N: int, splits: int, telemetry: bool = False, dtype=None
+    top_k: int,
+    N: int,
+    splits: int,
+    telemetry: bool = False,
+    dtype=None,
+    nt: int | None = None,
 ):
     """Compile (with on-disk caching) the walk-first kernel + gated
     fallback for a (top_k, N, splits) specialization.  mc_state (rows, 8)
@@ -2189,11 +2202,18 @@ def get_walkfirst_kernel(
     # 1024-thread CTA at 64 regs fills the register file, so one CTA per SM
     # and a 256-row batch on 148 SMs runs as two waves, while gvr_2 routes
     # those batches to 256/512-thread CTAs and wins 1.3-1.6x at 32K-128K.
-    # Measured 2026-09-02: forcing nt=512 here is NOT a usable shortcut --
-    # the walk/cluster/fallback paths carry 1024-thread assumptions beyond
-    # tie_cap (wrong results at k=512 S=2 without any fallback, mass
-    # fallbacks above 32K), so a 512-thread variant is a real port.
-    nt = 1024
+    # 512-thread shape (2 CTAs/SM): selected by the dispatcher for batches
+    # wider than the SM count (one-CTA-per-row regime), where the 1024-thread
+    # CTA's full register file forces two waves.  Requirements met for it
+    # (2026-09-03): lane-indexed partial reads guarded to nw warps, tie stage
+    # sized by k (tie_cap = max(2*nt, k)), radix tie select with tie_cap/nt
+    # items per thread, stage kept at 8192 entries.  FLASHINFER_TOPK_WF_NT
+    # overrides for experiments.
+    if os.environ.get("FLASHINFER_TOPK_WF_NT") in ("512", "1024"):
+        nt = int(os.environ["FLASHINFER_TOPK_WF_NT"])
+    if nt is None:
+        nt = 1024
+    assert nt in (512, 1024)
     cdt = {
         None: cutlass.Float32,
         torch.float32: cutlass.Float32,
@@ -2314,7 +2334,11 @@ def get_walkfirst_kernel(
         lcap_sel = LCAP_BIG
     if os.environ.get("FLASHINFER_TOPK_WF_LCAP") in ("8192", "16384"):
         lcap_sel = int(os.environ["FLASHINFER_TOPK_WF_LCAP"])
-    kern.lcap = lcap_sel if nt == 1024 else 4096
+    # 512-thread shape: the stage keeps 8192 entries (the aim at k=2048 is
+    # ~3k candidates, so 4096 overflowed every row) but not 16384 -- two
+    # CTAs per SM must fit: ~64KB stage + 16KB histogram + 16KB ties + misc
+    # is ~100KB each on a 228KB carveout
+    kern.lcap = lcap_sel if nt == 1024 else min(lcap_sel, LCAP)
     kern.psamp = vec_elems * nt  # one 16B probe per thread
     kern.wf_pair16 = pair16
     sym_rows = cute.sym_int()

@@ -145,10 +145,13 @@ class SampledPivotTopK(CoarseHistTopKPrimitivesKernel):
             s_warp_sums[warp_id] = incl
         cute.arch.barrier()
         w = cutlass.Int32(0)
-        if lane_id < warp_id:
-            w = s_warp_sums[lane_id]
+        wt = cutlass.Int32(0)
+        if lane_id < cutlass.Int32(self.nw):  # only nw warps wrote a slot
+            wt = s_warp_sums[lane_id]
+            if lane_id < warp_id:
+                w = wt
         prev_warps = warp_sum(w)
-        hsum = warp_sum(s_warp_sums[lane_id])  # NUM_WARPS == 32 == lanes
+        hsum = warp_sum(wt)
         nh = need_hi
         if nh > hsum:
             nh = hsum
