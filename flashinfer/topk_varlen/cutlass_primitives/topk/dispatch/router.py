@@ -90,7 +90,9 @@ def _cluster_kernel_wins(facts, dtype: torch.dtype, k: int, n: int, rows: int) -
 
 def choose(
     facts, dtype: torch.dtype, k: int, n: int, rows: int
-) -> tuple[str, RegisterConfig | RegisterClusterConfig | StreamingConfig]:
+) -> tuple[
+    str, RegisterConfig | RegisterClusterConfig | StreamingConfig | CensusSplitConfig
+]:
     """(kernel name, configuration) for a batch of ``rows`` rows of ``n`` elements.
 
     Any k: the register kernels refine an overflowing crossing bin by the radix select over

@@ -37,7 +37,6 @@ from ...device.timers import read_clock64
 from ...block.crossing import crossing_wide_pair
 
 from ..phases.aim import aim_tight, aim_wide
-from ..phases.census import COARSE_BINS
 from ..phases.elements import Elements
 from ..phases.fallback import exact_select_row, radix_select_in_range
 from ..phases.filter_pass import filter_pass
@@ -171,23 +170,6 @@ class StreamingConfig:
             raise ValueError("register_words must be 4, 8 or 16")
         if self.register_arm and 2 * (self.stage + 4) < self.register_bins() + 4:
             raise ValueError("the register arm's histogram does not fit the stage")
-
-    def register_bins(self, words: int | None = None) -> int:
-        """Coarse bins of the register arm's ``words`` tier: about a quarter of its row capacity
-        in [1024, 4096] and at least the thread count (``register_config_for``'s rule)."""
-        capacity = self.threads * (
-            words or self.register_words
-        )  # fp32 elements; 16-bit rows hold twice as many
-        bins = 1024
-        while bins < 4096 and bins * 4 < capacity:
-            bins *= 2
-        return max(bins, self.threads)
-
-    def register_tiers(self) -> tuple:
-        """Words per thread of the register arm's tiers, smallest first: a row takes the smallest
-        tier that holds it (fewer words load and count fewer clamped duplicates: 1K rows at 512
-        threads 5.5 us with 16 words, 3.8 with 4)."""
-        return tuple(w for w in (4, 8, 16) if w <= self.register_words)
         if k >= 3 * self.stage * self.splits // 4 and not self.exact_only:
             raise ValueError(
                 f"stage {self.stage} x {self.splits} too small for k={k}: k must sit below 3/4 of it (the balanced aim needs room on both sides)"
@@ -219,6 +201,23 @@ class StreamingConfig:
             raise ValueError(
                 f"{need} B x {self.ctas_per_sm} CTAs exceeds the {shared_memory_limit} B shared-memory budget"
             )
+
+    def register_bins(self, words: int | None = None) -> int:
+        """Coarse bins of the register arm's ``words`` tier: about a quarter of its row capacity
+        in [1024, 4096] and at least the thread count (``register_config_for``'s rule)."""
+        capacity = self.threads * (
+            words or self.register_words
+        )  # fp32 elements; 16-bit rows hold twice as many
+        bins = 1024
+        while bins < 4096 and bins * 4 < capacity:
+            bins *= 2
+        return max(bins, self.threads)
+
+    def register_tiers(self) -> tuple:
+        """Words per thread of the register arm's tiers, smallest first: a row takes the smallest
+        tier that holds it (fewer words load and count fewer clamped duplicates: 1K rows at 512
+        threads 5.5 us with 16 words, 3.8 with 4)."""
+        return tuple(w for w in (4, 8, 16) if w <= self.register_words)
 
     def shared_memory_bytes(self) -> int:
         stage = 2 * (self.stage + 4) * 4
