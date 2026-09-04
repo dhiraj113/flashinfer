@@ -185,6 +185,11 @@ def streaming_config_for(
     )
     if wide_batch and k <= 2048:
         wide_stage = 4096 if k <= 1024 else 8192
+        # The census arm's cutoff drops to 8K at 512 threads: the sampled arm is cheaper from
+        # 12K up there (k=2048: 10.7 vs 12.3 us at 12288, 11.4 vs 14.7 at 16384; k=512: 7.4 vs
+        # 11.3).  lpt_order (longest rows first, ranked inside every CTA) stays off: its serial
+        # prologue costs every batch 3-6% and pays back only on some parts' ragged batches
+        # (docs/measured-worse.md); a caller who knows the lengths can order the rows itself.
         wide = StreamingConfig(
             **{
                 **cfg.__dict__,
@@ -193,6 +198,7 @@ def streaming_config_for(
                 "stage": wide_stage,
                 "tie_capacity": max(1024, -(-k // 512) * 512),
                 "unroll": _unroll_for(facts, 512, n, per_vector),
+                "short_cutoff": 8192,
             }
         )
         if 2 * wide.shared_memory_bytes() <= facts.shared_memory_optin:
