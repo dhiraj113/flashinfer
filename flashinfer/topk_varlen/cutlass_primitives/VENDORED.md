@@ -3,8 +3,8 @@
 Do not edit these files in FlashInfer; change the library and re-vendor.
 
 - upstream: ssh://git@gitlab-master.nvidia.com:12051/dnallapa/cutlass-primitives.git
-- tag: v0.1.16
-- commit: 4ae05ab
+- tag: v0.1.17
+- commit: d0fa313
 - date: 2026-09-04
 - command: python tools/vendor_into_flashinfer.py <flashinfer>
 
