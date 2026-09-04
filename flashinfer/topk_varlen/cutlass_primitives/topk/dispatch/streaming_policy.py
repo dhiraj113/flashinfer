@@ -178,6 +178,9 @@ def streaming_config_for(
         aim=aim,
         unroll=_unroll_for(facts, threads, n // splits, per_vector),
         walk_width=_walk_width_for(splits, n),
+        # whole-row configurations: rows that fit the registers (16K fp32 at 1024 threads, 8K
+        # at 512) take the register-resident phases instead of the census
+        register_arm=splits == 1,
     )
     row_kb = row_bytes >> 10
     wide_batch = rows > facts.sm_count and (

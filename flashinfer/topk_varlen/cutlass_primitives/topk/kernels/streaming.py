@@ -34,12 +34,21 @@ from ...device.launch import release_dependent_grid, wait_for_prior_grid
 from ...device.warp import ballot_count, ballot_rank
 from ...device.timers import read_clock64
 
+from ...block.crossing import crossing_wide_pair
+
 from ..phases.aim import aim_tight, aim_wide
+from ..phases.census import COARSE_BINS
 from ..phases.elements import Elements
-from ..phases.fallback import exact_select_row
+from ..phases.fallback import exact_select_row, radix_select_in_range
 from ..phases.filter_pass import filter_pass
+from ..phases.register_row import (
+    classify_from_registers,
+    count_coarse_bins,
+    key_range_in_bin,
+    load_row_words,
+)
 from ..phases.repair import verdict_and_repair, verdict_and_repair_cluster
-from ..phases.resolve import emit_and_select, emit_and_select_cluster
+from ..phases.resolve import _select_ties, emit_and_select, emit_and_select_cluster
 from ..phases.sample import Threshold, sample_probe, sample_threshold
 from ..phases.slab import merge_slab, publish_and_arrive, slab_words_per_row
 from ..phases.varlen import effective_length, gather_values
@@ -94,6 +103,10 @@ class StreamingConfig:
     ballot_limit: int = 128
     scan_emit: bool = False  # output positions from a block scan instead of a shared cursor per candidate (phases/resolve.py)
     # scheduling
+    register_arm: bool = False  # rows that fit register_words per thread take the register-resident phases (whole-row configurations)
+    register_words: int = (
+        16  # 32-bit words per thread held in registers by that arm (4, 8 or 16)
+    )
     short_cutoff: int = 16384  # rows at or below take the exact select directly; EXACT_ONLY: every row does
     lpt_order: bool = False  # block b processes the row of rank b by length (longest first); wide batches, splits == 1
     pdl: bool = False
@@ -150,6 +163,31 @@ class StreamingConfig:
             raise ValueError("the exact-only configuration runs one CTA per row")
         if self.lpt_order and self.splits != 1:
             raise ValueError("lpt_order permutes whole rows: one CTA per row")
+        if self.register_arm and self.splits != 1:
+            raise ValueError(
+                "the register arm holds a whole row in one CTA's registers"
+            )
+        if self.register_words not in (4, 8, 16):
+            raise ValueError("register_words must be 4, 8 or 16")
+        if self.register_arm and 2 * (self.stage + 4) < self.register_bins() + 4:
+            raise ValueError("the register arm's histogram does not fit the stage")
+
+    def register_bins(self, words: int | None = None) -> int:
+        """Coarse bins of the register arm's ``words`` tier: about a quarter of its row capacity
+        in [1024, 4096] and at least the thread count (``register_config_for``'s rule)."""
+        capacity = self.threads * (
+            words or self.register_words
+        )  # fp32 elements; 16-bit rows hold twice as many
+        bins = 1024
+        while bins < 4096 and bins * 4 < capacity:
+            bins *= 2
+        return max(bins, self.threads)
+
+    def register_tiers(self) -> tuple:
+        """Words per thread of the register arm's tiers, smallest first: a row takes the smallest
+        tier that holds it (fewer words load and count fewer clamped duplicates: 1K rows at 512
+        threads 5.5 us with 16 words, 3.8 with 4)."""
+        return tuple(w for w in (4, 8, 16) if w <= self.register_words)
         if k >= 3 * self.stage * self.splits // 4 and not self.exact_only:
             raise ValueError(
                 f"stage {self.stage} x {self.splits} too small for k={k}: k must sit below 3/4 of it (the balanced aim needs room on both sides)"
@@ -261,6 +299,108 @@ class StreamingTopK:
             check_constant,
             cfg.telemetry,
         )
+
+    @cute.jit
+    def register_select(
+        self,
+        row_ptr,
+        length,
+        out_row,
+        s_bins_all,
+        s_tie_keys,
+        s_tie_idx,
+        s_slots,
+        s_slots_u32,
+        s_result,
+        tidx,
+        words: cutlass.Constexpr,
+    ):
+        """The register-resident kernel's phases on one whole row that fits ``words`` per
+        thread: one load, the coarse census from registers, the wide crossing, the classify with
+        a block scan, the tie select, and the radix refine by key range if the crossing bin
+        overflows the tie stage.  ``s_bins_all``: ``register_bins(words) + 4`` Int32 (the dead
+        stage).  Returns 1 when the tie select resolved the row, 0 when the radix refine did.
+        """
+        cfg = self.config
+        elems = self.elems
+        threads = cutlass.const_expr(self.threads)
+        bins = cutlass.const_expr(cfg.register_bins(words))
+        k = cutlass.const_expr(self.k)
+        s_bins = s_bins_all + 4  # slot -1 takes out-of-range elements
+        for i in range(tidx, bins + 4, threads):
+            s_bins_all[i] = cutlass.Int32(0)
+        wordvals = load_row_words(
+            row_ptr, length, tidx, threads, words, elems.log2_per_vector
+        )
+        cute.arch.barrier()
+        packed_bins = count_coarse_bins(
+            elems, wordvals, length, s_bins, tidx, threads, words, bins
+        )
+        cute.arch.barrier()
+        crossing_wide_pair(
+            s_bins,
+            bins,
+            cutlass.Int32(k),
+            cutlass.Int32(k),
+            s_slots,
+            s_result,
+            tidx,
+            threads,
+        )
+        cut_bin = s_result[0]
+        above = s_result[1]
+        _winners, ties = classify_from_registers(
+            elems,
+            wordvals,
+            packed_bins,
+            cut_bin,
+            out_row,
+            s_tie_keys,
+            s_tie_idx,
+            cfg.tie_capacity,
+            s_slots,
+            tidx,
+            threads,
+            words,
+            bins,
+        )
+        cute.arch.barrier()
+        ok = _select_ties(
+            elems,
+            k,
+            above,
+            ties,
+            out_row,
+            s_bins,
+            s_tie_keys,
+            s_tie_idx,
+            cfg.tie_capacity,
+            cfg.ballot_limit,
+            s_slots,
+            s_result,
+            tidx,
+            threads,
+        )
+        if ok == 0:
+            kmin, kmax = key_range_in_bin(
+                elems, wordvals, packed_bins, cut_bin, s_slots_u32, tidx, threads, words
+            )
+            cute.arch.barrier()
+            radix_select_in_range(
+                elems,
+                row_ptr,
+                length,
+                cutlass.Int32(k) - above,
+                out_row + above,
+                kmin,
+                kmax,
+                s_bins,
+                s_slots,
+                s_result,
+                tidx,
+                threads,
+            )
+        return ok
 
     @cute.kernel
     def kernel(
@@ -442,7 +582,45 @@ class StreamingTopK:
                     status_row[0] = cutlass.Int32(0)
                     status_row[1] = cutlass.Int32(0)
         else:
-            if length <= cutlass.Int32(cfg.short_cutoff):
+            reg_arm = cutlass.Int32(0)
+            if cutlass.const_expr(cfg.register_arm):
+                if length <= cutlass.Int32(
+                    threads * cfg.register_words * elems.per_word
+                ):
+                    reg_arm = cutlass.Int32(1)
+            if reg_arm == 1:
+                # a row that fits the CTA's registers: one read of the row, the census from
+                # registers, no sample and no survivor stage (walk-first's short-row path;
+                # the census arm below paid two passes and a 4096-bin crossing for it).  The
+                # smallest tier of words per thread that holds the row.
+                emitter = cutlass.Int32(1)
+                ok_reg = cutlass.Int32(1)
+                tiers = cfg.register_tiers()
+                taken = cutlass.Int32(0)
+                for w in cutlass.range_constexpr(len(tiers)):
+                    tier_words = cutlass.const_expr(tiers[w])
+                    fits = length <= cutlass.Int32(
+                        threads * tier_words * elems.per_word
+                    )
+                    if fits & (taken == 0):
+                        taken = cutlass.Int32(1)
+                        ok_reg = self.register_select(
+                            row_ptr,
+                            length,
+                            out_row,
+                            s_stage,
+                            s_tie_keys,
+                            s_tie_idx,
+                            s_slots,
+                            s_slots_u32,
+                            s_result,
+                            tidx,
+                            tier_words,
+                        )
+                if tidx == 0:
+                    status_row[0] = cutlass.Int32(1) - ok_reg
+                    status_row[1] = cutlass.Int32(5)
+            elif length <= cutlass.Int32(cfg.short_cutoff):
                 if rank == 0:
                     emitter = cutlass.Int32(1)
                     arm = self.exact_select(
