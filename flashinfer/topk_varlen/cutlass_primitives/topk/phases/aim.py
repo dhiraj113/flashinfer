@@ -61,16 +61,35 @@ def aim_tight(
     rows,
     samples: cutlass.Constexpr,
     cap: cutlass.Constexpr,
+    margin_frac: cutlass.Constexpr = 0.125,
+    z: cutlass.Constexpr = 3.5,
+    floor_rows: cutlass.Constexpr = 32,
+    margin_small: cutlass.Constexpr = 0.5,
 ):
-    """Target survivor count for a row of ``length`` in a grid of ``rows`` rows."""
-    margin = cutlass.Int32(k >> 1)
+    """Target survivor count for a row of ``length`` in a grid of ``rows`` rows.
+
+    Grids of ``floor_rows`` rows or more: ``k + max(margin_frac * k, length / 256)`` raised to
+    the ``z``-sigma statistical floor (the batch waits for its slowest row, so an undershoot
+    re-walk anywhere costs the whole batch; at 3.5 sigma one row in 4000 re-walks).  The floor
+    decides on these grids, so the fixed margin is small (k / 8: 64K b=148 k=2048 10.54 ->
+    10.22 us on B200 against the earlier k / 2, which exceeded the floor there).  Below
+    ``floor_rows`` there is no floor and ``margin_small`` (k / 2) alone covers the spread: with
+    a 4096 sample at 64K, k=2048 the k / 8 margin was 1.3 sigma and one row in ten re-walked.
+    A lower sigma is not a trade worth making: z=3.0 gained 2% and a single re-walk in a 256-row
+    batch costs 30% (measured z=2.5: 12.5 -> 16.5 us).
+    """
+    margin = cutlass.Int32(
+        int(k * margin_small)
+    )  # assigned before the branch: the DSL drops names first defined inside one
+    if rows >= cutlass.Int32(floor_rows):
+        margin = cutlass.Int32(int(k * margin_frac))
     by_length = length >> cutlass.Int32(8)
     if by_length > margin:
         margin = by_length
     aim = cutlass.Int32(k) + margin
-    if rows >= cutlass.Int32(32):
+    if rows >= cutlass.Int32(floor_rows):
         per_sample = length.to(cutlass.Float32) / cutlass.Float32(samples)
-        zq = cutlass.Float32(3.5) * cmath.sqrt(per_sample)
+        zq = cutlass.Float32(z) * cmath.sqrt(per_sample)
         root = (zq + cmath.sqrt(zq * zq + cutlass.Float32(4.0 * k))) * cutlass.Float32(
             0.5
         )
@@ -87,8 +106,12 @@ def aim_wide(
     rows,
     samples: cutlass.Constexpr,
     cap: cutlass.Constexpr,
+    margin_frac: cutlass.Constexpr = 0.125,
+    z: cutlass.Constexpr = 3.5,
+    floor_rows: cutlass.Constexpr = 32,
+    margin_small: cutlass.Constexpr = 0.5,
 ):
-    """Target survivor count: twice k, or length / 128 if larger."""
+    """Target survivor count: twice k, or length / 128 if larger (the tight aim's knobs unused)."""
     aim = cutlass.Int32(2 * k)
     by_length = length >> cutlass.Int32(7)
     if by_length > aim:
