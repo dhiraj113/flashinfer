@@ -51,6 +51,7 @@ def verdict_and_repair(
     tidx,
     threads: cutlass.Constexpr,
     unroll: cutlass.Constexpr,
+    walk_width: cutlass.Constexpr = 1,
 ):
     """Return ``(bar, scale, survivors, ok)`` after at most two repair passes.
 
@@ -80,6 +81,7 @@ def verdict_and_repair(
                 tidx,
                 threads,
                 unroll,
+                walk_width,
             )
             survivors = s_count[0]
         if survivors > cutlass.Int32(capacity):
@@ -115,6 +117,7 @@ def verdict_and_repair(
                     tidx,
                     threads,
                     unroll,
+                    walk_width,
                 )
                 survivors = s_count[0]
     ok = cutlass.Int32(0)
@@ -161,6 +164,7 @@ def verdict_and_repair_cluster(
     tidx,
     threads: cutlass.Constexpr,
     unroll: cutlass.Constexpr,
+    walk_width: cutlass.Constexpr = 1,
 ):
     """Cluster form of the verdict: the row's survivors are the sum over the ``splits`` CTAs.
 
@@ -195,6 +199,7 @@ def verdict_and_repair_cluster(
                 tidx,
                 threads,
                 unroll,
+                walk_width,
             )
             _publish_local(s_count, s_result, capacity, tidx)
             cluster_sync()
