@@ -142,6 +142,16 @@ def _unroll_for(
     return unroll
 
 
+def _walk_width_for(splits: int, n: int) -> int:
+    """Survivor reloads issued together in the filter's bit-walk (``phases/filter_pass.py``).
+    Whole-row CTAs stage every survivor of the row and pay the reload chain in full: four in
+    flight on rows up to 256K (six parts, 64K b=256 k=2048: B200 18.7 -> 16.7 us, H100 49.1 ->
+    39.9, A100 91.9 -> 83.0, L40S 52.7 -> 44.4; ragged rows gain more, H100 44.4 -> 33.8), two on
+    1M whole rows and on every split (A100 1M b=8 39.8 -> 36.4; on B200/Rubin/H100 splits two
+    is within noise of one and four costs 2-3%)."""
+    return 4 if splits == 1 and n <= (1 << 18) else 2
+
+
 def streaming_config_for(
     facts: DeviceFacts, dtype: torch.dtype, k: int, n: int, rows: int = 0
 ) -> StreamingConfig:
@@ -167,6 +177,7 @@ def streaming_config_for(
         merge=merge,
         aim=aim,
         unroll=_unroll_for(facts, threads, n // splits, per_vector),
+        walk_width=_walk_width_for(splits, n),
     )
     row_kb = row_bytes >> 10
     wide_batch = rows > facts.sm_count and (
@@ -284,6 +295,7 @@ def _fit_large_k(
                     "aim": "wide",
                     "stage": stage,
                     "unroll": _unroll_for(facts, cfg.threads, n // splits, per_vector),
+                    "walk_width": _walk_width_for(splits, n),
                 }
             )
     # the exact select's tie stage is its census's: eight slots per thread
