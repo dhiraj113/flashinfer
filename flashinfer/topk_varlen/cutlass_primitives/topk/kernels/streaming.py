@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover - older cuda-python
 
 from ...device.cluster import cluster_sync
 from ...device.launch import release_dependent_grid, wait_for_prior_grid
+from ...device.warp import ballot_count, ballot_rank
 from ...device.timers import read_clock64
 
 from ..phases.aim import aim_tight, aim_wide
@@ -74,9 +75,16 @@ class StreamingConfig:
     merge: str = "cluster"  # "cluster": DSMEM merge (SM90+, splits <= 8); "slab": global-memory last arriver
     # sample
     aim: str = "tight"  # "tight" | "wide"
+    aim_margin: float = 0.125  # tight aim, grids with the sigma floor: k + max(aim_margin * k, length / 256), raised to the floor (phases/aim.py)
+    aim_margin_small: float = 0.5  # tight aim, grids below aim_floor_rows (no floor): the fixed margin alone must cover the spread
+    aim_z: float = 3.5  # tight aim: sigma of the statistical undershoot floor
+    aim_floor_rows: int = (
+        32  # tight aim: the floor applies to grids of at least this many rows
+    )
     floor_multiple: int = 2
     span_ext: float = 1.5
     sample_vectors: int = 1  # adjacent 16-byte vectors per thread in the sample (1, 2 or 4): the survivor spread shrinks with the square root
+    sample_bins: int = 256  # equal-width bins of the sample histogram (256, 512, 1024, 2048); above 256 they live in the dead stage
     # stage
     stage: int = 8192
     tie_capacity: int = 2048
@@ -87,6 +95,7 @@ class StreamingConfig:
     scan_emit: bool = False  # output positions from a block scan instead of a shared cursor per candidate (phases/resolve.py)
     # scheduling
     short_cutoff: int = 16384  # rows at or below take the exact select directly; EXACT_ONLY: every row does
+    lpt_order: bool = False  # block b processes the row of rank b by length (longest first); wide batches, splits == 1
     pdl: bool = False
     packed_compare: bool = False  # 16-bit rows: setp.le.{f16x2,bf16x2} classify
     # instrumentation
@@ -111,6 +120,20 @@ class StreamingConfig:
             raise ValueError(f"unknown aim policy {self.aim!r}")
         if self.sample_vectors not in (1, 2, 4):
             raise ValueError("sample_vectors must be 1, 2 or 4")
+        if self.sample_bins not in (256, 512, 1024, 2048):
+            raise ValueError("sample_bins must be 256, 512, 1024 or 2048")
+        if self.sample_bins > 256 and (
+            self.sample_bins > self.stage or self.sample_bins % self.threads
+        ):
+            raise ValueError(
+                "a wide sample histogram must fit the stage and be a multiple of threads (the block-wide crossing)"
+            )
+        if (
+            not 0.0 <= self.aim_margin <= 2.0
+            or not 0.0 <= self.aim_margin_small <= 2.0
+            or not 1.0 <= self.aim_z <= 6.0
+        ):
+            raise ValueError("aim margins in [0, 2] and aim_z in [1, 6]")
         if self.stage < 2048 or self.stage % 256:
             raise ValueError(
                 "stage must be a multiple of 256 and at least 2048 (the census histogram aliases both stage halves)"
@@ -125,6 +148,8 @@ class StreamingConfig:
             )
         if self.exact_only and self.splits != 1:
             raise ValueError("the exact-only configuration runs one CTA per row")
+        if self.lpt_order and self.splits != 1:
+            raise ValueError("lpt_order permutes whole rows: one CTA per row")
         if k >= 3 * self.stage * self.splits // 4 and not self.exact_only:
             raise ValueError(
                 f"stage {self.stage} x {self.splits} too small for k={k}: k must sit below 3/4 of it (the balanced aim needs room on both sides)"
@@ -299,13 +324,103 @@ class StreamingTopK:
         )  # telemetry: after the PDL wait, so phases exclude the previous kernel's tail
         if telemetry:
             mark = read_clock64()
+        # the sample probe for the launch-order row goes out first, in flight while the length
+        # (and, with lpt_order, the whole ranking) loads; a permuted CTA reloads it
+        launch_row = row
+        probe = sample_probe(
+            elems,
+            x.iterator + cutlass.Int64(launch_row) * row_stride + self.col_offset,
+            n_cols,
+            tidx,
+            threads,
+            cfg.sample_vectors,
+        )
+        lpt = cutlass.Int32(0)
+        if cutlass.const_expr(cfg.lpt_order):
+            if rows <= cutlass.Int32(
+                threads
+            ):  # one row per ranking thread; wider grids keep launch order
+                lpt = cutlass.Int32(1)
+        if lpt == 1:
+            # Longest rows first: the hardware scheduler's first wave then holds the long rows,
+            # and the short rows it pairs beside them leave early so the long ones finish alone
+            # (B200 64K b=256 k=2048 ragged, rows sorted on the host: 16.9 -> 14.6 us).  Every
+            # CTA derives the same permutation from the lengths array, no prepare launch:
+            # rows fall into three classes by length (at least half the row, at least a
+            # quarter, the rest), one packed block scan gives each row its position within its
+            # class and the class sizes, and block b takes position b of the concatenated
+            # classes.  Rows within a class keep launch order.  A full rank by length (a
+            # 128-bucket count table with per-chunk prefixes and warp shuffles) cost 2 us per
+            # CTA, most of what the order saved; this is one global load, one scan, three
+            # barriers.  rows <= threads (one row per thread; the policy caps rows at 512).
+            block = row
+            warp = tidx // 32
+            lane_lt = cute.arch.lanemask_lt()
+            cls = cutlass.Int32(3)  # sentinel past the last row
+            if tidx < rows:
+                my_len = effective_length(
+                    lengths, tidx, n_cols, self.next_n, self.compress_ratio
+                )
+                cls = cutlass.Int32(2)
+                if my_len * cutlass.Int32(4) >= cutlass.Int32(n_cols):
+                    cls = cutlass.Int32(1)
+                if my_len * cutlass.Int32(2) >= cutlass.Int32(n_cols):
+                    cls = cutlass.Int32(0)
+            # per-warp class counts by ballot (two barriers in all: publish, then the answer)
+            in0 = cls == 0
+            in1 = cls == 1
+            in2 = cls == 2
+            r0 = ballot_rank(in0, lane_lt)
+            r1 = ballot_rank(in1, lane_lt)
+            r2 = ballot_rank(in2, lane_lt)
+            c0 = ballot_count(in0)
+            c1 = ballot_count(in1)
+            c2 = ballot_count(in2)
+            s_cls = s_stage  # warps x 3 counts (the stage is dead here)
+            if tidx % 32 == 0:
+                s_cls[warp * 3] = c0
+                s_cls[warp * 3 + 1] = c1
+                s_cls[warp * 3 + 2] = c2
+            cute.arch.barrier()
+            p0 = cutlass.Int32(
+                0
+            )  # this warp's offset within each class, and the class totals
+            p1 = cutlass.Int32(0)
+            p2 = cutlass.Int32(0)
+            n0 = cutlass.Int32(0)
+            n1 = cutlass.Int32(0)
+            for w in cutlass.range_constexpr(threads // 32):
+                w0 = s_cls[w * 3]
+                w1 = s_cls[w * 3 + 1]
+                if cutlass.Int32(w) < warp:
+                    p0 = p0 + w0
+                    p1 = p1 + w1
+                    p2 = p2 + s_cls[w * 3 + 2]
+                n0 = n0 + w0
+                n1 = n1 + w1
+            want_cls = cutlass.Int32(0)
+            want_pos = block
+            if block >= n0:
+                want_cls = cutlass.Int32(1)
+                want_pos = block - n0
+            if block >= n0 + n1:
+                want_cls = cutlass.Int32(2)
+                want_pos = block - n0 - n1
+            my_pos = p0 + r0
+            if cls == 1:
+                my_pos = p1 + r1
+            if cls == 2:
+                my_pos = p2 + r2
+            if cls < 3:
+                if (cls == want_cls) & (my_pos == want_pos):
+                    s_result[16] = tidx
+            cute.arch.barrier()
+            row = s_result[16]
 
         row_ptr = x.iterator + cutlass.Int64(row) * row_stride + self.col_offset
         out_row = out.iterator + cutlass.Int64(row) * k
         status_row = status.iterator + cutlass.Int64(row) * STATUS_WORDS
-        probe = sample_probe(
-            elems, row_ptr, n_cols, tidx, threads, cfg.sample_vectors
-        )  # in flight while the length loads
+        probe_stale = cutlass.Int32(row != launch_row)
         length = effective_length(
             lengths, row, n_cols, self.next_n, self.compress_ratio
         )
@@ -362,7 +477,15 @@ class StreamingTopK:
                     threads * elems.per_vector * cfg.sample_vectors
                 )
                 aim = self.aim_policy(
-                    k, length, rows, samples, 3 * cfg.stage * splits // 4
+                    k,
+                    length,
+                    rows,
+                    samples,
+                    3 * cfg.stage * splits // 4,
+                    cfg.aim_margin,
+                    cfg.aim_z,
+                    cfg.aim_floor_rows,
+                    cfg.aim_margin_small,
                 )
                 th = Threshold(
                     *sample_threshold(
@@ -381,6 +504,10 @@ class StreamingTopK:
                         threads,
                         cfg.telemetry,
                         cfg.sample_vectors,
+                        cfg.sample_bins,
+                        s_keys,
+                        s_slots,
+                        probe_stale,
                     )
                 )
                 if telemetry:
@@ -428,6 +555,9 @@ class StreamingTopK:
                 finisher = cutlass.Int32(
                     1
                 )  # the CTA that resolves the row and writes its status
+                passes = cutlass.Int32(
+                    1
+                )  # filter passes over this slice (the slab merge repairs nothing)
                 if cutlass.const_expr(slabbed):
                     # the row's verdict happens on the last arriver, after the others have left
                     slab_row = slab.iterator + cutlass.Int64(row) * slab_words_per_row(
@@ -491,7 +621,7 @@ class StreamingTopK:
                                     status_row[8 + w] = s_result[12 + w]
                 else:
                     if cutlass.const_expr(clustered):
-                        bar, scale, survivors, ok = verdict_and_repair_cluster(
+                        bar, scale, survivors, ok, passes = verdict_and_repair_cluster(
                             elems,
                             row_ptr,
                             start,
@@ -516,7 +646,7 @@ class StreamingTopK:
                             cfg.walk_width,
                         )
                     else:
-                        bar, scale, survivors, ok = verdict_and_repair(
+                        bar, scale, survivors, ok, passes = verdict_and_repair(
                             elems,
                             row_ptr,
                             start,
@@ -627,6 +757,10 @@ class StreamingTopK:
                         status_row[0] = cutlass.Int32(1) - ok
                         status_row[1] = arm
                         status_row[2] = survivors
+                        if cutlass.const_expr(not telemetry):
+                            status_row[3] = (
+                                passes  # filter passes over the slice (1, or 2 after an undershoot / overflow repair)
+                            )
         if cutlass.const_expr(self.return_values):
             # the emitter wrote the ties and the fallback itself; in a cluster the peers' winners
             # preceded the cluster barrier, in a slab the last arriver copied everything: after

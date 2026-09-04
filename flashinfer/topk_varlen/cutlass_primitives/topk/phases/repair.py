@@ -53,14 +53,16 @@ def verdict_and_repair(
     unroll: cutlass.Constexpr,
     walk_width: cutlass.Constexpr = 1,
 ):
-    """Return ``(bar, scale, survivors, ok)`` after at most two repair passes.
+    """Return ``(bar, scale, survivors, ok, passes)`` after at most two repair passes.
 
     ``bar`` and ``scale`` are rebound to whatever the last pass used, so the emit classifies
     with exactly the arithmetic that built the histogram.  ``ok`` is 1 when
-    ``k <= survivors <= capacity`` and the sample was not degenerate.  ``s_result``: 2 Int32
-    scratch.  All threads call it.
+    ``k <= survivors <= capacity`` and the sample was not degenerate.  ``passes`` counts the
+    filter passes taken (1 to 3), for the status word.  ``s_result``: 2 Int32 scratch.  All
+    threads call it.
     """
     survivors = s_count[0]
+    passes = cutlass.Int32(1)
     if degenerate == 0:
         if survivors < cutlass.Int32(k):
             bar = floor_bar
@@ -84,6 +86,7 @@ def verdict_and_repair(
                 walk_width,
             )
             survivors = s_count[0]
+            passes = passes + cutlass.Int32(1)
         if survivors > cutlass.Int32(capacity):
             target = cutlass.Int32(capacity - overflow_offset)
             if tidx < 32:
@@ -120,6 +123,7 @@ def verdict_and_repair(
                     walk_width,
                 )
                 survivors = s_count[0]
+                passes = passes + cutlass.Int32(1)
     ok = cutlass.Int32(0)
     if (
         (degenerate == 0)
@@ -127,7 +131,7 @@ def verdict_and_repair(
         & (survivors <= cutlass.Int32(capacity))
     ):
         ok = cutlass.Int32(1)
-    return bar, scale, survivors, ok
+    return bar, scale, survivors, ok, passes
 
 
 @cute.jit
@@ -179,6 +183,7 @@ def verdict_and_repair_cluster(
     cluster_sync()
     survivors = cluster_sum_i32(s_result + 8, splits)
     overflow = cluster_sum_i32(s_result + 9, splits)
+    passes = cutlass.Int32(1)
     if degenerate == 0:
         if (survivors < cutlass.Int32(k)) & (overflow == 0):
             bar = floor_bar
@@ -205,7 +210,8 @@ def verdict_and_repair_cluster(
             cluster_sync()
             survivors = cluster_sum_i32(s_result + 8, splits)
             overflow = cluster_sum_i32(s_result + 9, splits)
+            passes = passes + cutlass.Int32(1)
     ok = cutlass.Int32(0)
     if (degenerate == 0) & (survivors >= cutlass.Int32(k)) & (overflow == 0):
         ok = cutlass.Int32(1)
-    return bar, scale, survivors, ok
+    return bar, scale, survivors, ok, passes

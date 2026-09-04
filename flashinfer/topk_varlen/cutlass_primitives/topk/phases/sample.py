@@ -30,7 +30,7 @@ from typing import NamedTuple
 import cutlass
 import cutlass.cute as cute
 
-from ...block.crossing import crossing_256_warp
+from ...block.crossing import crossing_256_warp, crossing_wide_pair
 from ...block.reduce import block_max_min_u32
 from ...device.atomics import shared_count
 from ...device.memory import load_global_readonly_16
@@ -134,7 +134,7 @@ def _fold_max_min(elems, vec, kmax, kmin):
 
 
 @cute.jit
-def _bin_vector(elems, vec, smin, to_bin, hist_base):
+def _bin_vector(elems, vec, smin, to_bin, hist_base, bins: cutlass.Constexpr = 256):
     w0, w1, w2, w3 = vec
     for j in cutlass.range_constexpr(4):
         for h in cutlass.range_constexpr(elems.per_word):
@@ -142,8 +142,8 @@ def _bin_vector(elems, vec, smin, to_bin, hist_base):
             b = ((v - smin) * to_bin).to(cutlass.Int32)
             if b < 0:
                 b = cutlass.Int32(0)
-            if b > 255:
-                b = cutlass.Int32(255)
+            if b > cutlass.Int32(bins - 1):
+                b = cutlass.Int32(bins - 1)
             shared_count(hist_base + b * 4)
 
 
@@ -164,6 +164,10 @@ def sample_threshold(
     threads: cutlass.Constexpr,
     telemetry: cutlass.Constexpr = False,
     vectors: cutlass.Constexpr = 1,
+    bins: cutlass.Constexpr = 256,
+    s_wide=None,
+    s_slots_i32=None,
+    probe_stale=None,
 ):
     """Sample the row and return ``(bar, scale, floor_bar, floor_scale, degenerate, max)``.
 
@@ -176,14 +180,28 @@ def sample_threshold(
     ``s_result[12..14]``.  (Privatizing the sample histogram into 2 or 4 lane-interleaved
     copies measured no gain on B200, L40S or RTX 5080: the increments are not contention
     bound; see docs/measured-worse.md.)
+
+    ``bins`` above 256: the sample histogram lives in ``s_wide`` (``bins`` Int32, a dead
+    stage) and the crossing is the block-wide ``crossing_wide_pair`` (``s_slots_i32``: warps
+    Int32), two barriers instead of one warp crossing.  Finer bins quantize the threshold
+    finer: the bar is a bin's lower edge, so the survivors include everything in the crossing
+    bin, up to one bin's population above the aim.
     """
     mark = cutlass.Int64(0)
     if cutlass.const_expr(telemetry):
         mark = read_clock64()
     per_vector = cutlass.const_expr(elems.per_vector)
     samples = cutlass.const_expr(threads * per_vector * vectors)
+    wide = cutlass.const_expr(bins > 256)
     vecs = probe
-    if length != cutlass.Int32(n_cols):  # ragged row: the probe covered the wrong span
+    reload = length != cutlass.Int32(
+        n_cols
+    )  # ragged row: the probe covered the wrong span
+    if cutlass.const_expr(probe_stale is not None):
+        reload = reload | (
+            probe_stale != 0
+        )  # the probe was issued for another row (lpt_order moved this CTA)
+    if reload:
         vecs = _load_probe(elems, row_ptr, length, tidx, threads, vectors)
 
     first = vecs[0]
@@ -193,6 +211,9 @@ def sample_threshold(
         kmax, kmin = _fold_max_min(elems, vecs[v], kmax, kmin)
     if tidx < 256:
         s_hist[tidx] = cutlass.Int32(0)
+    if cutlass.const_expr(wide):
+        for i in range(tidx, bins, threads):
+            s_wide[i] = cutlass.Int32(0)
     kmax, kmin = block_max_min_u32(kmax, kmin, s_slots, tidx, threads)  # barrier 1
     if cutlass.const_expr(telemetry):
         if tidx == 0:
@@ -208,10 +229,13 @@ def sample_threshold(
     ):  # finite, non-empty
         degenerate = cutlass.Int32(0)
     if degenerate == 0:
-        to_bin = cutlass.Float32(256.0) / span
-        hist_base = s_hist.toint()
+        to_bin = cutlass.Float32(float(bins)) / span
+        if cutlass.const_expr(wide):
+            hist_base = s_wide.toint()
+        else:
+            hist_base = s_hist.toint()
         for v in cutlass.range_constexpr(vectors):
-            _bin_vector(elems, vecs[v], smin, to_bin, hist_base)
+            _bin_vector(elems, vecs[v], smin, to_bin, hist_base, bins)
     cute.arch.barrier()  # barrier 2
     if cutlass.const_expr(telemetry):
         if tidx == 0:
@@ -222,21 +246,32 @@ def sample_threshold(
     rank_floor = rank_aim * cutlass.Int32(floor_multiple)
     if rank_floor > cutlass.Int32(samples):
         rank_floor = cutlass.Int32(samples)
-    if tidx < 32:
-        bin_aim, _a, _c, bin_floor, _a2, _c2 = crossing_256_warp(
-            s_hist, rank_aim, rank_floor, tidx, True
+    if cutlass.const_expr(wide):
+        # block-wide crossing over the wide histogram: publishes (bin, above, count) for the
+        # aim at s_result[0..2] and for the floor at [3..5], ends with a barrier
+        crossing_wide_pair(
+            s_wide, bins, rank_aim, rank_floor, s_slots_i32, s_result, tidx, threads
         )
-        if tidx == 0:
-            s_result[0] = bin_aim
-            s_result[1] = bin_floor
-    cute.arch.barrier()  # barrier 3: bins published, histogram zeroed
+        bin_aim_w = s_result[0]
+        bin_floor_w = s_result[3]
+    else:
+        if tidx < 32:
+            bin_aim, _a, _c, bin_floor, _a2, _c2 = crossing_256_warp(
+                s_hist, rank_aim, rank_floor, tidx, True
+            )
+            if tidx == 0:
+                s_result[0] = bin_aim
+                s_result[1] = bin_floor
+        cute.arch.barrier()  # barrier 3: bins published, histogram zeroed
+        bin_aim_w = s_result[0]
+        bin_floor_w = s_result[1]
     if cutlass.const_expr(telemetry):
         if tidx == 0:
             s_result[14] = (read_clock64() - mark).to(cutlass.Int32)
 
-    bin_width = span / cutlass.Float32(256.0)
-    bar = smin + s_result[0].to(cutlass.Float32) * bin_width
-    floor_bar = smin + s_result[1].to(cutlass.Float32) * bin_width
+    bin_width = span / cutlass.Float32(float(bins))
+    bar = smin + bin_aim_w.to(cutlass.Float32) * bin_width
+    floor_bar = smin + bin_floor_w.to(cutlass.Float32) * bin_width
     scale = cutlass.Float32(0.0)
     span_above = (smax - bar) * cutlass.Float32(span_ext)
     if span_above > cutlass.Float32(0.0):
