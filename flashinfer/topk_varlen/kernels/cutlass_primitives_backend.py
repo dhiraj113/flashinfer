@@ -35,6 +35,7 @@ import torch
 from ..cutlass_primitives.dispatch.device import device_facts
 from ..cutlass_primitives.topk.dispatch.router import choose
 from ..cutlass_primitives.topk.dispatch.workspace import carve, workspace_layout
+from ..cutlass_primitives.topk.kernels import census_split as CS
 from ..cutlass_primitives.topk.kernels import register_cluster as RCL
 from ..cutlass_primitives.topk.kernels.layout import arena_bytes, arena_view
 from ..cutlass_primitives.topk.kernels import register_resident as REG
@@ -166,6 +167,19 @@ def _compiled_kernel(
             values_fake,
             _fake(i32, (rows, RCL.STATUS_WORDS), 16),
         )
+    elif kind == "census_split":
+        assert isinstance(config, CS.CensusSplitConfig)
+        kern = CS.CensusSplitTopK(cdt, k, config, facts.shared_memory_optin, *varlen)
+        words = CS.slab_words_per_row(config.splits, config.tie_slab)
+        fakes = (
+            _fake(cdt, (rows, stride), 16),
+            _fake(i32, (groups,)),
+            _fake(i32, (rows, k), 16),
+            values_fake,
+            _fake(i32, (rows, CS.STATUS_WORDS), 16),
+            _fake(i32, (rows, words), 16),
+            _fake(i32, (rows, 2)),
+        )
     else:
         assert isinstance(config, STR.StreamingConfig)
         kern = STR.StreamingTopK(cdt, k, config, facts.shared_memory_optin, *varlen)
@@ -287,6 +301,7 @@ def run_cutlass_primitives(
     words = {
         "register": REG.STATUS_WORDS,
         "register_cluster": RCL.STATUS_WORDS,
+        "census_split": CS.STATUS_WORDS,
         "streaming": STR.STATUS_WORDS,
     }[kind]
     caller_ws = workspace.get(WORKSPACE_KEY) if workspace else None
@@ -319,6 +334,15 @@ def run_cutlass_primitives(
     )
     if kind in ("register", "register_cluster"):
         compiled(arena, seq_lens, out_indices, values, status)
+    elif kind == "census_split":
+        assert isinstance(config, CS.CensusSplitConfig)
+        if slab is None:
+            slab, counters = CS._slab_workspace(logits.device, rows, config)
+            slab = slab.view(rows, -1)
+        else:
+            assert counters is not None
+            counters = counters.view(rows, 2)
+        compiled(arena, seq_lens, out_indices, values, status, slab, counters)
     else:
         assert isinstance(config, STR.StreamingConfig)
         if slab is None:

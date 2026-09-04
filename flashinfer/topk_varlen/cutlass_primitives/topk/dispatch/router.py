@@ -12,9 +12,17 @@ This is what a consumer sees as a single backend.  The rules, each from ledger c
    the cluster kernel wins that cell too (6.25 vs 6.42; 8.94 vs 11.0), recorded as the device
    fact ``cheap_small_clusters``.  A second wave of clusters costs the whole gain (128K b=16:
    14.8 vs 8.9), hence the occupancy bound.
-3. Everything else: the streaming kernel, whose own policy picks the split and merge.
+3. Large k on rows beyond both register kernels: the census split kernel, exact and flat in k
+   (two row passes split across the row's CTAs, every CTA emitting its own winners).  The
+   sampled streaming kernel stages about 1.5k survivors and hands the answer to one CTA, so
+   it loses once k is a few percent of the row: B200 1M b=8 k=65536 60.3 vs 36.6 us, k=200000
+   186.6 vs 37.3, 256K b=8 k=100000 75.9 vs 23.2; it still wins at k=16384 (28.1 vs 32.8) and
+   below.  The rule (``_census_split_wins``): k at least N / 24 when the row splits eight ways
+   or more, N / 8 otherwise (wide batches split little and the census's two passes per CTA
+   cost more: 256K b=64 k=16384 33.3 vs 51.3), and always for k at or above N (identity).
+4. Everything else: the streaming kernel, whose own policy picks the split and merge.
 
-All three share the output contract, so the choice is invisible to the caller.
+All four share the output contract, so the choice is invisible to the caller.
 """
 
 from __future__ import annotations
@@ -23,6 +31,11 @@ import torch
 
 from ...dispatch.device import cluster_capacity, device_facts
 
+from ..kernels.census_split import (
+    CensusSplitConfig,
+    census_split_config_for,
+    topk_census_split,
+)
 from ..kernels.register_cluster import (
     SLICE_ELEMENTS,
     RegisterClusterConfig,
@@ -40,6 +53,14 @@ from ..kernels.streaming import StreamingConfig, topk_streaming
 from .streaming_policy import streaming_config_for
 
 __all__ = ["REGISTER_MAX_ROW", "choose", "topk"]
+
+
+def _census_split_wins(facts, k: int, n: int, rows: int) -> bool:
+    if k >= n:
+        return True
+    splits = census_split_config_for(facts, torch.float32, k, n, rows).splits
+    return k * (24 if splits >= 8 else 8) >= n
+
 
 REGISTER_MAX_ROW = (
     1024 * 16
@@ -78,13 +99,19 @@ def choose(
     Raises ``ValueError`` when no configuration fits the device, so callers can decline up front.
     """
     per_word = 1 if dtype == torch.float32 else 2
-    config: RegisterConfig | RegisterClusterConfig | StreamingConfig
+    config: RegisterConfig | RegisterClusterConfig | StreamingConfig | CensusSplitConfig
     if n <= REGISTER_MAX_ROW * per_word and k < n:
         kernel, config = "register", register_config_for(facts, dtype, k, n, rows)
-    elif _cluster_kernel_wins(facts, dtype, k, n, rows):
+    elif k < n and _cluster_kernel_wins(facts, dtype, k, n, rows):
+        # one pass from registers beats the census's two at any k (64K b=8 k=32768: 12.9 vs 14.6 us)
         kernel, config = (
             "register_cluster",
             register_cluster_config_for(facts, dtype, k, n),
+        )
+    elif _census_split_wins(facts, k, n, rows):
+        kernel, config = (
+            "census_split",
+            census_split_config_for(facts, dtype, k, n, rows),
         )
     else:
         kernel, config = "streaming", streaming_config_for(facts, dtype, k, n, rows)
@@ -127,4 +154,6 @@ def topk(
         return topk_register(x, k, config=config, **extra)
     if isinstance(config, RegisterClusterConfig):
         return topk_register_cluster(x, k, config=config, **extra)
+    if isinstance(config, CensusSplitConfig):
+        return topk_census_split(x, k, config=config, **extra)
     return topk_streaming(x, k, config=config, **extra)
