@@ -88,12 +88,20 @@ class Workspace:
 def workspace_layout(kind: str, config, rows: int, arena_bytes: int) -> WorkspaceLayout:
     """The layout for ``rows`` rows under kernel ``kind`` ("register", "register_cluster",
     "streaming") with its configuration; ``arena_bytes`` from :func:`..kernels.layout.arena_bytes`."""
-    from ..kernels import register_cluster, register_resident, streaming
+    from ..kernels import census_split, register_cluster, register_resident, streaming
 
     if kind == "register":
         return WorkspaceLayout(rows * register_resident.STATUS_WORDS, 0, 0, arena_bytes)
     if kind == "register_cluster":
         return WorkspaceLayout(rows * register_cluster.STATUS_WORDS, 0, 0, arena_bytes)
+    if kind == "census_split":
+        assert isinstance(config, census_split.CensusSplitConfig)
+        return WorkspaceLayout(
+            rows * census_split.STATUS_WORDS,
+            2 * rows,
+            rows * census_split.slab_words_per_row(config.splits, config.tie_slab),
+            arena_bytes,
+        )
     assert kind == "streaming" and isinstance(config, streaming.StreamingConfig), kind
     counters = slab = 0
     if config.merge == "slab" and config.splits > 1:

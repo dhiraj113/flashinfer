@@ -3128,6 +3128,88 @@ def test_cutlass_primitives_caller_workspaces_one_per_stream(cell):
 
 
 @pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["f32", "bf16"])
+def test_cutlass_primitives_census_split_cell(dtype):
+    """Large k routes to the library's census split kernel (two launches): exact with values,
+    next_n, a garbage-filled caller workspace with preallocated outputs leaving the allocator
+    untouched, and four streams replaying graphs of the shape at once."""
+    from flashinfer.topk_varlen.cutlass_primitives.dispatch.device import device_facts
+    from flashinfer.topk_varlen.cutlass_primitives.topk.dispatch.router import choose
+    from flashinfer.topk_varlen.kernels.cutlass_primitives_backend import (
+        cutlass_primitives_workspace_bytes,
+    )
+
+    N, batch, top_k, next_n = 262144, 8, 100000, 2
+    kind, _ = choose(device_facts(torch.device("cuda")), dtype, top_k, N, batch)
+    assert kind == "census_split"
+    logits, _, seq_lens = _make_inputs(batch, N, top_k, dtype, seed=61, next_n=next_n)
+    ws = torch.empty(
+        cutlass_primitives_workspace_bytes(logits, top_k),
+        dtype=torch.uint8,
+        device="cuda",
+    ).fill_(0xE7)
+    out_i = torch.empty(batch, top_k, dtype=torch.int32, device="cuda")
+    out_v = torch.empty(batch, top_k, dtype=dtype, device="cuda")
+    kw = dict(
+        next_n=next_n,
+        return_values=True,
+        backend="cutlass_primitives",
+        workspace={"cutlass_primitives_workspace": ws},
+        out_indices=out_i,
+        out_values=out_v,
+    )
+    flashinfer.top_k_varlen(logits, seq_lens, top_k, **kw)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    ws.fill_(0x11)
+    flashinfer.top_k_varlen(logits, seq_lens, top_k, **kw)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == before
+    _check_correct(
+        out_i, logits, seq_lens, top_k, next_n=next_n, require_all_checked=True
+    )
+    for row in range(batch):
+        assert torch.equal(logits[row][out_i[row].long()], out_v[row])
+    # the default caches, four streams at once
+    xs = [_cp_logits_shape(N, batch, dtype, seed=70 + i) for i in range(4)]
+    lens = torch.full((batch,), N, dtype=torch.int32, device="cuda")
+    outs = [
+        torch.full((batch, top_k), -9, dtype=torch.int32, device="cuda") for _ in xs
+    ]
+    streams = [torch.cuda.Stream() for _ in xs]
+    torch.cuda.synchronize()
+    graphs = []
+    for x, out, s in zip(xs, outs, streams, strict=True):
+        with torch.cuda.stream(s):
+            flashinfer.top_k_varlen(
+                x, lens, top_k, backend="cutlass_primitives", out_indices=out
+            )
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            for _ in range(6):
+                flashinfer.top_k_varlen(
+                    x, lens, top_k, backend="cutlass_primitives", out_indices=out
+                )
+        graphs.append(g)
+    for _ in range(3):
+        for out in outs:
+            out.fill_(-9)
+        torch.cuda.synchronize()
+        for g, s in zip(graphs, streams, strict=True):
+            with torch.cuda.stream(s):
+                g.replay()
+        torch.cuda.synchronize()
+        for x, out in zip(xs, outs, strict=True):
+            _check_correct(out, x, lens, top_k, require_all_checked=True)
+
+
+def _cp_logits_shape(N, batch, dtype, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    return (torch.randn(batch, N, device="cuda", generator=g) * 2.0).to(dtype)
+
+
+@pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
 def test_cutlass_primitives_streams_and_shapes_interleaved():
     """Shapes, options and streams interleaved in one loop through the default caches: no
     buffer is ever picked up by the wrong shape or stream."""
