@@ -1488,15 +1488,10 @@ def test_gvr2_neginf_tail_completeness():
 
 
 @requires_blackwell
-@pytest.mark.xfail(
-    strict=True,
-    reason="gvr_2 drops a +inf entry (classify transform maps +inf to NaN); "
-    "DKG issue #58, listed as an adjacent defect in TensorRT-LLM PR #18501",
-)
 def test_gvr2_plus_inf_selected():
     """A single +inf must be in the top-k (finite + inf inputs are inside the
-    kernel's exactness contract).  Strict xfail: flips to a failure -- i.e.
-    remove the marker -- once the upstream fix lands."""
+    kernel's exactness contract).  Was a strict xfail (DKG issue #58) until the
+    TensorRT-LLM #18625 port landed upstream with the gvr_2 backend."""
     top_k, n = 1024, 4096
     gen = torch.Generator(device="cuda").manual_seed(7)
     logits = torch.randn((1, n), generator=gen, dtype=torch.float32, device="cuda")
