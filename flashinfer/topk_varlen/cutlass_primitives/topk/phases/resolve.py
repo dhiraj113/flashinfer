@@ -16,6 +16,7 @@ import cutlass.cute as cute
 
 from ...block.cluster_merge import merge_histograms_256
 from ...block.crossing import crossing_256_warp
+from ...block.reduce import block_exclusive_scan_i32
 from ...block.tie_select import tie_select_ballot, tie_select_radix
 from ...device.atomics import shared_add
 from ...device.cluster import (
@@ -49,6 +50,7 @@ def emit_and_select(
     s_result,
     tidx,
     threads: cutlass.Constexpr,
+    scan_emit: cutlass.Constexpr = False,
 ):
     """Write the k winners of a usable stage to ``out_row``; return 1, or 0 if the crossing
     bin overflowed the tie stage (the caller then takes the exact fallback).
@@ -56,7 +58,13 @@ def emit_and_select(
     Preconditions: ``k <= survivors <= capacity``; ``s_hist`` is the histogram the stage was
     built with, under the same ``bar`` and ``scale``.  ``s_keys`` (>= 512 Int32) is dead after
     the emit and is reused as the radix select's histogram.  ``s_result``: 8 Int32 scratch;
-    ``s_slots``: 8 Int32.  Barriers: two, plus the radix select's when taken.
+    ``s_slots``: warps Int32.  Barriers: two, plus the radix select's when taken.
+
+    ``scan_emit``: positions from one block scan of per-thread (winner, tie) counts packed in
+    one word, instead of a same-address shared atomic per candidate.  The atomic form won at
+    one 1024-thread CTA per SM (module docstring); with two 512-thread CTAs sharing an SM's
+    atomic unit at k=2048 the candidates' atomics serialize (measured here: the per-row cost
+    grows 2.7 us per thousand staged survivors), so the wide-batch policy selects the scan.
     """
     if tidx < 32:
         b, above, _c, _b2, _a2, _c2 = crossing_256_warp(
@@ -70,25 +78,58 @@ def emit_and_select(
     cute.arch.barrier()
     cut_bin = s_result[0]
     above = s_result[1]
-    for t in range(tidx, survivors, threads):
-        bits = cutlass.Uint32(s_keys[t])
-        b = survivor_bin(elems.value(bits), bar, scale)
-        if b > cut_bin:
-            p = shared_add(s_result + 6, 1)
-            if p < cutlass.Int32(k):
-                out_row[p] = s_idx[t]
-        else:
-            if b == cut_bin:
-                e = shared_add(s_result + 7, 1)
-                if e < cutlass.Int32(tie_capacity):
-                    s_tie_keys[e] = elems.key(bits)
-                    s_tie_idx[e] = s_idx[t]
-    cute.arch.barrier()
+    ties = cutlass.Int32(0)
+    if cutlass.const_expr(scan_emit):
+        # pass 1: this thread's winner and tie counts (packed: winners in the high half)
+        mine = cutlass.Int32(0)
+        for t in range(tidx, survivors, threads):
+            b = survivor_bin(elems.value(cutlass.Uint32(s_keys[t])), bar, scale)
+            if b > cut_bin:
+                mine = mine + cutlass.Int32(65536)
+            else:
+                if b == cut_bin:
+                    mine = mine + cutlass.Int32(1)
+        before, total = block_exclusive_scan_i32(mine, s_slots, tidx, threads)
+        wpos = before >> cutlass.Int32(16)
+        tpos = before & cutlass.Int32(0xFFFF)
+        ties = total & cutlass.Int32(0xFFFF)
+        # pass 2: write at the scanned positions (the stage is 8 KB per thousand candidates:
+        # the second read comes from shared memory)
+        for t in range(tidx, survivors, threads):
+            bits = cutlass.Uint32(s_keys[t])
+            b = survivor_bin(elems.value(bits), bar, scale)
+            if b > cut_bin:
+                if wpos < cutlass.Int32(k):
+                    out_row[wpos] = s_idx[t]
+                wpos = wpos + cutlass.Int32(1)
+            else:
+                if b == cut_bin:
+                    if tpos < cutlass.Int32(tie_capacity):
+                        s_tie_keys[tpos] = elems.key(bits)
+                        s_tie_idx[tpos] = s_idx[t]
+                    tpos = tpos + cutlass.Int32(1)
+        cute.arch.barrier()
+    else:
+        for t in range(tidx, survivors, threads):
+            bits = cutlass.Uint32(s_keys[t])
+            b = survivor_bin(elems.value(bits), bar, scale)
+            if b > cut_bin:
+                p = shared_add(s_result + 6, 1)
+                if p < cutlass.Int32(k):
+                    out_row[p] = s_idx[t]
+            else:
+                if b == cut_bin:
+                    e = shared_add(s_result + 7, 1)
+                    if e < cutlass.Int32(tie_capacity):
+                        s_tie_keys[e] = elems.key(bits)
+                        s_tie_idx[e] = s_idx[t]
+        cute.arch.barrier()
+        ties = s_result[7]
     return _select_ties(
         elems,
         k,
         above,
-        s_result[7],
+        ties,
         out_row,
         s_keys,
         s_tie_keys,

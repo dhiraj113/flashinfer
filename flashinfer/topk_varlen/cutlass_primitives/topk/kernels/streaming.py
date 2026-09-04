@@ -68,6 +68,7 @@ class StreamingConfig:
     threads: int = 1024
     ctas_per_sm: int = 1
     unroll: int = 4
+    walk_width: int = 1  # survivor reloads issued together in the filter's bit-walk (1, 2, 4): phases/filter_pass.py
     # split
     splits: int = 1  # CTAs per row
     merge: str = "cluster"  # "cluster": DSMEM merge (SM90+, splits <= 8); "slab": global-memory last arriver
@@ -83,6 +84,7 @@ class StreamingConfig:
     overflow_offset: int = 64
     # epilogue
     ballot_limit: int = 128
+    scan_emit: bool = False  # output positions from a block scan instead of a shared cursor per candidate (phases/resolve.py)
     # scheduling
     short_cutoff: int = 16384  # rows at or below take the exact select directly; EXACT_ONLY: every row does
     pdl: bool = False
@@ -103,6 +105,8 @@ class StreamingConfig:
             raise ValueError(
                 "unroll * elements per vector must fit the 32-bit dead mask"
             )
+        if self.walk_width not in (1, 2, 4):
+            raise ValueError("walk_width must be 1, 2 or 4")
         if self.aim not in ("tight", "wide"):
             raise ValueError(f"unknown aim policy {self.aim!r}")
         if self.sample_vectors not in (1, 2, 4):
@@ -411,6 +415,7 @@ class StreamingTopK:
                         tidx,
                         threads,
                         cfg.unroll,
+                        cfg.walk_width,
                     )
                 else:
                     cute.arch.barrier()
@@ -508,6 +513,7 @@ class StreamingTopK:
                             tidx,
                             threads,
                             cfg.unroll,
+                            cfg.walk_width,
                         )
                     else:
                         bar, scale, survivors, ok = verdict_and_repair(
@@ -532,6 +538,7 @@ class StreamingTopK:
                             tidx,
                             threads,
                             cfg.unroll,
+                            cfg.walk_width,
                         )
                     if telemetry:
                         if tidx == 0:
@@ -580,6 +587,7 @@ class StreamingTopK:
                                 s_result,
                                 tidx,
                                 threads,
+                                cfg.scan_emit,
                             )
                     else:
                         if cutlass.const_expr(clustered):

@@ -64,6 +64,28 @@ def _classify_vector(
 
 
 @cute.jit
+def _stage_bits(
+    elems,
+    bits,
+    idx,
+    pos,
+    capacity: cutlass.Constexpr,
+    bar,
+    scale,
+    hist_base,
+    s_keys,
+    s_idx,
+):
+    """Write one loaded survivor to the stage (slot ``capacity`` is the overflow trash) and count its bin."""
+    slot = pos
+    if slot > cutlass.Int32(capacity):
+        slot = cutlass.Int32(capacity)
+    s_keys[slot] = bits.bitcast(cutlass.Int32)
+    s_idx[slot] = idx
+    shared_count(hist_base + survivor_bin(elems.value(bits), bar, scale) * 4)
+
+
+@cute.jit
 def _stage(
     elems,
     row_ptr,
@@ -76,14 +98,39 @@ def _stage(
     s_keys,
     s_idx,
 ):
-    """Write one survivor to the stage (slot ``capacity`` is the overflow trash) and count its bin."""
-    bits = elems.load_bits(row_ptr, idx)
-    slot = pos
-    if slot > cutlass.Int32(capacity):
-        slot = cutlass.Int32(capacity)
-    s_keys[slot] = bits.bitcast(cutlass.Int32)
-    s_idx[slot] = idx
-    shared_count(hist_base + survivor_bin(elems.value(bits), bar, scale) * 4)
+    """Reload one survivor and stage it."""
+    _stage_bits(
+        elems,
+        elems.load_bits(row_ptr, idx),
+        idx,
+        pos,
+        capacity,
+        bar,
+        scale,
+        hist_base,
+        s_keys,
+        s_idx,
+    )
+
+
+@cute.jit
+def _next_bit(
+    alive,
+    lg: cutlass.Constexpr,
+    per_vector: cutlass.Constexpr,
+    vbase,
+    start,
+    threads: cutlass.Constexpr,
+):
+    """(alive without its lowest bit, row index of that bit's element).  With ``alive == 0`` the
+    index is that of bit 0 (a valid element of the tile), so a predicated-off reload is safe."""
+    low = alive & (cutlass.Int32(0) - alive)
+    bit = cutlass.Int32(cute.arch.popc(low - cutlass.Int32(1)))
+    if alive == 0:
+        bit = cutlass.Int32(0)
+    vec = vbase + (bit >> cutlass.Int32(lg)) * cutlass.Int32(threads)
+    idx = start + (vec << cutlass.Int32(lg)) + (bit & cutlass.Int32(per_vector - 1))
+    return alive & (alive - cutlass.Int32(1)), idx
 
 
 @cute.jit
@@ -103,6 +150,7 @@ def filter_pass(
     tidx,
     threads: cutlass.Constexpr,
     unroll: cutlass.Constexpr,
+    walk_width: cutlass.Constexpr = 1,
 ):
     """Stage every element of ``row[start, start + count)`` that is not <= ``bar``.
 
@@ -111,6 +159,13 @@ def filter_pass(
     ``s_hist`` = 256-bin survivor histogram over ALL survivors (staged or not).  ``s_keys``
     and ``s_idx`` need ``capacity + 1`` slots.  Two barriers (one to zero, one to publish).
     ``unroll * per_vector`` must be at most 32 (the mask width).
+
+    ``walk_width``: survivors reloaded per walk step, their loads issued together before any
+    is staged.  With one, each survivor's reload waits out the previous one's latency; when
+    two CTAs share an SM the tiles no longer fit the L1 left beside their shared memory and
+    the reloads come from L2, so at k=2048 (3000+ survivors per row) the chain was the
+    k-proportional cost of the wide-batch cells (ncu: long-scoreboard stalls 6 per issue at 34%
+    issue utilization).
     """
     if tidx == 0:
         s_count[0] = cutlass.Int32(0)
@@ -178,21 +233,51 @@ def filter_pass(
                     )
         alive = (~dead) & valid
         pos = warp_reserve(cutlass.Int32(cute.arch.popc(alive)), lane, s_count)
-        while alive != 0:
-            bit = cutlass.Int32(
-                cute.arch.popc((alive & (cutlass.Int32(0) - alive)) - cutlass.Int32(1))
-            )
-            alive = alive & (alive - cutlass.Int32(1))
-            vec = vbase + (bit >> cutlass.Int32(lg)) * cutlass.Int32(threads)
-            idx = (
-                start
-                + (vec << cutlass.Int32(lg))
-                + (bit & cutlass.Int32(per_vector - 1))
-            )
-            _stage(
-                elems, row_ptr, idx, pos, capacity, bar, scale, hist_base, s_keys, s_idx
-            )
-            pos = pos + cutlass.Int32(1)
+        if cutlass.const_expr(walk_width == 1):
+            while alive != 0:
+                alive, idx = _next_bit(alive, lg, per_vector, vbase, start, threads)
+                _stage(
+                    elems,
+                    row_ptr,
+                    idx,
+                    pos,
+                    capacity,
+                    bar,
+                    scale,
+                    hist_base,
+                    s_keys,
+                    s_idx,
+                )
+                pos = pos + cutlass.Int32(1)
+        else:
+            while alive != 0:
+                # up to walk_width survivors: all their reloads first (independent loads in
+                # flight), then the stage writes; absent survivors reload a valid element and
+                # skip the write
+                idxs = []
+                present = []
+                for w in cutlass.range_constexpr(walk_width):
+                    present.append(alive != 0)
+                    alive, idx_w = _next_bit(
+                        alive, lg, per_vector, vbase, start, threads
+                    )
+                    idxs.append(idx_w)
+                loaded = [elems.load_bits(row_ptr, idxs[w]) for w in range(walk_width)]
+                for w in cutlass.range_constexpr(walk_width):
+                    if present[w]:
+                        _stage_bits(
+                            elems,
+                            loaded[w],
+                            idxs[w],
+                            pos,
+                            capacity,
+                            bar,
+                            scale,
+                            hist_base,
+                            s_keys,
+                            s_idx,
+                        )
+                        pos = pos + cutlass.Int32(1)
         vbase = vbase + cutlass.Int32(per_iter)
         vaddr = vaddr + stride * unroll
         it = it + cutlass.Int32(1)
