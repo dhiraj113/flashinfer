@@ -256,7 +256,7 @@ def filter_pass(
                 # skip the write
                 idxs = []
                 present = []
-                for w in cutlass.range_constexpr(walk_width):
+                for _w in cutlass.range_constexpr(walk_width):
                     present.append(alive != 0)
                     alive, idx_w = _next_bit(
                         alive, lg, per_vector, vbase, start, threads
