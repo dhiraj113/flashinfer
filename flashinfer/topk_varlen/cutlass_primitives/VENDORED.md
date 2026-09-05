@@ -3,9 +3,9 @@
 Do not edit these files in FlashInfer; change the library and re-vendor.
 
 - upstream: ssh://git@gitlab-master.nvidia.com:12051/dnallapa/cutlass-primitives.git
-- tag: v0.1.18
-- commit: d75fa1e
-- date: 2026-09-04
+- tag: v0.1.19
+- commit: b8dd297
+- date: 2026-09-05
 - command: python tools/vendor_into_flashinfer.py <flashinfer>
 
 Layout: `device/`, `block/`, `dispatch/` are the shared layers; `topk/` holds the phases,

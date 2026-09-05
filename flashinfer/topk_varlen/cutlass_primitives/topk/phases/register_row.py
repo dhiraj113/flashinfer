@@ -19,7 +19,10 @@ instruction count is the whole story.  Three measured rules:
   and the twiddle runs on both halves in 32-bit arithmetic (five instructions for two keys).
   A scalar fp32 -> fp16 conversion takes a quarter-rate slot per element.
 * No ``if`` per element: sixteen traced ``if`` regions in a row serialize the independent
-  per-element work.  Validity is arithmetic (out-of-range elements count into a trash bin).
+  per-element work.  Validity is arithmetic (out-of-range elements count into a trash bin),
+  and it runs only for the vectors at or past the row's tail, behind one uniform branch per
+  vector (v0.1.19: 16K b=64 on B200 measured the arithmetic on every element at a quarter of
+  the count phase, the whole of the 5% gap to walk-first's register kernel).
 * Bins are kept, packed two per register, from the count to the classify, so the classify is
   an unpack and two compares per element.  The block runs one CTA per SM (64 registers), which
   measured better than two CTAs per SM at 32 registers anyway (8.7 -> 7.3 us at 16K b=64).
@@ -42,6 +45,7 @@ from .census import element_bits, pair_key16
 
 __all__ = [
     "load_row_words",
+    "zero_bins",
     "count_coarse_bins",
     "classify_from_registers",
     "classify_from_registers_cluster",
@@ -108,16 +112,19 @@ def _index_of_bit(tidx, threads: cutlass.Constexpr, per_vector: cutlass.Constexp
 
 
 @cute.jit
-def _pair_bins(
-    elems,
-    wordvals,
-    p: cutlass.Constexpr,
-    length,
-    tidx,
-    threads: cutlass.Constexpr,
-    bins: cutlass.Constexpr,
-):
-    """Coarse bins of elements 2p and 2p+1 packed (low half = element 2p), trash bin past the end."""
+def zero_bins(s_bins_all, count: cutlass.Constexpr, tidx, threads: cutlass.Constexpr):
+    """Zero ``count`` Int32 of ``s_bins_all`` (unrolled: a rolled loop costs three instructions
+    per iteration on every warp, 12 per warp at 4096 bins)."""
+    for z in cutlass.range_constexpr(count // threads):
+        s_bins_all[tidx + z * threads] = cutlass.Int32(0)
+    if cutlass.const_expr(count % threads != 0):
+        if tidx < cutlass.Int32(count % threads):
+            s_bins_all[tidx + (count // threads) * threads] = cutlass.Int32(0)
+
+
+@cute.jit
+def _raw_pair_bins(elems, wordvals, p: cutlass.Constexpr, bins: cutlass.Constexpr):
+    """Coarse bins of elements 2p and 2p+1 (low half = element 2p), validity not applied."""
     shift = cutlass.const_expr(16 - {1024: 10, 2048: 11, 4096: 12}[int(bins)])
     half_mask = cutlass.const_expr((int(bins) - 1) | ((int(bins) - 1) << 16))
     packed = (pair_key16(elems, wordvals, p) >> cutlass.Uint32(shift)) & cutlass.Uint32(
@@ -125,15 +132,65 @@ def _pair_bins(
     )
     lo = (packed & cutlass.Uint32(0xFFFF)).to(cutlass.Int32)
     hi = (packed >> cutlass.Uint32(16)).to(cutlass.Int32)
-    valid_lo = cutlass.Int32(
-        _element_index(tidx, threads, elems.per_vector, 2 * p) < length
-    )
-    valid_hi = cutlass.Int32(
-        _element_index(tidx, threads, elems.per_vector, 2 * p + 1) < length
-    )
-    lo = (lo + 1) * valid_lo - 1  # -1 past the row's end
-    hi = (hi + 1) * valid_hi - 1
     return lo, hi
+
+
+@cute.jit
+def _tail_bin(
+    b,
+    e: cutlass.Constexpr,
+    length,
+    tidx,
+    threads: cutlass.Constexpr,
+    per_vector: cutlass.Constexpr,
+):
+    """Bin ``b`` of the thread's element ``e``, or -1 when the element lies past the row's end."""
+    valid = cutlass.Int32(_element_index(tidx, threads, per_vector, e) < length)
+    return (b + 1) * valid - 1
+
+
+@cute.jit
+def _vector_bins(
+    elems,
+    wordvals,
+    j: cutlass.Constexpr,
+    length,
+    full_vectors,
+    tidx,
+    threads: cutlass.Constexpr,
+    bins: cutlass.Constexpr,
+):
+    """Coarse bins of the thread's vector ``j`` as (lo, hi) per pair: two pairs (fp32) or four
+    (16-bit).  The validity test runs only on vectors at or past the row's tail: a vector
+    below ``full_vectors`` is entirely inside the row (uniform across a warp except at the tail
+    itself, so the branch is a cheap skip; per-element validity arithmetic measured 1.5
+    instructions per element on every element of every row, a quarter of the count phase)."""
+    ppv = cutlass.const_expr(2 * elems.per_word)  # pairs per 16-byte vector
+    pv = cutlass.const_expr(elems.per_vector)
+    l0, h0 = _raw_pair_bins(elems, wordvals, j * ppv, bins)
+    l1, h1 = _raw_pair_bins(elems, wordvals, j * ppv + 1, bins)
+    l2 = cutlass.Int32(0)
+    h2 = cutlass.Int32(0)
+    l3 = cutlass.Int32(0)
+    h3 = cutlass.Int32(0)
+    if cutlass.const_expr(ppv == 4):
+        l2, h2 = _raw_pair_bins(elems, wordvals, j * ppv + 2, bins)
+        l3, h3 = _raw_pair_bins(elems, wordvals, j * ppv + 3, bins)
+    if tidx + cutlass.Int32(j * threads) >= full_vectors:
+        e0 = cutlass.const_expr(j * pv)
+        l0 = _tail_bin(l0, e0, length, tidx, threads, pv)
+        h0 = _tail_bin(h0, e0 + 1, length, tidx, threads, pv)
+        l1 = _tail_bin(l1, e0 + 2, length, tidx, threads, pv)
+        h1 = _tail_bin(h1, e0 + 3, length, tidx, threads, pv)
+        if cutlass.const_expr(ppv == 4):
+            l2 = _tail_bin(l2, e0 + 4, length, tidx, threads, pv)
+            h2 = _tail_bin(h2, e0 + 5, length, tidx, threads, pv)
+            l3 = _tail_bin(l3, e0 + 6, length, tidx, threads, pv)
+            h3 = _tail_bin(h3, e0 + 7, length, tidx, threads, pv)
+    if cutlass.const_expr(ppv == 4):
+        return (l0, h0, l1, h1, l2, h2, l3, h3)
+    else:
+        return (l0, h0, l1, h1)
 
 
 @cute.jit
@@ -149,15 +206,23 @@ def count_coarse_bins(
 ):
     """Add every element to its coarse bin in ``s_bins`` (``bins`` Int32 zeroed by the caller,
     with one writable slot just below index 0 for out-of-range elements) and return the bins
-    packed two per Int32 (element 2p in the low half).  No barrier, no branches."""
+    packed two per Int32 (element 2p in the low half).  No barrier; one uniform branch per
+    vector (``_vector_bins``)."""
     base = s_bins.toint()
-    pairs = cutlass.const_expr(words * elems.per_word // 2)
+    full_vectors = length >> cutlass.Int32(
+        elems.log2_per_vector
+    )  # vectors entirely inside the row
     packed = []
-    for p in cutlass.range_constexpr(pairs):
-        lo, hi = _pair_bins(elems, wordvals, p, length, tidx, threads, bins)
-        shared_count(base + lo * 4)
-        shared_count(base + hi * 4)
-        packed.append((lo & cutlass.Int32(0xFFFF)) | (hi << 16))
+    for j in cutlass.range_constexpr(words // 4):
+        vec = _vector_bins(
+            elems, wordvals, j, length, full_vectors, tidx, threads, bins
+        )
+        for q in cutlass.range_constexpr(len(vec) // 2):
+            lo = vec[2 * q]
+            hi = vec[2 * q + 1]
+            shared_count(base + lo * 4)
+            shared_count(base + hi * 4)
+            packed.append((lo & cutlass.Int32(0xFFFF)) | (hi << 16))
     return tuple(packed)
 
 
