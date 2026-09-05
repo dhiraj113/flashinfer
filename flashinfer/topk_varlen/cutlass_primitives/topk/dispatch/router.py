@@ -4,14 +4,19 @@ This is what a consumer sees as a single backend.  The rules, each from ledger c
 
 1. Rows that fit one CTA's registers (16K fp32, 32K 16-bit): the register-resident kernel.
 2. Rows up to eight register slices (128K fp32, 256K 16-bit) in batches whose clusters all
-   fit one wave, on any part with clusters: the clustered register-resident kernel.  It won
-   or tied the streaming kernel on every measured cell of that grid (B200, k=1024: 32K b=8
-   7.87 vs 8.07 us, 32K b=32 8.07 vs 8.69, 128K b=8 8.48 vs 8.90, bf16 64K b=32 8.48 vs
-   9.71) except fp32 64K rows in batches under 32 at k <= 1024 on H100 and B200 (8.28 vs 7.87;
-   H100 13.7 vs 12.5), which stay with the streaming kernel there; on Rubin and the RTX 5080
+   fit one wave, on any part with clusters: the clustered register-resident kernel, in the
+   largest cluster the batch has SMs for (v0.1.19: ``register_cluster_config_for`` takes the
+   batch; 8 CTAs of 8 words per thread for 64K b=8, 8 of 4 words for 32K b=8).  With slices
+   of at most 8 words per thread it beat the streaming kernel on every measured cell (B200
+   k=1024: 64K b=8 6.93 vs 7.53 us, 32K b=8 5.95 vs 7.48, 32K b=32 6.56 vs 7.97; H100 64K
+   b=8 11.5 vs 12.5, 32K b=16 10.8 vs 12.3), and gvr_2's eight-way register kernel (6.43,
+   6.23 on B200) is no longer ahead there.  At 16 words per thread it won or tied on most
+   cells (B200: 32K b=32 7.67 vs 7.94, 128K b=8 8.00 vs 8.30, bf16 64K b=32 8.48 vs 9.71)
+   except fp32 64K rows in batches under 32 at k <= 1024 on H100 and B200 (8.04 vs 7.72;
+   H100 13.5 vs 12.6), which stay with the streaming kernel there; on Rubin and the RTX 5080
    the cluster kernel wins that cell too (6.25 vs 6.42; 8.94 vs 11.0), recorded as the device
    fact ``cheap_small_clusters``.  A second wave of clusters costs the whole gain (128K b=16:
-   14.8 vs 8.9), hence the occupancy bound.
+   14.4 vs 8.5), hence the occupancy bound.
 3. Large k on rows beyond both register kernels: the census split kernel, exact and flat in k
    (two row passes split across the row's CTAs, every CTA emitting its own winners).  The
    sampled streaming kernel stages about 1.5k survivors and hands the answer to one CTA, so
@@ -73,18 +78,27 @@ def _cluster_kernel_wins(facts, dtype: torch.dtype, k: int, n: int, rows: int) -
     # on consumer Blackwell (RTX 5080 128K b=8: 11.2 us vs 12.4 streaming, 12.0 walk-first)
     if not facts.supports_clusters:
         return False
+    # slices hold at most SLICE_ELEMENTS elements whatever the dtype (a 32-element slice per
+    # thread measured 12.0 us against 8.9 streaming at bf16 64K b=8), so 16-bit rows beyond
+    # 128K go on to the census split or streaming kernels
     if n <= SLICE_ELEMENTS or n > 8 * SLICE_ELEMENTS:
         return False
-    splits = next(s for s in (2, 4, 8) if n <= s * SLICE_ELEMENTS)
-    if rows > cluster_capacity(facts.index, splits):
-        return False
+    smallest = next(s for s in (2, 4, 8) if n <= s * SLICE_ELEMENTS)
+    if rows > cluster_capacity(facts.index, smallest):
+        return False  # even the smallest clusters need a second wave
+    if register_cluster_config_for(facts, dtype, k, n, rows).words_per_thread <= 8:
+        # slices of at most 8 words per thread (the batch leaves SMs for 4 or 8 CTAs per row)
+        # beat the streaming kernel on every measured cell: B200 k=1024 64K b=8 6.93 vs 7.53,
+        # 32K b=8 5.95 vs 7.48, 32K b=32 6.56 vs 7.97; H100 64K b=8 11.5 vs 12.5, 32K b=16
+        # 10.8 vs 12.3
+        return True
     if (
         dtype == torch.float32
         and 2 * SLICE_ELEMENTS < n <= 4 * SLICE_ELEMENTS
         and rows < 32
         and k <= 1024
     ):
-        return facts.cheap_small_clusters  # fp32 64K rows in small batches: the streaming kernel wins on H100 and B200 (device fact)
+        return facts.cheap_small_clusters  # fp32 64K rows at 4 x 16 words: the streaming kernel wins on H100 and B200 (device fact)
     return True
 
 
@@ -108,7 +122,7 @@ def choose(
         # one pass from registers beats the census's two at any k (64K b=8 k=32768: 12.9 vs 14.6 us)
         kernel, config = (
             "register_cluster",
-            register_cluster_config_for(facts, dtype, k, n),
+            register_cluster_config_for(facts, dtype, k, n, rows),
         )
     elif _census_split_wins(facts, k, n, rows):
         kernel, config = (

@@ -41,6 +41,7 @@ from ..phases.register_row import (
     count_coarse_bins,
     key_range_in_bin,
     load_row_words,
+    zero_bins,
 )
 from ..phases.resolve import _select_ties
 from ..phases.varlen import effective_length, gather_values
@@ -221,8 +222,7 @@ class RegisterTopK:
                 status_row[0] = cutlass.Int32(0)
                 status_row[1] = cutlass.Int32(0)
         else:
-            for i in range(tidx, bins + 4, threads):
-                s_bins_all[i] = cutlass.Int32(0)
+            zero_bins(s_bins_all, bins + 4, tidx, threads)
             cute.arch.barrier()
             packed_bins = count_coarse_bins(
                 elems, wordvals, length, s_bins, tidx, threads, words, bins
