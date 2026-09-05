@@ -181,6 +181,7 @@ def streaming_config_for(
         # whole-row configurations: rows that fit the registers (16K fp32 at 1024 threads, 8K
         # at 512) take the register-resident phases instead of the census
         register_arm=splits == 1,
+        count_after_barrier=facts.staggered_count,
     )
     row_kb = row_bytes >> 10
     wide_batch = rows > facts.sm_count and (

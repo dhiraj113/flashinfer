@@ -45,6 +45,7 @@ from ..phases.register_row import (
     count_coarse_bins,
     key_range_in_bin,
     load_row_words,
+    words_after_barrier,
     zero_bins,
 )
 from ..phases.repair import verdict_and_repair, verdict_and_repair_cluster
@@ -107,6 +108,7 @@ class StreamingConfig:
     register_words: int = (
         16  # 32-bit words per thread held in registers by that arm (4, 8 or 16)
     )
+    count_after_barrier: bool = True  # the arm pins its count below the zeroing barrier (see register_row.words_after_barrier); a device fact
     short_cutoff: int = 16384  # rows at or below take the exact select directly; EXACT_ONLY: every row does
     lpt_order: bool = False  # block b processes the row of rank b by length (longest first); wide batches, splits == 1
     pdl: bool = False
@@ -332,6 +334,8 @@ class StreamingTopK:
             row_ptr, length, tidx, threads, words, elems.log2_per_vector
         )
         cute.arch.barrier()
+        if cutlass.const_expr(cfg.count_after_barrier):
+            wordvals = words_after_barrier(wordvals, s_bins_all)
         packed_bins = count_coarse_bins(
             elems, wordvals, length, s_bins, tidx, threads, words, bins
         )
