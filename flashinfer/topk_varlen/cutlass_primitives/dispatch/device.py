@@ -30,6 +30,7 @@ class DeviceFacts:
     )
     supports_pdl: bool  # programmatic dependent launch (SM90+)
     packed_bf16_compare: bool  # setp.le.bf16x2 (SM90+); fp16x2 is available everywhere
+    staggered_count: bool  # register kernels enter the histogram count warp by warp, not in a burst (see _facts)
 
 
 @functools.cache
@@ -64,6 +65,16 @@ def _facts(index: int) -> DeviceFacts:
         filter_unroll=8 if cc[0] in (9, 10) else 4,
         supports_pdl=cc[0] >= 9,
         packed_bf16_compare=cc[0] >= 9,
+        # The register kernels' histogram count is 16 shared atomics per thread.  Left to the
+        # compiler, the first conversion is hoisted above the zeroing barrier, so the barrier
+        # becomes a rendezvous after the load latency and all warps issue their atomics in one
+        # burst; pinning the count below the barrier (register_row.words_after_barrier) lets
+        # each warp start as its own loads land.  Stall-sampled and graph-timed at 16K b=64
+        # (burst -> pinned): A100 10.51 -> 10.06 us (16K b=256: 34.0 -> 27.5), L40S 11.57 ->
+        # 10.57, RTX 5080 6.36 -> 5.93; the parts with faster shared atomics lose the overlap
+        # of conversions with the load tail instead: B200 5.73 -> 5.92, Rubin 4.25 -> 4.42,
+        # H100 8.98 -> 9.09.
+        staggered_count=cc[0] in (8, 12),
     )
 
 

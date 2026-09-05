@@ -41,6 +41,7 @@ from ..phases.register_row import (
     count_coarse_bins,
     key_range_in_bin,
     load_row_words,
+    words_after_barrier,
     zero_bins,
 )
 from ..phases.resolve import _select_ties
@@ -72,6 +73,7 @@ class RegisterConfig:
     tie_capacity: int = 2048
     ballot_limit: int = 128
     pdl: bool = False
+    count_after_barrier: bool = True  # pin the count below the zeroing barrier (words_after_barrier); a device fact
     telemetry: bool = False
 
     def row_capacity(self, elems: Elements) -> int:
@@ -224,6 +226,8 @@ class RegisterTopK:
         else:
             zero_bins(s_bins_all, bins + 4, tidx, threads)
             cute.arch.barrier()
+            if cutlass.const_expr(cfg.count_after_barrier):
+                wordvals = words_after_barrier(wordvals, s_bins_all)
             packed_bins = count_coarse_bins(
                 elems, wordvals, length, s_bins, tidx, threads, words, bins
             )
@@ -398,6 +402,7 @@ def register_config_for(
         bins=bins,
         tie_capacity=tie_capacity,
         pdl=facts.supports_pdl,
+        count_after_barrier=facts.staggered_count,
     )
     if cfg.ctas_per_sm * cfg.shared_memory_bytes() > facts.shared_memory_optin:
         cfg = RegisterConfig(**{**cfg.__dict__, "ctas_per_sm": 1})

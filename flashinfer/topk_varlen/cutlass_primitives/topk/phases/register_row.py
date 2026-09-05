@@ -46,6 +46,7 @@ from .census import element_bits, pair_key16
 __all__ = [
     "load_row_words",
     "zero_bins",
+    "words_after_barrier",
     "count_coarse_bins",
     "classify_from_registers",
     "classify_from_registers_cluster",
@@ -120,6 +121,23 @@ def zero_bins(s_bins_all, count: cutlass.Constexpr, tidx, threads: cutlass.Const
     if cutlass.const_expr(count % threads != 0):
         if tidx < cutlass.Int32(count % threads):
             s_bins_all[tidx + (count // threads) * threads] = cutlass.Int32(0)
+
+
+@cute.jit
+def words_after_barrier(wordvals, s_zeroed):
+    """The row's words made dependent on a shared load of ``s_zeroed`` (an Int32 the caller
+    zeroed before its barrier), so no use of the words can be scheduled above that barrier.
+
+    Without it the compiler hoists the first pair conversion above the histogram-zeroing
+    barrier (it is register-only work), so a warp reaches the barrier only once its loads have
+    landed: the barrier becomes a rendezvous after the load latency and all 32 warps then
+    issue their 16 shared atomics at once.  Stall-sampled on L40S, A100 and H100 at 16K b=64,
+    that burst throttled the shared-memory pipe (680, 1302 and 391 MIO samples) where
+    walk-first's count, entered by each warp as its own loads land, showed none.  One LDS and
+    one OR per word.
+    """
+    zero = cutlass.Uint32(s_zeroed[0])
+    return tuple(w | zero for w in wordvals)
 
 
 @cute.jit
