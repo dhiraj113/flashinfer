@@ -45,6 +45,7 @@ from ..phases.register_row import (
     count_coarse_bins,
     key_range_in_bin,
     load_row_words,
+    zero_bins,
 )
 from ..phases.repair import verdict_and_repair, verdict_and_repair_cluster
 from ..phases.resolve import _select_ties, emit_and_select, emit_and_select_cluster
@@ -326,8 +327,7 @@ class StreamingTopK:
         bins = cutlass.const_expr(cfg.register_bins(words))
         k = cutlass.const_expr(self.k)
         s_bins = s_bins_all + 4  # slot -1 takes out-of-range elements
-        for i in range(tidx, bins + 4, threads):
-            s_bins_all[i] = cutlass.Int32(0)
+        zero_bins(s_bins_all, bins + 4, tidx, threads)
         wordvals = load_row_words(
             row_ptr, length, tidx, threads, words, elems.log2_per_vector
         )

@@ -46,6 +46,7 @@ from ..phases.register_row import (
     count_coarse_bins,
     key_range_in_bin,
     load_row_words,
+    zero_bins,
 )
 from ..phases.resolve import _select_ties
 from ..phases.varlen import effective_length, gather_values
@@ -236,8 +237,7 @@ class RegisterClusterTopK:
                 count = chunk
             if count < 0:
                 count = cutlass.Int32(0)
-            for i in range(tidx, bins + 4, threads):
-                s_bins_all[i] = cutlass.Int32(0)
+            zero_bins(s_bins_all, bins + 4, tidx, threads)
             if tidx == 0:
                 s_result[8] = cutlass.Int32(0)  # winner cursor (rank 0's is the row's)
                 s_result[9] = cutlass.Int32(0)  # tie cursor
@@ -421,24 +421,45 @@ SLICE_ELEMENTS = (
 
 
 def register_cluster_config_for(
-    facts, dtype: torch.dtype, k: int, n: int
+    facts, dtype: torch.dtype, k: int, n: int, rows: int = 0
 ) -> RegisterClusterConfig:
-    """The smallest cluster (2, 4, 8) whose slices hold at most 16K elements per CTA (16 words
-    per thread for fp32, 8 for 16-bit: a 32-element slice per thread measured 12.0 us against
-    8.9 for the streaming kernel at bf16 64K b=8); N / 4 bins."""
+    """The shape for a batch of ``rows`` rows of ``n`` elements.
+
+    Slices hold at most 16K elements per CTA (16 words per thread for fp32, 8 for 16-bit: a
+    32-element slice per thread measured 12.0 us against 8.9 for the streaming kernel at bf16
+    64K b=8), and the cluster is the *largest* of 2, 4, 8 whose clusters for the batch fit one
+    wave (``cluster_capacity``), with the fewest words per thread that hold the slice (at least
+    4, one vector).  The per-CTA phases (load, count, classify) scale with the slice, so more
+    CTAs of smaller slices win while the SMs are free: B200 k=1024 64K b=8 7.89 (4 x 16 words)
+    -> 6.94 us (8 x 8), 32K b=8 7.63 (2 x 16) -> 6.00 (8 x 4), 32K b=16 7.61 -> 6.44 (4 x 8);
+    gvr_2's reg_clus, which always splits eight ways, measures 6.43 and 6.23 there.  One
+    cluster past the capacity costs a second wave (32K b=16 at 8 x 4: 10.7; 64K b=32 at 8 x 8:
+    17.8), hence the bound.  With ``rows`` unknown (0) the smallest cluster is chosen.  N / 4
+    bins.
+    """
+    from ...dispatch.device import cluster_capacity
+
     per_word = 1 if dtype == torch.float32 else 2
-    for splits in (2, 4, 8):
-        if n <= splits * SLICE_ELEMENTS:
-            break
-    else:
+    if n > 8 * SLICE_ELEMENTS:
         raise ValueError(
             f"row length {n} exceeds the clustered register capacity {8 * SLICE_ELEMENTS}"
         )
+    candidates = [s for s in (2, 4, 8) if n <= s * SLICE_ELEMENTS]
+    splits = candidates[0]
+    if rows > 0:
+        for s in reversed(candidates):
+            if rows <= cluster_capacity(facts.index, s):
+                splits = s
+                break
+    slice_elements = -(-n // splits)
+    words = 4
+    while words * 1024 * per_word < slice_elements:
+        words *= 2
     bins = 1024
     while bins < 4096 and bins * 4 < n:
         bins *= 2
     return RegisterClusterConfig(
-        words_per_thread=16 // per_word,
+        words_per_thread=words,
         splits=splits,
         bins=bins,
         tie_capacity=min(8192, max(2048, -(-k // 1024) * 1024)),
@@ -478,7 +499,7 @@ def topk_register_cluster(
             "the clustered register kernel needs thread-block clusters (SM90+)"
         )
     if config is None:
-        config = register_cluster_config_for(facts, x.dtype, k, n)
+        config = register_cluster_config_for(facts, x.dtype, k, n, rows)
     elems = Elements.of(_DTYPES[x.dtype])
     if n > config.splits * config.slice_capacity(elems):
         raise ValueError(
