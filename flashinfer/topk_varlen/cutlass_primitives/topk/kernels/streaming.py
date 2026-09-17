@@ -664,13 +664,18 @@ class StreamingTopK:
                 # the sample: the launch probe's vectors inside this row (a shorter row masks
                 # the rest rather than re-sampling: one dependent round trip per ragged row,
                 # v0.1.24), or the full probe of a re-sampled permuted row
-                samples = valid_samples(
-                    n_cols, length, threads, cfg.sample_vectors, elems.log2_per_vector
-                )
-                if probe_stale != 0:
-                    samples = cutlass.Int32(
-                        threads * elems.per_vector * cfg.sample_vectors
-                    )
+                samples = cutlass.Int32(threads * elems.per_vector * cfg.sample_vectors)
+                if length != cutlass.Int32(n_cols):
+                    if (
+                        probe_stale == 0
+                    ):  # a permuted CTA re-samples its real row in full
+                        samples = valid_samples(
+                            n_cols,
+                            length,
+                            threads,
+                            cfg.sample_vectors,
+                            elems.log2_per_vector,
+                        )
                 aim = self.aim_policy(
                     k,
                     length,

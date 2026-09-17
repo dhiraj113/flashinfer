@@ -70,9 +70,8 @@ def _word(w0, w1, w2, w3, j: cutlass.Constexpr):
 def _scaled_rank(aim, samples, length):
     """Rank among the ``samples`` sampled elements corresponding to ``aim`` survivors in the
     row, in [1, samples]."""
-    r = ((cutlass.Int64(aim) * cutlass.Int64(samples)) // cutlass.Int64(length)).to(
-        cutlass.Int32
-    )
+    # 32-bit: aim <= 3/4 of the stage x splits (< 2^18) and samples <= 16K, so the product fits
+    r = (cutlass.Int32(aim) * samples) // length
     if r < 1:
         r = cutlass.Int32(1)
     if r > samples:
@@ -84,9 +83,9 @@ def _scaled_rank(aim, samples, length):
 def _pick(length, slot, slots: cutlass.Constexpr, log2_per_vector: cutlass.Constexpr):
     """Sample vector ``slot`` of ``slots`` in a row of ``length`` elements: a row-uniform stride."""
     n_vectors = length >> cutlass.Int32(log2_per_vector)
-    pick = (
-        (cutlass.Int64(slot) * cutlass.Int64(n_vectors)) // cutlass.Int64(slots)
-    ).to(cutlass.Int32)
+    # 32-bit: slots <= 1024 and rows hold at most 2^18 vectors (1M fp32 / 2M 16-bit), so the
+    # product stays below 2^28 (a 64-bit divide here cost about 0.1 us per CTA on Rubin)
+    pick = (slot * n_vectors) // cutlass.Int32(slots)
     if pick > n_vectors - 1:
         pick = n_vectors - 1
     return pick
@@ -150,9 +149,8 @@ def valid_samples(
             count = cutlass.Int32(threads)
         elif m > 0:
             count = (
-                (cutlass.Int64(m) * cutlass.Int64(threads) + cutlass.Int64(nv - 1))
-                // cutlass.Int64(nv)
-            ).to(cutlass.Int32)
+                m * cutlass.Int32(threads) + cutlass.Int32(nv - 1)
+            ) // cutlass.Int32(nv)  # < 2^28, see _pick
             if count > cutlass.Int32(threads):
                 count = cutlass.Int32(threads)
         total = total + count
@@ -254,26 +252,39 @@ def sample_threshold(
     full_samples = cutlass.const_expr(threads * per_vector * vectors)
     wide = cutlass.const_expr(bins > 256)
     vecs = probe
-    pick = _probe_pick(
-        cutlass.Int32(n_cols), tidx, threads, vectors, elems.log2_per_vector
-    )  # where the probe was taken
-    n_row_vectors = length >> cutlass.Int32(elems.log2_per_vector)
+    # the probe's vectors that lie inside this row: all of them for a full row (the common case
+    # pays nothing here) or for a permuted CTA's fresh sample; a shorter row masks the vectors
+    # past its end.  ``valid`` is a per-thread bit mask over the probe's vectors.
+    valid = cutlass.Int32((1 << vectors) - 1)
     if cutlass.const_expr(samples is None):
-        samples = valid_samples(n_cols, length, threads, vectors, elems.log2_per_vector)
+        samples = cutlass.Int32(full_samples)
+    stale = cutlass.Int32(0)
     if cutlass.const_expr(probe_stale is not None):
-        if (
-            probe_stale != 0
-        ):  # the probe was issued for another row (a permuted CTA): sample this one
-            vecs = _load_probe(elems, row_ptr, length, tidx, threads, vectors)
-            pick = _probe_pick(length, tidx, threads, vectors, elems.log2_per_vector)
-            samples = cutlass.Int32(full_samples)
+        stale = probe_stale
+    if (
+        stale != 0
+    ):  # the probe was issued for another row (a permuted CTA): sample this one
+        vecs = _load_probe(elems, row_ptr, length, tidx, threads, vectors)
+        samples = cutlass.Int32(full_samples)
+    elif length != cutlass.Int32(n_cols):
+        pick = _probe_pick(
+            cutlass.Int32(n_cols), tidx, threads, vectors, elems.log2_per_vector
+        )
+        n_row_vectors = length >> cutlass.Int32(elems.log2_per_vector)
+        valid = cutlass.Int32(0)
+        for v in cutlass.range_constexpr(vectors):
+            if pick + cutlass.Int32(v) < n_row_vectors:
+                valid = valid | cutlass.Int32(1 << v)
+        if cutlass.const_expr(samples is None):
+            samples = valid_samples(
+                n_cols, length, threads, vectors, elems.log2_per_vector
+            )
 
-    # a shorter row keeps the full-row probe and masks the vectors past its end (the neutral
-    # pair for the block reduction is (0, 0xFFFFFFFF))
+    # (the neutral pair for the block reduction is (0, 0xFFFFFFFF))
     kmax = cutlass.Uint32(0)
     kmin = cutlass.Uint32(0xFFFFFFFF)
     for v in cutlass.range_constexpr(vectors):
-        if pick + cutlass.Int32(v) < n_row_vectors:
+        if (valid & cutlass.Int32(1 << v)) != 0:
             kmax, kmin = _fold_max_min(elems, vecs[v], kmax, kmin)
     if tidx < 256:
         s_hist[tidx] = cutlass.Int32(0)
@@ -301,7 +312,7 @@ def sample_threshold(
         else:
             hist_base = s_hist.toint()
         for v in cutlass.range_constexpr(vectors):
-            if pick + cutlass.Int32(v) < n_row_vectors:
+            if (valid & cutlass.Int32(1 << v)) != 0:
                 _bin_vector(elems, vecs[v], smin, to_bin, hist_base, bins)
     cute.arch.barrier()  # barrier 2
     if cutlass.const_expr(telemetry):

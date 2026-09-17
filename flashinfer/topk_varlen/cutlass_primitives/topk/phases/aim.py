@@ -40,8 +40,10 @@ def _capped(aim, k: cutlass.Constexpr, cap: cutlass.Constexpr, length, samples):
     """
     stage = cutlass.const_expr(4 * cap // 3)
     room = (cutlass.Int32(stage) - aim).to(cutlass.Float32)
+    # rcp_approx: one MUFU instead of a full division sequence; a statistical margin needs no
+    # more (``samples`` is a runtime count since v0.1.24, so this is no longer a constant)
     variance = aim.to(cutlass.Float32) * (
-        length.to(cutlass.Float32) / samples.to(cutlass.Float32)
+        length.to(cutlass.Float32) * cute.arch.rcp_approx(samples.to(cutlass.Float32))
     )
     if (aim > cutlass.Int32(cap)) | (room * room < cutlass.Float32(9.0) * variance):
         aim = cutlass.Int32((k + stage) // 2)
@@ -82,7 +84,9 @@ def aim_tight(
         margin = by_length
     aim = cutlass.Int32(k) + margin
     if rows >= cutlass.Int32(floor_rows):
-        per_sample = length.to(cutlass.Float32) / samples.to(cutlass.Float32)
+        per_sample = length.to(cutlass.Float32) * cute.arch.rcp_approx(
+            samples.to(cutlass.Float32)
+        )
         zq = cutlass.Float32(z) * cmath.sqrt(per_sample)
         root = (zq + cmath.sqrt(zq * zq + cutlass.Float32(4.0 * k))) * cutlass.Float32(
             0.5
