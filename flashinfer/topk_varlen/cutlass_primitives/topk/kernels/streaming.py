@@ -50,7 +50,7 @@ from ..phases.register_row import (
 )
 from ..phases.repair import verdict_and_repair, verdict_and_repair_cluster
 from ..phases.resolve import _select_ties, emit_and_select, emit_and_select_cluster
-from ..phases.sample import Threshold, sample_probe, sample_threshold
+from ..phases.sample import Threshold, sample_probe, sample_threshold, valid_samples
 from ..phases.slab import merge_slab, publish_and_arrive, slab_words_per_row
 from ..phases.varlen import effective_length, gather_values
 from .layout import arena_view, check_layout
@@ -661,9 +661,16 @@ class StreamingTopK:
                     count = chunk
                 if count < 0:
                     count = cutlass.Int32(0)
-                samples = cutlass.const_expr(
-                    threads * elems.per_vector * cfg.sample_vectors
+                # the sample: the launch probe's vectors inside this row (a shorter row masks
+                # the rest rather than re-sampling: one dependent round trip per ragged row,
+                # v0.1.24), or the full probe of a re-sampled permuted row
+                samples = valid_samples(
+                    n_cols, length, threads, cfg.sample_vectors, elems.log2_per_vector
                 )
+                if probe_stale != 0:
+                    samples = cutlass.Int32(
+                        threads * elems.per_vector * cfg.sample_vectors
+                    )
                 aim = self.aim_policy(
                     k,
                     length,
@@ -696,6 +703,7 @@ class StreamingTopK:
                         s_keys,
                         s_slots,
                         probe_stale,
+                        samples,
                     )
                 )
                 if telemetry:

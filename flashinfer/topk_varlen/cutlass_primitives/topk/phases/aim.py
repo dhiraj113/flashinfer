@@ -26,13 +26,7 @@ __all__ = ["aim_tight", "aim_wide"]
 
 
 @cute.jit
-def _capped(
-    aim,
-    k: cutlass.Constexpr,
-    cap: cutlass.Constexpr,
-    length,
-    samples: cutlass.Constexpr,
-):
+def _capped(aim, k: cutlass.Constexpr, cap: cutlass.Constexpr, length, samples):
     """Keep the aim clear of the stage: when the overshoot room above the aim is under three
     sigma of the survivor count, balance the two tails instead.
 
@@ -47,7 +41,7 @@ def _capped(
     stage = cutlass.const_expr(4 * cap // 3)
     room = (cutlass.Int32(stage) - aim).to(cutlass.Float32)
     variance = aim.to(cutlass.Float32) * (
-        length.to(cutlass.Float32) / cutlass.Float32(samples)
+        length.to(cutlass.Float32) / samples.to(cutlass.Float32)
     )
     if (aim > cutlass.Int32(cap)) | (room * room < cutlass.Float32(9.0) * variance):
         aim = cutlass.Int32((k + stage) // 2)
@@ -59,7 +53,7 @@ def aim_tight(
     k: cutlass.Constexpr,
     length,
     rows,
-    samples: cutlass.Constexpr,
+    samples,
     cap: cutlass.Constexpr,
     margin_frac: cutlass.Constexpr = 0.125,
     z: cutlass.Constexpr = 3.5,
@@ -88,7 +82,7 @@ def aim_tight(
         margin = by_length
     aim = cutlass.Int32(k) + margin
     if rows >= cutlass.Int32(floor_rows):
-        per_sample = length.to(cutlass.Float32) / cutlass.Float32(samples)
+        per_sample = length.to(cutlass.Float32) / samples.to(cutlass.Float32)
         zq = cutlass.Float32(z) * cmath.sqrt(per_sample)
         root = (zq + cmath.sqrt(zq * zq + cutlass.Float32(4.0 * k))) * cutlass.Float32(
             0.5
@@ -104,7 +98,7 @@ def aim_wide(
     k: cutlass.Constexpr,
     length,
     rows,
-    samples: cutlass.Constexpr,
+    samples,
     cap: cutlass.Constexpr,
     margin_frac: cutlass.Constexpr = 0.125,
     z: cutlass.Constexpr = 3.5,
