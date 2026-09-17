@@ -111,6 +111,7 @@ class StreamingConfig:
     count_after_barrier: bool = True  # the arm pins its count below the zeroing barrier (see register_row.words_after_barrier); a device fact
     short_cutoff: int = 16384  # rows at or below take the exact select directly; EXACT_ONLY: every row does
     lpt_order: bool = False  # block b processes the row of rank b by length (longest first); wide batches, splits == 1
+    row_order: bool = False  # block b processes the row named by a permutation from a one-CTA prepare launch (phases/row_order.py) or the caller; wide batches
     pdl: bool = False
     packed_compare: bool = False  # 16-bit rows: setp.le.{f16x2,bf16x2} classify
     # instrumentation
@@ -415,6 +416,7 @@ class StreamingTopK:
         status: cute.Tensor,
         slab: cute.Tensor,
         counters: cute.Tensor,
+        order: cute.Tensor,
     ):
         cfg = self.config
         elems = self.elems
@@ -469,6 +471,11 @@ class StreamingTopK:
             mark = read_clock64()
         # the sample probe for the launch-order row goes out first, in flight while the length
         # (and, with lpt_order, the whole ranking) loads; a permuted CTA reloads it
+        if cutlass.const_expr(cfg.row_order):
+            # the permutation from the prepare launch (or the caller): block b takes row
+            # order[b].  Read before the probe so the probe goes to the real row (one dependent
+            # load; probing the launch-order row and re-probing after cost a wasted round trip)
+            row = order[row]
         launch_row = row
         probe = sample_probe(
             elems,
@@ -970,13 +977,14 @@ class StreamingTopK:
         status: cute.Tensor,
         slab: cute.Tensor,
         counters: cute.Tensor,
+        order: cute.Tensor,
         stream: cuda_driver.CUstream,
     ):
         """Launch on the caller's stream (torch's current stream, so CUDA-graph capture and
         stream ordering with the surrounding torch work both hold)."""
         splits = self.config.splits
         if cutlass.const_expr(splits > 1 and self.config.merge == "cluster"):
-            self.kernel(x, lengths, out, values, status, slab, counters).launch(
+            self.kernel(x, lengths, out, values, status, slab, counters, order).launch(
                 grid=(x.shape[0], splits, 1),
                 block=(self.threads, 1, 1),
                 cluster=(1, splits, 1),
@@ -985,7 +993,7 @@ class StreamingTopK:
                 stream=stream,
             )
         else:
-            self.kernel(x, lengths, out, values, status, slab, counters).launch(
+            self.kernel(x, lengths, out, values, status, slab, counters, order).launch(
                 grid=(x.shape[0], splits, 1),
                 block=(self.threads, 1, 1),
                 min_blocks_per_mp=self.config.ctas_per_sm,
@@ -1050,7 +1058,19 @@ def _caller_workspace(
         slab, counters = ws.slab, ws.counters
         assert counters is not None
         counters.zero_()  # the kernel needs zero arrivals at launch; the caller's memory holds anything
-    return ws.status, slab, counters, ws.arena
+    return ws.status, slab, counters, ws.arena, ws.order
+
+
+_orders: dict = {}
+
+
+def _order_buffer(device, rows: int) -> torch.Tensor:
+    """Per-(device, stream, rows) buffer for the prepare launch's permutation (stream-keyed for
+    the same reason as the slab: two streams must not share it)."""
+    key = (device, torch.cuda.current_stream(device).cuda_stream, rows)
+    if key not in _orders:
+        _orders[key] = torch.empty(rows, device=device, dtype=torch.int32)
+    return _orders[key]
 
 
 _compiled: dict = {}
@@ -1067,6 +1087,7 @@ def topk_streaming(
     next_n: int = 1,
     compress_ratio: int = 1,
     workspace: torch.Tensor | None = None,
+    row_order: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Indices of the k largest elements of each row of ``x`` (rows, N), as an int32 (rows, k)
     tensor.  ``lengths`` (rows // next_n, int32) limits each row to its first elements: row r
@@ -1081,10 +1102,15 @@ def topk_streaming(
     ``dispatch.workspace.workspace_bytes(x, k)`` bytes) supplies the status words, the slab
     merge's buffers and the arena for a misaligned copy, so the call allocates nothing; without
     it those come from per-(device, stream, shape) caches (see ``dispatch/workspace.py``).
+    ``row_order`` (rows, int32, a permutation of the row indices): the order in which CTAs
+    take rows, for configurations with ``config.row_order``; without it the prepare launch
+    (``phases/row_order.py``) ranks the rows longest-first on the device first.  The result
+    does not depend on the order.
     """
     from ...dispatch.device import device_facts
 
     from ..dispatch.streaming_policy import streaming_config_for
+    from ..phases.row_order import rank_rows
 
     assert x.dtype in _DTYPES
     check_layout(x)
@@ -1092,9 +1118,16 @@ def topk_streaming(
     facts = device_facts(x.device)
     if config is None:
         config = streaming_config_for(facts, x.dtype, k, n, rows)
+    if row_order is not None and not config.row_order and config.splits == 1:
+        config = StreamingConfig(
+            **{**config.__dict__, "row_order": True}
+        )  # a supplied order selects the ordered kernel
     arena = None
+    ws_order = None
     if workspace is not None:
-        ws_status, slab, counters, arena = _caller_workspace(workspace, x, rows, config)
+        ws_status, slab, counters, arena, ws_order = _caller_workspace(
+            workspace, x, rows, config
+        )
         if status is None:
             status = ws_status
     else:
@@ -1109,6 +1142,23 @@ def topk_streaming(
     if status is None:
         status = torch.empty(rows * STATUS_WORDS, device=x.device, dtype=torch.int32)
     vals = values if values is not None else _no_values(x.device, x.dtype)
+    if config.row_order:
+        if row_order is not None:
+            if (
+                row_order.dtype != torch.int32
+                or row_order.shape != (rows,)
+                or not row_order.is_contiguous()
+                or row_order.device != x.device
+            ):
+                raise ValueError(
+                    f"row_order must be a contiguous int32 tensor of shape ({rows},) on {x.device}"
+                )
+            order = row_order
+        else:
+            order = ws_order if ws_order is not None else _order_buffer(x.device, rows)
+            rank_rows(lengths, order, n, next_n, compress_ratio, config.pdl)
+    else:
+        order = lengths  # unused by the kernel; any int32 tensor keeps the argument list fixed
     key = (
         x.dtype,
         k,
@@ -1131,6 +1181,7 @@ def topk_streaming(
         from_dlpack(status),
         from_dlpack(slab),
         from_dlpack(counters),
+        from_dlpack(order),
         stream,
     )
     if key not in _compiled:

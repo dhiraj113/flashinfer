@@ -9,7 +9,9 @@ engine that preallocates everything, or bounds the library's footprint) sizes on
 with :func:`workspace_bytes` and passes it as ``workspace``; the entry point carves the buffers
 out of it in the layout below and allocates nothing.
 
-Layout: ``[status | counters | slab | arena]``, each region starting on a 256-byte boundary.
+Layout: ``[status | counters | slab | order | arena]``, each region starting on a 256-byte
+boundary (``order``: the row permutation of the streaming kernel's prepare launch, present for
+configurations with ``row_order``).
 The arrival counters must be zero when a launch starts.  The cached counters are zeroed once
 and every launch leaves them zero (the last arriver resets its row); a caller-owned workspace
 may hold anything, so the entry point zeroes the counter region before each launch (one small
@@ -53,6 +55,7 @@ class WorkspaceLayout:
         int  # rows x slab_words_per_row for a slab-merge configuration, 0 otherwise
     )
     arena_bytes: int  # the padded copy of a misaligned input, 0 when read in place
+    order_words: int = 0  # rows for a streaming configuration with row_order (the prepare launch's permutation), 0 otherwise
 
     @property
     def status_offset(self) -> int:
@@ -67,8 +70,12 @@ class WorkspaceLayout:
         return self.counter_offset + _round(self.counter_words * WORD)
 
     @property
-    def arena_offset(self) -> int:
+    def order_offset(self) -> int:
         return self.slab_offset + _round(self.slab_words * WORD)
+
+    @property
+    def arena_offset(self) -> int:
+        return self.order_offset + _round(self.order_words * WORD)
 
     @property
     def total_bytes(self) -> int:
@@ -83,6 +90,7 @@ class Workspace:
     counters: torch.Tensor | None
     slab: torch.Tensor | None
     arena: torch.Tensor | None
+    order: torch.Tensor | None = None
 
 
 def workspace_layout(kind: str, config, rows: int, arena_bytes: int) -> WorkspaceLayout:
@@ -107,7 +115,13 @@ def workspace_layout(kind: str, config, rows: int, arena_bytes: int) -> Workspac
     if config.merge == "slab" and config.splits > 1:
         counters = rows
         slab = rows * streaming.slab_words_per_row(config.splits, config.stage)
-    return WorkspaceLayout(rows * streaming.STATUS_WORDS, counters, slab, arena_bytes)
+    return WorkspaceLayout(
+        rows * streaming.STATUS_WORDS,
+        counters,
+        slab,
+        arena_bytes,
+        rows if config.row_order else 0,
+    )
 
 
 def workspace_bytes(x: torch.Tensor, k: int) -> int:
@@ -166,4 +180,5 @@ def carve(
         words(layout.counter_offset, layout.counter_words),
         words(layout.slab_offset, layout.slab_words),
         arena,
+        words(layout.order_offset, layout.order_words),
     )

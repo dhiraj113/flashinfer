@@ -144,6 +144,7 @@ def topk(
     next_n: int = 1,
     compress_ratio: int = 1,
     workspace: torch.Tensor | None = None,
+    row_order: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Indices of the k largest elements of each row of ``x`` (rows, N), int32 (rows, k).
 
@@ -154,7 +155,10 @@ def topk(
     the selected elements (-inf in padding).  ``workspace`` (CUDA byte tensor of at least
     ``workspace.workspace_bytes(x, k)`` bytes) makes the call allocation-free and stream-private
     under the caller's control; without it the kernels use per-(device, stream, shape) caches
-    (``dispatch/workspace.py``).
+    (``dispatch/workspace.py``).  ``row_order`` (rows, int32, a permutation of the row indices)
+    is the order in which the streaming kernel's CTAs take rows: a wide ragged batch launched
+    longest-first runs 7-15% faster (the batch time is the slowest pair of rows sharing an SM);
+    the result is the same in any order, and the other kernels ignore it.
     """
     rows, n = x.shape
     kernel, config = choose(device_facts(x.device), x.dtype, k, n, rows)
@@ -172,4 +176,4 @@ def topk(
         return topk_register_cluster(x, k, config=config, **extra)
     if isinstance(config, CensusSplitConfig):
         return topk_census_split(x, k, config=config, **extra)
-    return topk_streaming(x, k, config=config, **extra)
+    return topk_streaming(x, k, config=config, row_order=row_order, **extra)

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -42,6 +43,12 @@ from ..cutlass_primitives.topk.kernels import register_resident as REG
 from ..cutlass_primitives.topk.kernels import streaming as STR
 
 WORKSPACE_KEY = "cutlass_primitives_workspace"
+# optional: the order in which the streaming kernel's CTAs take rows (an int32 permutation of
+# the row indices, on the logits device).  A wide ragged batch launched longest-first runs
+# 7-15% faster (the batch time is the slowest pair of rows sharing an SM); the result does not
+# depend on the order.  Callers that hold the lengths on the host fill it directly, others use
+# ``torch.argsort(seq_lens, descending=True)`` on the device (CUDA-graph safe).
+ROW_ORDER_KEY = "cutlass_primitives_row_order"
 
 
 @functools.cache
@@ -188,13 +195,20 @@ def _compiled_kernel(
             slab_fakes = (_fake(i32, (rows, words), 16), _fake(i32, (rows,)))
         else:  # unused by the kernel: static one-element placeholders (TVM-FFI ties every `rows` dim together)
             slab_fakes = (_fake(i32, (1, 1), 16), _fake(i32, (1,)))
+        # the row order: a (rows,) permutation for ordered configurations, else a static
+        # one-element placeholder the kernel never reads
+        order_fake = _fake(i32, (rows,)) if config.row_order else _fake(i32, (1,))
         fakes = (
-            _fake(cdt, (rows, stride), 16),
-            _fake(i32, (groups,)),
-            _fake(i32, (rows, k), 16),
-            values_fake,
-            _fake(i32, (rows, STR.STATUS_WORDS), 16),
-        ) + slab_fakes
+            (
+                _fake(cdt, (rows, stride), 16),
+                _fake(i32, (groups,)),
+                _fake(i32, (rows, k), 16),
+                values_fake,
+                _fake(i32, (rows, STR.STATUS_WORDS), 16),
+            )
+            + slab_fakes
+            + (order_fake,)
+        )
 
     def compile_fn():
         return cute.compile(
@@ -298,6 +312,26 @@ def run_cutlass_primitives(
     if rows == 0:
         return out_indices, (out_values if return_values else None)
     kind, config = _cached_choose(logits.device, logits.dtype, top_k, n, rows)
+    # the caller's workspace is laid out for the router's configuration (what
+    # cutlass_primitives_workspace_bytes sized); the order tensor is the caller's own, so the
+    # ordered configuration below carves the same layout, without an order region
+    layout_config = config
+    row_order = workspace.get(ROW_ORDER_KEY) if workspace else None
+    if row_order is not None and kind == "streaming" and config.splits == 1:
+        if (
+            not isinstance(row_order, torch.Tensor)
+            or row_order.dtype != torch.int32
+            or tuple(row_order.shape) != (rows,)
+            or not row_order.is_contiguous()
+            or row_order.device != logits.device
+        ):
+            raise ValueError(
+                f"workspace[{ROW_ORDER_KEY!r}] must be a contiguous int32 tensor of shape "
+                f"({rows},) on {logits.device}"
+            )
+        config = replace(config, row_order=True)  # the ordered streaming kernel
+    else:
+        row_order = None
     words = {
         "register": REG.STATUS_WORDS,
         "register_cluster": RCL.STATUS_WORDS,
@@ -308,7 +342,7 @@ def run_cutlass_primitives(
     arena_buf = slab = counters = None
     if caller_ws is not None:
         status, slab, counters, arena_buf = _caller_buffers(
-            caller_ws, logits, kind, config, words, rows
+            caller_ws, logits, kind, layout_config, words, rows
         )
     else:
         status = _status_buffer(rows, words, logits.device)
@@ -353,7 +387,13 @@ def run_cutlass_primitives(
                 slab = slab.view(rows, -1)
             else:
                 slab = slab.view(1, 1)  # matching the static one-element fakes
-        compiled(arena, seq_lens, out_indices, values, status, slab, counters)
+        # the placeholder shares the slab cache's one-element counters (never read)
+        order = (
+            row_order
+            if row_order is not None
+            else STR._placeholder_slab(logits.device)[1]
+        )
+        compiled(arena, seq_lens, out_indices, values, status, slab, counters, order)
     return out_indices, (out_values if return_values else None)
 
 

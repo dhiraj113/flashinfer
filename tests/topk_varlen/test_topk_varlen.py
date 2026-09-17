@@ -3154,6 +3154,69 @@ def test_cutlass_primitives_caller_workspaces_one_per_stream(cell):
     _cp_concurrent_streams(cell, 3, workspaces=True)
 
 
+def _cp_ordered_cell():
+    """A shape the router sends to the one-CTA-per-row streaming kernel, the only one that takes
+    a caller row order; None when this device routes every candidate elsewhere."""
+    from flashinfer.topk_varlen.cutlass_primitives.dispatch.device import device_facts
+    from flashinfer.topk_varlen.cutlass_primitives.topk.dispatch.router import choose
+
+    facts = device_facts(torch.device("cuda"))
+    for n, rows in ((65536, 256), (131072, 256), (262144, 512), (32768, 512)):
+        kind, config = choose(facts, torch.float32, _CP_K, n, rows)
+        if kind == "streaming" and config.splits == 1:
+            return n, rows
+    return None
+
+
+@pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
+@pytest.mark.parametrize("order", ["longest_first", "random", "reversed"])
+def test_cutlass_primitives_row_order(order):
+    """``workspace["cutlass_primitives_row_order"]`` sets the order in which the streaming
+    kernel's CTAs take rows: the result is exact under any permutation, the same call without
+    the key still runs, the tensor is validated, and a graph captured with the key replays."""
+    cell = _cp_ordered_cell()
+    if cell is None:
+        pytest.skip("no shape routes to the unsplit streaming kernel on this device")
+    n, batch = cell
+    logits, _, seq_lens = _make_inputs(batch, n, _CP_K, torch.float32, seed=71)
+    if order == "longest_first":
+        perm = torch.argsort(seq_lens, descending=True).to(torch.int32)
+    elif order == "random":
+        perm = torch.randperm(batch, device="cuda").to(torch.int32)
+    else:
+        perm = torch.arange(batch - 1, -1, -1, device="cuda", dtype=torch.int32)
+    key = "cutlass_primitives_row_order"
+    out, _ = _cp_run(logits, seq_lens, 1, 1, False, workspace={key: perm})
+    _check_correct(out, logits, seq_lens, _CP_K, require_all_checked=True)
+    # with a caller workspace too, and again without the key (the unordered kernel)
+    ws = {key: perm, "cutlass_primitives_workspace": _cp_workspace(logits)}
+    out2, _ = _cp_run(logits, seq_lens, 1, 1, False, workspace=ws)
+    _check_correct(out2, logits, seq_lens, _CP_K, require_all_checked=True)
+    out3, _ = _cp_run(logits, seq_lens, 1, 1, False)
+    _check_correct(out3, logits, seq_lens, _CP_K, require_all_checked=True)
+    for bad in (perm.to(torch.int64), perm[:-1], perm.cpu()):
+        with pytest.raises(ValueError, match="row_order"):
+            _cp_run(logits, seq_lens, 1, 1, False, workspace={key: bad})
+    # a CUDA graph holding the ordered kernel replays with fresh data
+    out_g = torch.empty(batch, _CP_K, dtype=torch.int32, device="cuda")
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        _cp_run(logits, seq_lens, 1, 1, False, workspace={key: perm}, out_indices=out_g)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            _cp_run(
+                logits, seq_lens, 1, 1, False, workspace={key: perm}, out_indices=out_g
+            )
+    torch.cuda.synchronize()
+    for seed in (72, 73):
+        new, _, _ = _make_inputs(batch, n, _CP_K, torch.float32, seed=seed)
+        logits.copy_(new)
+        torch.cuda.synchronize()
+        g.replay()
+        torch.cuda.synchronize()
+        _check_correct(out_g, logits, seq_lens, _CP_K, require_all_checked=True)
+
+
 @pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["f32", "bf16"])
 def test_cutlass_primitives_census_split_cell(dtype):

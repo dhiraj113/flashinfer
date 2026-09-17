@@ -182,6 +182,10 @@ def streaming_config_for(
         # at 512) take the register-resident phases instead of the census
         register_arm=splits == 1,
         count_after_barrier=facts.staggered_count,
+        # row_order stays off here: the ordered kernel wins 7-15% on ragged wide batches but a
+        # standalone prepare launch that ranks the rows costs 1.3 us, more than it saves on the
+        # ledger's ragged cell and 12% on uniform batches (docs/measured-worse.md).  A caller
+        # that supplies the order (topk_streaming(row_order=)) gets the ordered kernel.
     )
     row_kb = row_bytes >> 10
     wide_batch = rows > facts.sm_count and (
