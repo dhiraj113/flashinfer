@@ -38,7 +38,7 @@ import cutlass.cute as cute
 
 from ...block.reduce import block_exclusive_scan_i32, block_max_min_u32
 from ...device.atomics import shared_count
-from ...device.cluster import peer_add_i32, peer_store_i32
+from ...device.cluster import peer_store_i32
 from ...device.memory import load_global_readonly_16
 
 from .census import element_bits, pair_key16
@@ -388,43 +388,39 @@ def classify_from_registers_cluster(
     out_row,
     tie_keys_root,
     tie_idx_root,
-    cursors_root,
+    win_before,
+    tie_before,
     tie_capacity: cutlass.Constexpr,
     s_slots,
-    s_result,
     tidx,
     threads: cutlass.Constexpr,
     words: cutlass.Constexpr,
 ):
-    """Cluster form: this CTA's winners go to ``out_row`` and its ties to rank 0's tie stage,
-    at positions reserved with one remote atomic per CTA on rank 0's cursors.
+    """Cluster form: this CTA's winners go to ``out_row`` from position ``win_before`` and its
+    ties to rank 0's tie stage from ``tie_before`` (the lower-ranked peers' counts, from
+    ``cluster_crossing``), so the output order is by rank and no CTA reserves anything.
 
-    ``tie_keys_root``, ``tie_idx_root``, ``cursors_root``: mapped DSMEM addresses of rank 0's
-    tie arrays and of its two Int32 cursors (winners, ties), zeroed before the cluster barrier
-    that preceded this call.  ``s_result``: 2 Int32 scratch.  Three block barriers.  Row
-    indices are ``slice_start`` plus the position in the slice.  Returns nothing; rank 0 reads
-    the totals from its cursors after the next cluster barrier.
+    ``tie_keys_root``, ``tie_idx_root``: mapped DSMEM addresses of rank 0's tie arrays.  Two
+    block barriers (the scan's).  Row indices are ``slice_start`` plus the position in the
+    slice.  (v0.1.23: the previous form reserved positions with one remote atomic per CTA on
+    rank 0's cursors, and every warp then waited at a barrier for that round trip.)
     """
     pairs = cutlass.const_expr(words * elems.per_word // 2)
     win_mask, tie_mask = _masks(packed_bins, cut_bin, pairs)
     packed = (cutlass.Int32(cute.arch.popc(win_mask)) << 16) | cutlass.Int32(
         cute.arch.popc(tie_mask)
     )
-    before, total = block_exclusive_scan_i32(packed, s_slots, tidx, threads)
-    if tidx == 0:  # one reservation per CTA on rank 0's cursors
-        s_result[0] = peer_add_i32(cursors_root, total >> 16)
-        s_result[1] = peer_add_i32(cursors_root + 4, total & cutlass.Int32(0xFFFF))
-    cute.arch.barrier()
+    before, _total = block_exclusive_scan_i32(packed, s_slots, tidx, threads)
     _emit_winners(
         elems,
         win_mask,
-        s_result[0] + (before >> 16),
+        win_before + (before >> 16),
         slice_start,
         out_row,
         tidx,
         threads,
     )
-    tie_pos = s_result[1] + (before & cutlass.Int32(0xFFFF))
+    tie_pos = tie_before + (before & cutlass.Int32(0xFFFF))
     if tie_mask != 0:
         for e in cutlass.range_constexpr(2 * pairs):
             if ((tie_mask >> e) & 1) == 1:

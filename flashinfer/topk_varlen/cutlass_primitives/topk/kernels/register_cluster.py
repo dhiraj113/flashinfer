@@ -4,8 +4,9 @@ Kernel 1 with the row split into slices that each fit a CTA's registers.  Every 
 slice once, counts its coarse histogram, and after one cluster barrier every CTA merges all
 peers' histograms over DSMEM (redundantly, so the crossing needs no broadcast).  Each CTA then
 classifies its own slice from registers; winners go straight to the output and ties to rank
-0's tie stage, at positions reserved with one remote atomic per CTA.  After a second cluster
-barrier rank 0 selects the ties.  This is gvr_2's reg_clus family: a batch with SMs to spare
+0's tie stage, at the offsets given by the lower-ranked peers' histograms (the same remote
+loads as the crossing; v0.1.23, no remote atomic).  After a second cluster barrier rank 0
+selects the ties.  This is gvr_2's reg_clus family: a batch with SMs to spare
 gives each row a cluster's worth of registers and reads the row exactly once.
 """
 
@@ -239,8 +240,6 @@ class RegisterClusterTopK:
                 count = cutlass.Int32(0)
             zero_bins(s_bins_all, bins + 4, tidx, threads)
             if tidx == 0:
-                s_result[8] = cutlass.Int32(0)  # winner cursor (rank 0's is the row's)
-                s_result[9] = cutlass.Int32(0)  # tie cursor
                 s_result[12] = cutlass.Int32(
                     -1
                 )  # key range of the crossing bin: min (0xFFFFFFFF) ...
@@ -274,9 +273,11 @@ class RegisterClusterTopK:
                 bins,
                 splits,
                 tidx,
+                rank,
             )
             cut_bin = s_result[0]
             above = s_result[1]
+            ties = s_result[6]  # the row's, from every peer's crossing bin
             overflow = cutlass.Int32(
                 s_result[2] > cutlass.Int32(cfg.tie_capacity)
             )  # cluster-uniform
@@ -294,10 +295,10 @@ class RegisterClusterTopK:
                 out_row,
                 peer_shared_address(s_tie_keys.toint(), root),
                 peer_shared_address(s_tie_idx.toint(), root),
-                peer_shared_address((s_result + 8).toint(), root),
+                s_result[4],
+                s_result[5],
                 cfg.tie_capacity,
                 s_slots,
-                s_result + 10,
                 tidx,
                 threads,
                 words,
@@ -328,7 +329,6 @@ class RegisterClusterTopK:
                     status_row[5] = (read_clock64() - mark).to(cutlass.Int32)
                 mark = read_clock64()
             if rank == 0:
-                ties = s_result[9]
                 ok = _select_ties(
                     elems,
                     k,

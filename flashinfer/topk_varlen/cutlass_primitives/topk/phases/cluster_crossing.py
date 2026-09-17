@@ -15,14 +15,23 @@ so it is found in two levels:
 
 Every CTA computes the same answer from the same peer data, so no broadcast is needed.
 Precondition: a cluster barrier separates the peers' histogram and group writes from this call.
+
+The same remote loads give each CTA its output offsets (v0.1.23): the winners of a peer are
+its counts above the crossing bin, so the peer values a thread loaded for the merge, kept in
+registers, summed over the lower-ranked peers once the crossing is known, are the number of
+winners (and ties) written before this CTA's.  One block reduction replaces the remote atomic
+on rank 0's cursors that every CTA used to wait on between two barriers (B200 64K b=8 k=1024:
+the stall samples of that barrier were the largest single difference to gvr_2's kernel).
 """
 
 import cutlass
 import cutlass.cute as cute
 
 from ...block.crossing import crossing_256_warp
+from ...device.atomics import shared_add
 from ...device.cluster import peer_load_i32, peer_shared_address
 from ...device.memory import load_shared_16
+from ...device.warp import warp_sum
 
 __all__ = ["summarize_groups_256", "cluster_crossing"]
 
@@ -53,20 +62,31 @@ def cluster_crossing(
     bins: cutlass.Constexpr,
     splits: cutlass.Constexpr,
     tidx,
+    rank,
 ):
     """Publish the rank-k crossing over the cluster's merged histogram to ``s_result[0..2]``
-    as ``(bin, above, count in the bin)``.
+    as ``(bin, above, count in the bin)``, and this CTA's output offsets to ``s_result[4..6]``
+    as ``(winners before this CTA's, ties before this CTA's, ties in the row)``: the counts
+    above and in the crossing bin of the peers with a lower ``rank`` (output order is by rank).
 
     ``s_merged_groups``: 256 Int32 scratch; ``s_fine``: ``bins / 256`` Int32 scratch;
-    ``s_result``: 4 Int32.  Remote loads: ``splits`` per thread for threads 0..255, then
-    ``splits`` for threads 0..per_group-1.  Three block barriers.  Requires 256 or more threads.
+    ``s_result``: 8 Int32.  Remote loads: ``splits`` per thread for threads 0..255, then
+    ``splits`` for threads 0..per_group-1 (the peer values stay in registers for the offsets).
+    Five block barriers.  Requires 256 or more threads.
     """
     per_group = cutlass.const_expr(bins // 256)
+    if tidx == 0:
+        s_result[4] = cutlass.Int32(0)
+        s_result[5] = cutlass.Int32(0)
+        s_result[6] = cutlass.Int32(0)
+    below_groups = cutlass.Int32(0)  # this group's count over the lower-ranked peers
     if tidx < 256:
         addr = s_groups.toint() + tidx * 4
         total = cutlass.Int32(0)
         for r in cutlass.range_constexpr(splits):
-            total = total + peer_load_i32(peer_shared_address(addr, cutlass.Int32(r)))
+            v = peer_load_i32(peer_shared_address(addr, cutlass.Int32(r)))
+            total = total + v
+            below_groups = below_groups + v * cutlass.Int32(cutlass.Int32(r) < rank)
         s_merged_groups[tidx] = total
     cute.arch.barrier()
     if tidx < 32:
@@ -78,12 +98,17 @@ def cluster_crossing(
             s_result[3] = above_g
     cute.arch.barrier()
     group = s_result[2]
+    fine_total = cutlass.Int32(
+        0
+    )  # this fine bin's count over every peer, and over the lower-ranked ones
+    fine_below = cutlass.Int32(0)
     if tidx < per_group:
         addr = s_bins.toint() + (group * per_group + tidx) * 4
-        total = cutlass.Int32(0)
         for r in cutlass.range_constexpr(splits):
-            total = total + peer_load_i32(peer_shared_address(addr, cutlass.Int32(r)))
-        s_fine[tidx] = total
+            v = peer_load_i32(peer_shared_address(addr, cutlass.Int32(r)))
+            fine_total = fine_total + v
+            fine_below = fine_below + v * cutlass.Int32(cutlass.Int32(r) < rank)
+        s_fine[tidx] = fine_total
     cute.arch.barrier()
     if tidx == 0:  # walk the group's fine bins from the top
         above = s_result[3]
@@ -100,4 +125,29 @@ def cluster_crossing(
                     found = cutlass.Int32(1)
                 else:
                     above = above + c
+    cute.arch.barrier()
+    # the offsets: lower-ranked peers' counts in the groups above the crossing group, plus in
+    # the fine bins above the crossing bin; ties in the crossing bin itself
+    cut_bin = s_result[0]
+    win_before = cutlass.Int32(0)
+    tie_before = cutlass.Int32(0)
+    ties = cutlass.Int32(0)
+    if tidx < 256:
+        if tidx > group:
+            win_before = below_groups
+    if tidx < per_group:
+        b = group * per_group + tidx
+        if b > cut_bin:
+            win_before = win_before + fine_below
+        if b == cut_bin:
+            tie_before = fine_below
+            ties = fine_total
+    if tidx < 256:  # eight warps: one shared add per warp and value
+        win_before = warp_sum(win_before)
+        tie_before = warp_sum(tie_before)
+        ties = warp_sum(ties)
+        if tidx % 32 == 0:
+            shared_add(s_result + 4, win_before)
+            shared_add(s_result + 5, tie_before)
+            shared_add(s_result + 6, ties)
     cute.arch.barrier()

@@ -88,7 +88,9 @@ def _wide_batch_streams(facts, dtype: torch.dtype, k: int, n: int, rows: int) ->
     per_word = 1 if dtype == torch.float32 else 2
     if n <= 512 * 16 * per_word or rows <= facts.sm_count:
         return False
-    return per_word == 2 or k <= 1024 or facts.capability[0] in (9, 10)
+    # fp32 k > 1024: a win on B200 (16K b=256 11.9 -> 10.7) and H100 (13.7 -> 12.7), a tie on
+    # Rubin in isolation but 4% slower in the ledger (8.7 -> 9.1), so Rubin keeps the register kernel
+    return per_word == 2 or k <= 1024 or facts.capability in ((9, 0), (10, 0), (10, 3))
 
 
 def _cluster_kernel_wins(facts, dtype: torch.dtype, k: int, n: int, rows: int) -> bool:
