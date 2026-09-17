@@ -137,8 +137,11 @@ def choose(
     """
     per_word = 1 if dtype == torch.float32 else 2
     config: RegisterConfig | RegisterClusterConfig | StreamingConfig | CensusSplitConfig
-    if n <= REGISTER_MAX_ROW * per_word and k < n:
-        if _wide_batch_streams(facts, dtype, k, n, rows):
+    # rows that fit the registers take the register kernel whatever k: at k >= n every row is
+    # the identity, which its direct arm writes in one launch (v0.1.26; the census split's two
+    # launches took 1K rows at k=1024 to 0.7x of gvr_2 on B200 and Rubin)
+    if n <= REGISTER_MAX_ROW * per_word and k < REGISTER_MAX_ROW * per_word:
+        if k < n and _wide_batch_streams(facts, dtype, k, n, rows):
             # the streaming kernel specifically (measured); the census split's k * 8 >= n rule
             # would otherwise claim k=2048 at 16K, which no measurement supports
             kernel, config = "streaming", streaming_config_for(facts, dtype, k, n, rows)

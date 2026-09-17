@@ -391,19 +391,22 @@ def register_config_for(
       waves of SMs (RTX 5080 1K b=256: 5.48 -> 4.06).
     """
     per_word = 1 if dtype == torch.float32 else 2
+    # k >= n rows are the identity (the kernel's direct arm writes 0..length-1 and -1 padding);
+    # the configuration only needs its register capacity above k, so size it for max(n, k + 1)
+    need = max(n, k + 1)
     threads = 1024
     for t in (256, 512):  # the fewest threads that hold the row at one vector each
-        if n <= t * 4 * per_word:
+        if need <= t * 4 * per_word:
             threads = t
             break
     if (
         threads == 1024
         and rows > facts.sm_count
         and k <= 2048
-        and _words_for(512, n, per_word) is not None
+        and _words_for(512, need, per_word) is not None
     ):
         threads = 512
-    words = _words_for(threads, n, per_word)
+    words = _words_for(threads, need, per_word)
     if words is None:
         raise ValueError(f"row length {n} exceeds the register-resident capacity")
     # a multiple of threads (candidate slots per thread), holding k where it can; beyond eight
