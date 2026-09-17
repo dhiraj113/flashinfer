@@ -380,10 +380,28 @@ def register_config_for(
       4K b=256 6.8 -> 6.0 us, 8K b=256 8.7 -> 8.3, 16K bf16 b=256 11.6 -> 10.7.
     * Histogram bins N / 4 clamped to [1024, 4096]: expected ties in the crossing bin scale
       with N / bins, and fewer bins cost less to zero and to scan.
+    * Tiny rows (one 16-byte vector per thread at 256 or 512 threads: up to 1K / 2K fp32,
+      2K / 4K 16-bit) run on the fewest threads that hold the row at four words.  At 1024
+      threads three quarters of the warps loaded duplicates of the tail vector and every
+      barrier, block scan and the tie select ran over 32 warps: 1K b=1 on B200 2.71 -> 2.32 us,
+      H100 2.68 -> 2.26, Rubin 2.03 -> 1.77, RTX 5080 2.83 -> 2.27 (v0.1.22; gvr_2's register
+      kernel runs 256 threads here).  More words on fewer threads does not pay above that:
+      4K rows at 512 x 8 or 256 x 16 words measured 1-20% slower than 1024 x 4 everywhere.
+      Wide batches of tiny rows keep two CTAs per SM, four where the batch is more than two
+      waves of SMs (RTX 5080 1K b=256: 5.48 -> 4.06).
     """
     per_word = 1 if dtype == torch.float32 else 2
     threads = 1024
-    if rows > facts.sm_count and k <= 2048 and _words_for(512, n, per_word) is not None:
+    for t in (256, 512):  # the fewest threads that hold the row at one vector each
+        if n <= t * 4 * per_word:
+            threads = t
+            break
+    if (
+        threads == 1024
+        and rows > facts.sm_count
+        and k <= 2048
+        and _words_for(512, n, per_word) is not None
+    ):
         threads = 512
     words = _words_for(threads, n, per_word)
     if words is None:
@@ -395,17 +413,25 @@ def register_config_for(
     while bins < 4096 and bins * 4 < n:
         bins *= 2
     bins = max(bins, threads)
+    ctas_per_sm = 1
+    if threads == 512:
+        ctas_per_sm = 2
+    elif threads == 256:
+        ctas_per_sm = 4 if rows > 2 * facts.sm_count else 2
     cfg = RegisterConfig(
         threads=threads,
         words_per_thread=words,
-        ctas_per_sm=2 if threads == 512 else 1,
+        ctas_per_sm=ctas_per_sm,
         bins=bins,
         tie_capacity=tie_capacity,
         pdl=facts.supports_pdl,
         count_after_barrier=facts.staggered_count,
     )
-    if cfg.ctas_per_sm * cfg.shared_memory_bytes() > facts.shared_memory_optin:
-        cfg = RegisterConfig(**{**cfg.__dict__, "ctas_per_sm": 1})
+    while (
+        cfg.ctas_per_sm > 1
+        and cfg.ctas_per_sm * cfg.shared_memory_bytes() > facts.shared_memory_optin
+    ):
+        cfg = RegisterConfig(**{**cfg.__dict__, "ctas_per_sm": cfg.ctas_per_sm // 2})
     return cfg
 
 

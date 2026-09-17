@@ -72,6 +72,25 @@ REGISTER_MAX_ROW = (
 )  # words per thread x threads; 16-bit rows hold twice as many
 
 
+def _wide_batch_streams(facts, dtype: torch.dtype, k: int, n: int, rows: int) -> bool:
+    """Rows that need the register kernel's full block (1024 threads x 16 words: above 8K fp32
+    or 16K 16-bit elements) in a batch wider than the SM count run one CTA per SM in two or
+    more waves, and the streaming kernel at 512 threads x 2 per SM beats them (v0.1.22;
+    16K b=256 k=512 fp32: B200 10.3 -> 7.1 us, H100 11.6 -> 8.0, Rubin 7.6 -> 5.7, A100 38.8
+    -> 35.0, RTX 5080 12K b=256 17.8 -> 16.5; bf16 32K b=256 k=512: B200 17.2 -> 8.1, H100
+    18.4 -> 9.7, A100 63.6 -> 37.9, L40S 15.4 -> 10.6, RTX 5080 32.9 -> 19.5).  At k=2048 on
+    fp32 rows the streaming kernel's wider stage costs more than the second wave on SM80, SM89
+    and SM120 (A100 45.6 -> 49.4, L40S 12.3 -> 13.5, RTX 5080 25.9 -> 27.7), so those keep
+    the register kernel; 16-bit rows win at every k (A100 69.9 -> 58.8, L40S 17.2 -> 14.8,
+    RTX 5080 38.3 -> 31.1).  One wave (rows <= SMs) keeps the register kernel: it ties or
+    wins there (B200 16K b=148 5.46 vs 5.36, A100 b=108 14.1 vs 15.6, L40S b=142 5.66 vs
+    6.14)."""
+    per_word = 1 if dtype == torch.float32 else 2
+    if n <= 512 * 16 * per_word or rows <= facts.sm_count:
+        return False
+    return per_word == 2 or k <= 1024 or facts.capability[0] in (9, 10)
+
+
 def _cluster_kernel_wins(facts, dtype: torch.dtype, k: int, n: int, rows: int) -> bool:
     # the device's cluster cap is about the streaming kernel's long DSMEM merges; this kernel
     # merges 256 group sums and a few fine bins, and its 8-CTA form beat the alternatives even
@@ -117,7 +136,12 @@ def choose(
     per_word = 1 if dtype == torch.float32 else 2
     config: RegisterConfig | RegisterClusterConfig | StreamingConfig | CensusSplitConfig
     if n <= REGISTER_MAX_ROW * per_word and k < n:
-        kernel, config = "register", register_config_for(facts, dtype, k, n, rows)
+        if _wide_batch_streams(facts, dtype, k, n, rows):
+            # the streaming kernel specifically (measured); the census split's k * 8 >= n rule
+            # would otherwise claim k=2048 at 16K, which no measurement supports
+            kernel, config = "streaming", streaming_config_for(facts, dtype, k, n, rows)
+        else:
+            kernel, config = "register", register_config_for(facts, dtype, k, n, rows)
     elif k < n and _cluster_kernel_wins(facts, dtype, k, n, rows):
         # one pass from registers beats the census's two at any k (64K b=8 k=32768: 12.9 vs 14.6 us)
         kernel, config = (
