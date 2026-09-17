@@ -311,21 +311,42 @@ def _masks(packed_bins, cut_bin, pairs: cutlass.Constexpr):
 
 @cute.jit
 def _emit_winners(
-    elems, win_mask, win_pos, index_offset, out_row, tidx, threads: cutlass.Constexpr
+    elems,
+    win_mask,
+    win_pos,
+    index_offset,
+    out_row,
+    tidx,
+    threads: cutlass.Constexpr,
+    elements: cutlass.Constexpr = 0,
 ):
-    """Write the row indices of the mask's elements at ``out_row[win_pos ...]`` (bit-walk,
-    about one iteration per thread).  ``index_offset`` is the slice's start in the row."""
-    while win_mask != 0:
-        e = cutlass.Int32(
-            cute.arch.popc(
-                (win_mask & (cutlass.Int32(0) - win_mask)) - cutlass.Int32(1)
+    """Write the row indices of the mask's elements at ``out_row[win_pos ...]``.  ``index_offset``
+    is the slice's start in the row.  With ``elements`` (the thread's element count, a
+    compile-time constant) of at most 4, the walk is unrolled as one predicated store per
+    element slot: no lowest-bit arithmetic, and the warp does not iterate to its slowest lane
+    (v0.1.27: 1K b=1 2.22 -> 2.11 us, 4K b=1 3.17 -> 3.09, 4K b=256 4.64 -> 4.52 on B200).
+    Above 4 slots the predicated form loses (16 slots: 16K b=1 5.14 -> 5.36, the winners are
+    sparse and every slot still pays its test), so those keep the bit-walk (about 17
+    instructions per winner, about five rounds per warp at k=2048)."""
+    if cutlass.const_expr(0 < elements <= 4):
+        for e in cutlass.range_constexpr(elements):
+            if ((win_mask >> cutlass.Int32(e)) & cutlass.Int32(1)) == 1:
+                out_row[win_pos] = index_offset + _element_index(
+                    tidx, threads, elems.per_vector, e
+                )
+                win_pos = win_pos + 1
+    else:
+        while win_mask != 0:
+            e = cutlass.Int32(
+                cute.arch.popc(
+                    (win_mask & (cutlass.Int32(0) - win_mask)) - cutlass.Int32(1)
+                )
             )
-        )
-        win_mask = win_mask & (win_mask - cutlass.Int32(1))
-        out_row[win_pos] = index_offset + _index_of_bit(
-            tidx, threads, elems.per_vector, e
-        )
-        win_pos = win_pos + 1
+            win_mask = win_mask & (win_mask - cutlass.Int32(1))
+            out_row[win_pos] = index_offset + _index_of_bit(
+                tidx, threads, elems.per_vector, e
+            )
+            win_pos = win_pos + 1
 
 
 @cute.jit
@@ -363,7 +384,14 @@ def classify_from_registers(
     )
     before, total = block_exclusive_scan_i32(packed, s_slots, tidx, threads)
     _emit_winners(
-        elems, win_mask, before >> 16, cutlass.Int32(0), out_row, tidx, threads
+        elems,
+        win_mask,
+        before >> 16,
+        cutlass.Int32(0),
+        out_row,
+        tidx,
+        threads,
+        2 * pairs,
     )
     tie_pos = before & cutlass.Int32(0xFFFF)
     if tie_mask != 0:  # rare; the exact key needs the word, so test each position
@@ -419,6 +447,7 @@ def classify_from_registers_cluster(
         out_row,
         tidx,
         threads,
+        2 * pairs,
     )
     tie_pos = tie_before + (before & cutlass.Int32(0xFFFF))
     if tie_mask != 0:

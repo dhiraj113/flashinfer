@@ -79,9 +79,13 @@ def block_exclusive_scan_i32(val, s_slots, tidx, threads: cutlass.Constexpr):
     """Exclusive prefix sum of ``val`` (Int32) in thread order, and the block total, to
     every thread: thread t receives (val[0] + ... + val[t-1], total).
 
-    ``s_slots``: Int32 shared array of ``warps`` entries, dead on exit.  Two block barriers
-    (warp partials out; warp 0 scans them in place; everyone reads its warp's offset).  This
-    is how a block assigns output positions without one serialized atomic per element.
+    ``s_slots``: Int32 shared array of ``warps`` entries.  One block barrier: the warp partials
+    go out, then every warp reads all of them and sums the ones below it (one warp reduction
+    each for the prefix and the total) instead of waiting for warp 0 to scan them in place
+    behind a second barrier (v0.1.27; the second barrier cost about 0.1 us per use on the
+    register kernels, whose classify is one of the uses).  ``s_slots`` is still being read
+    when this returns: the caller must not write it before its next block barrier.  This is
+    how a block assigns output positions without one serialized atomic per element.
     """
     warps = cutlass.const_expr(threads // 32)
     lane = tidx % 32
@@ -90,18 +94,14 @@ def block_exclusive_scan_i32(val, s_slots, tidx, threads: cutlass.Constexpr):
     if lane == 31:
         s_slots[warp] = incl
     cute.arch.barrier()
-    if tidx < 32:
-        part = cutlass.Int32(0)
-        if lane < cutlass.Int32(warps):
-            part = s_slots[lane]
-        part_incl = warp_inclusive_scan_add(part, lane)
-        if lane < cutlass.Int32(warps):
-            s_slots[lane] = part_incl
-    cute.arch.barrier()
-    before = cutlass.Int32(0)
-    if warp > 0:
-        before = s_slots[warp - 1]
-    total = s_slots[warps - 1]
+    part = cutlass.Int32(0)
+    lower = cutlass.Int32(0)
+    if lane < cutlass.Int32(warps):
+        part = s_slots[lane]
+        if lane < warp:
+            lower = part
+    total = warp_sum(part)
+    before = warp_sum(lower)
     return before + incl - val, total
 
 

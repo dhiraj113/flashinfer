@@ -36,7 +36,12 @@ from ..device.warp import (
     warp_sum,
 )
 
-__all__ = ["crossing_256_warp", "crossing_256_block", "crossing_wide_pair"]
+__all__ = [
+    "crossing_256_warp",
+    "crossing_256_block",
+    "crossing_wide_pair",
+    "crossing_wide_warp",
+]
 
 
 @cute.jit
@@ -143,6 +148,85 @@ def crossing_256_block(s_hist, total, target, s_slots, s_result, tidx):
                 s_result[1] = above
                 s_result[2] = c
     cute.arch.barrier()
+
+
+@cute.jit
+def crossing_wide_warp(s_hist, bins: cutlass.Constexpr, target, lane):
+    """Crossing bin of one target rank over a ``bins``-bin Int32 histogram (1024 to 4096), by
+    one warp in two levels, no barrier.
+
+    Level 1: lane l sums bins ``l * span .. (l + 1) * span`` (``span = bins / 32``, 16-byte
+    loads), a warp scan gives the count above each span, and the span holding the target is
+    found.  Level 2: the warp re-reads that span, ``span / 32`` bins per lane, scans again and
+    the owning lane walks its bins.  Identical answer to ``crossing_wide_pair``; costs the
+    lane loads (8 to 32 per lane) and two warp scans instead of two block barriers, so the
+    other warps of the block are free and the caller needs one barrier to publish.  A target
+    above the total is clamped to it; an empty histogram answers bin 0.  Returns ``(bin,
+    above, count)`` on every lane.
+
+    Measured worse than ``crossing_wide_pair`` in the register kernel on B200 (2026-09-18:
+    1K b=1 2.22 -> 2.50 us, 16K b=1 5.14 -> 6.08, 16K b=148 5.39 -> 6.33): one warp reading
+    8 to 32 vectors per lane serially is slower than 32 warps reading one each behind two
+    barriers.  Kept for histograms where the block is busy elsewhere; not used by any kernel.
+    """
+    span = cutlass.const_expr(bins // 32)
+    sub = cutlass.const_expr(span // 32)
+    addr = s_hist.toint() + lane * (span * 4)
+    mine = cutlass.Uint32(0)
+    for q in cutlass.range_constexpr(span // 4):
+        a, b, c, d = load_shared_16(addr + q * 16)
+        mine = mine + a + b + c + d
+    mine_i = mine.to(cutlass.Int32)
+    incl = warp_inclusive_scan_add(mine_i, lane)
+    total = warp_broadcast(incl, 31)
+    above = total - incl
+    t = target
+    if t > total:
+        t = total
+    hit = cutlass.Int32(0)
+    if (above < t) & (above + mine_i >= t):
+        hit = lane
+    hit_lane = warp_max_u32(cutlass.Uint32(hit)).to(
+        cutlass.Int32
+    )  # lane 0 when nothing crosses
+    above_span = warp_broadcast(above, hit_lane)
+    # level 2 over the hit span: ``sub`` consecutive bins per lane
+    base2 = s_hist.toint() + (hit_lane * span + lane * sub) * 4
+    vals: list = []
+    if cutlass.const_expr(sub == 4):
+        a, b, c, d = load_shared_16(base2)
+        vals.extend(
+            (
+                a.to(cutlass.Int32),
+                b.to(cutlass.Int32),
+                c.to(cutlass.Int32),
+                d.to(cutlass.Int32),
+            )
+        )
+    else:
+        for i in cutlass.range_constexpr(sub):
+            vals.append(s_hist[hit_lane * span + lane * sub + i])
+    mine2 = cutlass.Int32(0)
+    for i in cutlass.range_constexpr(sub):
+        mine2 = mine2 + vals[i]
+    incl2 = warp_inclusive_scan_add(mine2, lane)
+    span_total = warp_broadcast(incl2, 31)
+    above2 = above_span + (span_total - incl2)  # count above this lane's bins
+    hit_bin = cutlass.Int32(0)
+    hit_above = cutlass.Int32(0)
+    hit_count = cutlass.Int32(0)
+    for i in cutlass.range_constexpr(sub - 1, -1, -1):
+        c = vals[i]
+        b = hit_lane * span + lane * sub + i
+        if above2 < t:
+            if (above2 + c >= t) | (b == 0):
+                hit_bin = b
+                hit_above = above2
+                hit_count = c
+        above2 = above2 + c
+    bin_out = warp_max_u32(cutlass.Uint32(hit_bin)).to(cutlass.Int32)
+    owner = (bin_out - hit_lane * span) // cutlass.Int32(sub)
+    return bin_out, warp_broadcast(hit_above, owner), warp_broadcast(hit_count, owner)
 
 
 @cute.jit

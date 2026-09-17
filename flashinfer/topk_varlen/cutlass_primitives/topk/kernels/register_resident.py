@@ -236,6 +236,8 @@ class RegisterTopK:
                 if tidx == 0:
                     status_row[3] = (read_clock64() - mark).to(cutlass.Int32)
                 mark = read_clock64()
+            # (a one-warp two-level crossing behind one barrier measured 0.2-0.9 us SLOWER
+            # than this block form on every register cell: docs/measured-worse.md, 2026-09-18)
             crossing_wide_pair(
                 s_bins,
                 bins,

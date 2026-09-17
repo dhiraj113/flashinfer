@@ -38,6 +38,8 @@ __all__ = [
     "peer_add_i32",
     "peer_min_u32",
     "peer_max_u32",
+    "peer_add_release_i32",
+    "shared_load_acquire_cluster",
     "cluster_arrive",
     "cluster_wait",
     "cluster_sync",
@@ -280,6 +282,53 @@ def peer_max_u32(
     """Unsigned maximum of ``val`` into the Uint32 at a mapped peer address; no result.
     Cluster scope, one instruction."""
     _peer_reduce("max", mapped_address, val, loc, ip)
+
+
+@dsl_user_op
+def peer_add_release_i32(
+    mapped_address: cutlass.Int32, val: cutlass.Int32, *, loc=None, ip=None
+) -> None:
+    """Add ``val`` to the Int32 at a mapped peer address with release semantics at cluster
+    scope, no result (``red.release.cluster.shared::cluster.add``).
+
+    The one-sided arrival: after a CTA's block barrier (so every thread's DSMEM stores into the
+    peer precede this in the CTA's order), one thread adds 1 to the peer's arrival word; the
+    release makes those stores visible to a thread of the peer that observes the count with an
+    acquire load.  Lets a CTA leave a cluster phase without a full cluster barrier (v0.1.28,
+    the clustered register kernel's tie hand-over).
+    """
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(mapped_address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "fence.acq_rel.cluster;\nred.release.cluster.shared::cluster.add.u32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def shared_load_acquire_cluster(address: cutlass.Int32, *, loc=None, ip=None):
+    """Int32 at a local shared-memory address with acquire semantics at cluster scope
+    (``ld.acquire.cluster.shared::cta``): the poll side of ``peer_add_release_i32``.  Every
+    DSMEM store a peer released before its add is visible after the load that sees the add."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Int32(address).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.cluster.shared::cta.b32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
