@@ -310,6 +310,7 @@ def _fit_large_k(
                     "stage": stage,
                     "unroll": _unroll_for(facts, cfg.threads, n // splits, per_vector),
                     "walk_width": _walk_width_for(splits, n),
+                    "register_arm": False,  # a split row is never whole in one CTA (the whole-row base carried the arm)
                 }
             )
     # the exact select's tie stage is its census's: eight slots per thread

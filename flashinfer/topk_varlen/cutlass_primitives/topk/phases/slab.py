@@ -131,6 +131,24 @@ def _prefix(s_pref, s_staged, r, b):
 
 
 @cute.jit
+def _slab_source(
+    s_scratch,
+    offsets: cutlass.Constexpr,
+    sources: cutlass.Constexpr,
+    g,
+    splits: cutlass.Constexpr,
+):
+    """Slab word of output position ``g`` of a concatenated range: the segment whose output
+    offset (``s_scratch[offsets + r]``, ascending) is the last at or below ``g``, plus its
+    distance into that segment's source range (``s_scratch[sources + r]``)."""
+    r = cutlass.Int32(0)
+    for rr in cutlass.range_constexpr(1, splits):
+        if g >= s_scratch[offsets + rr]:
+            r = cutlass.Int32(rr)
+    return s_scratch[sources + r] + (g - s_scratch[offsets + r])
+
+
+@cute.jit
 def merge_slab(
     elems,
     k: cutlass.Constexpr,
@@ -250,20 +268,38 @@ def merge_slab(
         above = s_result[1]
         n_win = s_result[2]
         n_tie = s_result[3]
-        for g in range(tidx, n_win, threads):  # one winner index per thread per step
-            r = cutlass.Int32(0)
-            for rr in cutlass.range_constexpr(1, splits):
-                if g >= s_scratch[32 + rr]:
-                    r = cutlass.Int32(rr)
-            src = s_scratch[64 + r] + (g - s_scratch[32 + r])
+        # Each thread's first winner and first tie entry are loaded together before either is
+        # stored: the two copies are independent L2 round trips (about 0.6 us each on B200) and
+        # the winners rarely need more than one step (n_win < k <= threads on the default
+        # configurations), so issuing both loads first overlaps them.  Further steps, when the
+        # tie bin is wider than the block, follow in the plain loops.
+        has_win = tidx < n_win
+        has_tie = tidx < n_tie
+        win_idx = cutlass.Int32(0)
+        tie_key = cutlass.Int32(0)
+        tie_idx = cutlass.Int32(0)
+        if has_win:
+            win_idx = load_global_l2_i32(
+                (slab_idx + _slab_source(s_scratch, 32, 64, tidx, splits)).toint()
+            )
+        if has_tie:
+            src = _slab_source(s_scratch, 96, 128, tidx, splits)
+            tie_key = load_global_l2_i32((slab_keys + src).toint())
+            tie_idx = load_global_l2_i32((slab_idx + src).toint())
+        if has_win & (tidx < cutlass.Int32(k)):
+            out_row[tidx] = win_idx
+        if has_tie & (tidx < cutlass.Int32(tie_capacity)):
+            s_tie_keys[tidx] = elems.key(cutlass.Uint32(tie_key))
+            s_tie_idx[tidx] = tie_idx
+        for g in range(
+            tidx + cutlass.Int32(threads), n_win, threads
+        ):  # one winner index per thread per step
             if g < cutlass.Int32(k):
-                out_row[g] = load_global_l2_i32((slab_idx + src).toint())
-        for g in range(tidx, n_tie, threads):
-            r = cutlass.Int32(0)
-            for rr in cutlass.range_constexpr(1, splits):
-                if g >= s_scratch[96 + rr]:
-                    r = cutlass.Int32(rr)
-            src = s_scratch[128 + r] + (g - s_scratch[96 + r])
+                out_row[g] = load_global_l2_i32(
+                    (slab_idx + _slab_source(s_scratch, 32, 64, g, splits)).toint()
+                )
+        for g in range(tidx + cutlass.Int32(threads), n_tie, threads):
+            src = _slab_source(s_scratch, 128 - 32, 128, g, splits)
             if g < cutlass.Int32(tie_capacity):
                 s_tie_keys[g] = elems.key(
                     cutlass.Uint32(load_global_l2_i32((slab_keys + src).toint()))
