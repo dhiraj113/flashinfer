@@ -397,6 +397,72 @@ def run_cutlass_primitives(
     return out_indices, (out_values if return_values else None)
 
 
+def cutlass_primitives_row_order(
+    seq_lens: torch.Tensor,
+    num_cols: int,
+    *,
+    num_rows: Optional[int] = None,
+    next_n: int = 1,
+    compress_ratio: int = 1,
+    balanced: bool = True,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The row order for ``workspace["cutlass_primitives_row_order"]``, from the lengths alone.
+
+    A wide ragged batch (more rows than SMs) puts two CTAs on an SM and finishes when its
+    slowest pair finishes; CTAs take rows in launch order, so with random lengths some SMs
+    receive two long rows.  Ranked longest first the long rows spread over the SMs and the
+    short rows paired beside them leave early (B200 64K b=256 k=2048 on U[k+1, N] lengths:
+    16.7 -> 14.7 us); ``balanced`` (default) goes one step further and pairs the longest rows
+    with the shortest (the SM-count longest rows first, then the rest shortest first: 13.9 us,
+    within 0.5 of a batch where every row has the mean length).  Uniform batches are
+    unchanged either way.
+
+    The order depends only on ``seq_lens``, which a serving framework has before the logits
+    exist, so compute it there (next to the rest of the step's metadata) and off the top-k's
+    critical path; recomputing it inside the top-k call costs a dependent launch of 1.3 us that
+    loses on uniform batches, which is why the backend never does it by itself.  One launch of
+    a one-CTA counting sort on the current stream (CUDA-graph safe); with ``out`` given the
+    result is written in place, so a graph that captured the buffer replays with refreshed
+    lengths after ``cutlass_primitives_row_order(..., out=order)`` on the same buffer.
+
+    ``seq_lens``: int32, one entry per ``next_n`` rows; ``num_cols``: the logits width (the
+    rank buckets lengths relative to it); ``num_rows``: ``seq_lens.numel() * next_n`` by
+    default.  Returns an int32 permutation of ``range(num_rows)`` on the lengths' device.
+    """
+    from ..cutlass_primitives.topk.phases.row_order import rank_rows
+
+    if seq_lens.dtype != torch.int32 or not seq_lens.is_cuda:
+        raise ValueError("seq_lens must be an int32 CUDA tensor")
+    rows = seq_lens.numel() * next_n if num_rows is None else num_rows
+    if rows % next_n or rows // next_n != seq_lens.numel():
+        raise ValueError(
+            f"num_rows ({rows}) must be seq_lens.numel() ({seq_lens.numel()}) x next_n ({next_n})"
+        )
+    if out is not None and (
+        out.dtype != torch.int32
+        or tuple(out.shape) != (rows,)
+        or not out.is_contiguous()
+        or out.device != seq_lens.device
+    ):
+        raise ValueError(
+            f"out must be a contiguous int32 tensor of shape ({rows},) on {seq_lens.device}"
+        )
+    order = torch.empty(rows, dtype=torch.int32, device=seq_lens.device)
+    rank_rows(seq_lens.contiguous(), order, num_cols, next_n, compress_ratio, False)
+    if balanced:
+        sms = device_facts(seq_lens.device).sm_count
+        if rows > sms:
+            # the SM-count longest rows keep their rank; the rest come shortest first, so the
+            # second CTA on an SM pairs the longest row with the shortest (graph-safe: two
+            # views and a copy, no host read of the lengths)
+            order = torch.cat([order[:sms], order[sms:].flip(0)])
+    if out is not None:
+        out.copy_(order)
+        return out
+    return order.contiguous()
+
+
 _no_values: dict = {}
 
 

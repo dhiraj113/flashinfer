@@ -3218,6 +3218,70 @@ def test_cutlass_primitives_row_order(order):
 
 
 @pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
+@pytest.mark.parametrize("balanced", [True, False], ids=["balanced", "longest_first"])
+@pytest.mark.parametrize("next_n", [1, 2])
+def test_cutlass_primitives_row_order_helper(balanced, next_n):
+    """``cutlass_primitives_row_order`` builds the row-order key from the lengths alone: a
+    permutation, longest first (the SM-count longest rows first, then shortest first when
+    balanced), one entry per ``next_n`` rows with the radix backends' effective lengths, exact
+    results under it, in-place refresh into ``out`` so a captured graph sees new lengths."""
+    from flashinfer.topk_varlen.cutlass_primitives.dispatch.device import device_facts
+    from flashinfer.topk_varlen.kernels.cutlass_primitives_backend import (
+        cutlass_primitives_row_order,
+    )
+
+    cell = _cp_ordered_cell()
+    if cell is None:
+        pytest.skip("no shape routes to the unsplit streaming kernel on this device")
+    n, batch = cell
+    batch -= batch % next_n
+    logits, _, seq_lens = _make_inputs(batch, n, _CP_K, torch.float32, seed=74)
+    req_lens = seq_lens[::next_n].contiguous()  # one length per request
+    order = cutlass_primitives_row_order(req_lens, n, next_n=next_n, balanced=balanced)
+    assert order.dtype == torch.int32 and tuple(order.shape) == (batch,)
+    assert torch.equal(
+        torch.sort(order).values, torch.arange(batch, device="cuda", dtype=torch.int32)
+    )
+    eff = (
+        req_lens.repeat_interleave(next_n)
+        - next_n
+        + torch.arange(batch, device="cuda") % next_n
+        + 1
+    ).clamp(0, n)
+    ranked = eff[order.long()]
+    sms = device_facts(torch.device("cuda")).sm_count
+    if balanced and batch > sms:
+        # the first SM-count rows are the longest (non-increasing up to bucket ties), the rest
+        # non-decreasing, and the shortest rows pair with the longest
+        assert ranked[:sms].min() >= ranked[sms:].max() - n // 256
+        assert (ranked[sms:].diff() >= -(n // 256)).all()
+    else:
+        assert (
+            ranked.diff() <= n // 256
+        ).all()  # non-increasing up to one bucket's width
+    key = "cutlass_primitives_row_order"
+    out, _ = _cp_run(logits, req_lens, next_n, 1, False, workspace={key: order})
+    # the checker takes per-row lengths: the effective lengths under next_n, not seq_lens
+    _check_correct(out, logits, eff.to(torch.int32), _CP_K, require_all_checked=True)
+    # in-place refresh keeps the buffer a graph captured; rows within one length bucket come
+    # out in atomic (arbitrary) order, so two calls agree on the bucket sequence, not bitwise
+    buf = torch.empty(batch, dtype=torch.int32, device="cuda")
+    ret = cutlass_primitives_row_order(
+        req_lens, n, next_n=next_n, balanced=balanced, out=buf
+    )
+    assert ret.data_ptr() == buf.data_ptr()
+    assert torch.equal(torch.sort(buf).values, torch.sort(order).values)
+    bucket = lambda o: (eff[o.long()] * 255) // n  # noqa: E731
+    assert torch.equal(bucket(buf), bucket(order))
+    with pytest.raises(ValueError, match="num_rows"):
+        cutlass_primitives_row_order(
+            req_lens, n, next_n=next_n, num_rows=batch + next_n
+        )
+    with pytest.raises(ValueError, match="out must"):
+        cutlass_primitives_row_order(req_lens, n, next_n=next_n, out=buf[:-1])
+
+
+@pytest.mark.skipif(not _CP_CELLS, reason="cutlass_primitives needs CUDA SM80+")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["f32", "bf16"])
 def test_cutlass_primitives_census_split_cell(dtype):
     """Large k routes to the library's census split kernel (two launches): exact with values,

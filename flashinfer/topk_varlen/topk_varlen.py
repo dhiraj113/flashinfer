@@ -2876,10 +2876,15 @@ def top_k_varlen(
         ``"cutlass_primitives_row_order"`` (a contiguous int32 permutation of
         the row indices on the logits device) sets the order in which the
         one-CTA-per-row streaming kernel's CTAs take rows; a wide ragged batch
-        launched longest first (``torch.argsort(seq_lens, descending=True)``,
-        or the order the caller already knows on the host) runs 7-15% faster
-        on skewed length distributions, and the result does not depend on the
-        order.  Other kernels ignore the key.
+        launched with the longest rows paired against the shortest runs up to
+        17% faster on skewed length distributions (B200 64K x 256 k=2048,
+        U[k+1, N] lengths: 16.7 -> 13.9 us), and the result does not depend
+        on the order.  The order depends only on ``seq_lens``: compute it where
+        the step's metadata is built, before the logits exist, with
+        ``flashinfer.topk_varlen.kernels.cutlass_primitives_backend.cutlass_primitives_row_order(seq_lens, num_cols, next_n=, compress_ratio=, out=)``
+        (one small launch, CUDA-graph safe, refreshes ``out`` in place), or
+        with ``torch.argsort(seq_lens, descending=True).int()`` for the plain
+        longest-first order.  Other kernels ignore the key.
 
         .. warning::
             Do **not** share the same workspace dict across concurrent CUDA
