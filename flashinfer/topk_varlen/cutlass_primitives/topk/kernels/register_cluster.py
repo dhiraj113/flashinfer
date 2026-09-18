@@ -436,6 +436,13 @@ def register_cluster_config_for(
     cluster past the capacity costs a second wave (32K b=16 at 8 x 4: 10.7; 64K b=32 at 8 x 8:
     17.8), hence the bound.  With ``rows`` unknown (0) the smallest cluster is chosen.  N / 4
     bins.
+
+    Re-swept 2026-09-18 (v0.1.30, B200 and Rubin, b=8/16/32, k=512/1024): the rule is at its
+    bound everywhere.  B200 32K b=16 stays at 4 x 8 (6.32 us; 8 x 4 is 9.8, a second wave, as
+    the part fits 15 clusters of 8 and gvr_2 vetoes 8 above 15 rows as well), 64K b=16 at 4 x
+    16 (7.26-7.71; 8 x 8 is 11.2-12.0); Rubin fits 22 clusters of 8 and runs 8 x 4 at 32K b=16
+    (4.33 against 4.88 for 4 x 8).  The 0.88-0.94x against gvr_2 on B200 32K b=16 is therefore
+    per-CTA cost at the same shape, not the shape.
     """
     from ...dispatch.device import cluster_capacity
 

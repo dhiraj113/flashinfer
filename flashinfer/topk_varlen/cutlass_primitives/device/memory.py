@@ -239,6 +239,20 @@ def clear_shared_16(address: cutlass.Int32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def load_shared_8(address: cutlass.Int32, *, loc=None, ip=None):
+    """Two Uint32 words from an 8-byte aligned shared byte address (``ld.shared.v2.b32``):
+    ``(low, high)``, the pair ``store_shared_8`` wrote.  One instruction."""
+    return _load_words(
+        "ld.shared.v2.b32 {$0, $1}, [$2];",
+        cutlass.Int32(address).ir_value(loc=loc, ip=ip),
+        "r",
+        2,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
 def store_shared_8(
     address: cutlass.Int32,
     low: cutlass.Uint32,

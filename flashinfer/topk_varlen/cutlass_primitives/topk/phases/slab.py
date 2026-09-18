@@ -34,6 +34,7 @@ from ...device.timers import read_clock64
 from ...device.warp import warp_inclusive_scan_add
 
 from .binning import survivor_bin
+from .filter_pass import stage_pair
 from .resolve import _select_ties
 
 __all__ = ["TABLE_WORDS", "slab_words_per_row", "publish_and_arrive", "merge_slab"]
@@ -54,8 +55,7 @@ def publish_and_arrive(
     scale,
     capacity: cutlass.Constexpr,
     s_count,
-    s_keys,
-    s_idx,
+    s_stage,
     s_hist,
     s_cursor,
     s_result,
@@ -69,7 +69,8 @@ def publish_and_arrive(
     """Publish this CTA's stage bin-major into its slab segment and arrive; return 1 on the
     last arriver, 0 elsewhere (block-uniform).
 
-    ``s_cursor``: 256 Int32 scratch (per-bin write cursors).  ``slab_keys``/``slab_idx``:
+    ``s_stage``: the (bits, index) pair stage (``filter_pass``).  ``s_cursor``: 256 Int32
+    scratch (per-bin write cursors).  ``slab_keys``/``slab_idx``:
     row base pointers (this CTA writes ``[rank * capacity, ...)``); ``tables``: row base;
     ``counter``: pointer to the row's arrival word.  Two block barriers plus the fence.
     """
@@ -94,13 +95,14 @@ def publish_and_arrive(
             staged = cutlass.Int32(-1)  # overflow: the last arriver takes the fallback
         table[0] = staged
     cute.arch.barrier()
+    stage_base = s_stage.toint()
     if local <= cutlass.Int32(capacity):
         for t in range(tidx, local, threads):
-            bits = cutlass.Uint32(s_keys[t])
+            bits, idx = stage_pair(stage_base, t)
             b = survivor_bin(elems.value(bits), bar, scale)
             pos = seg + shared_add(s_cursor + b, 1)
-            slab_keys[pos] = s_keys[t]
-            slab_idx[pos] = s_idx[t]
+            slab_keys[pos] = bits.bitcast(cutlass.Int32)
+            slab_idx[pos] = idx
     cute.arch.barrier()
     if tidx == 0:
         # one acq_rel atomic is the whole handshake: release for this CTA's segment, acquire

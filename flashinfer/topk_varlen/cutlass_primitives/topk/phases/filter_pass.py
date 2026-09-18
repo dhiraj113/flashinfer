@@ -28,11 +28,11 @@ from ...block.reduce import warp_reserve
 from ...device.atomics import shared_add, shared_count
 from ...device.compiler import pin_i32, pin_i64, pin_shared_address
 from ...device.keys import below_or_equal_mask_16x8, pack_threshold_16
-from ...device.memory import load_global_readonly_16
+from ...device.memory import load_global_readonly_16, load_shared_8, store_shared_8
 
 from .binning import survivor_bin
 
-__all__ = ["filter_pass"]
+__all__ = ["filter_pass", "stage_pair"]
 
 
 @cute.jit
@@ -73,15 +73,18 @@ def _stage_bits(
     bar,
     scale,
     hist_base,
-    s_keys,
-    s_idx,
+    stage_base,
 ):
-    """Write one loaded survivor to the stage (slot ``capacity`` is the overflow trash) and count its bin."""
+    """Write one loaded survivor to the stage (slot ``capacity`` is the overflow trash) and count its bin.
+
+    The stage is an array of (bits, index) pairs, 8 bytes per slot, written with one
+    ``st.shared.v2`` (v0.1.31; two 32-bit stores into separate key and index arrays before:
+    the ncu instruction profile against gvr_2 had our filter at 130K STS against its 60K).
+    """
     slot = pos
     if slot > cutlass.Int32(capacity):
         slot = cutlass.Int32(capacity)
-    s_keys[slot] = bits.bitcast(cutlass.Int32)
-    s_idx[slot] = idx
+    store_shared_8(stage_base + slot * 8, bits, cutlass.Uint32(idx))
     shared_count(hist_base + survivor_bin(elems.value(bits), bar, scale) * 4)
 
 
@@ -95,8 +98,7 @@ def _stage(
     bar,
     scale,
     hist_base,
-    s_keys,
-    s_idx,
+    stage_base,
 ):
     """Reload one survivor and stage it."""
     _stage_bits(
@@ -108,9 +110,15 @@ def _stage(
         bar,
         scale,
         hist_base,
-        s_keys,
-        s_idx,
+        stage_base,
     )
+
+
+@cute.jit
+def stage_pair(stage_base, t):
+    """(bits, index) of stage slot ``t``: one ``ld.shared.v2``."""
+    low, high = load_shared_8(stage_base + t * 8)
+    return cutlass.Uint32(low), cutlass.Int32(high)
 
 
 @cute.jit
@@ -145,8 +153,7 @@ def filter_pass(
     capacity: cutlass.Constexpr,
     s_count,
     s_hist,
-    s_keys,
-    s_idx,
+    s_stage,
     tidx,
     threads: cutlass.Constexpr,
     unroll: cutlass.Constexpr,
@@ -155,9 +162,10 @@ def filter_pass(
     """Stage every element of ``row[start, start + count)`` that is not <= ``bar``.
 
     On exit (after the closing barrier): ``s_count[0]`` = survivor count (may exceed
-    ``capacity``), ``s_keys/s_idx[0, min(count, capacity))`` = survivor bits and indices,
-    ``s_hist`` = 256-bin survivor histogram over ALL survivors (staged or not).  ``s_keys``
-    and ``s_idx`` need ``capacity + 1`` slots.  Two barriers (one to zero, one to publish).
+    ``capacity``), ``s_stage`` slots ``[0, min(count, capacity))`` = (bits, index) pairs, 8
+    bytes each (``stage_pair`` reads one), ``s_hist`` = 256-bin survivor histogram over ALL
+    survivors (staged or not).  ``s_stage`` is an 8-byte aligned Int32 array of at least
+    ``2 * (capacity + 1)`` words.  Two barriers (one to zero, one to publish).
     ``unroll * per_vector`` must be at most 32 (the mask width).
 
     ``walk_width``: survivors reloaded per walk step, their loads issued together before any
@@ -181,6 +189,7 @@ def filter_pass(
     )
     lane = tidx % 32
     hist_base = pin_shared_address(s_hist.toint())
+    stage_base = pin_shared_address(s_stage.toint())
     base = pin_i64(row_ptr.toint() + cutlass.Int64(start) * cutlass.Int64(elems.bytes))
     n_vectors = count >> cutlass.Int32(lg)
     last_vector = pin_i32(n_vectors - 1)
@@ -245,8 +254,7 @@ def filter_pass(
                     bar,
                     scale,
                     hist_base,
-                    s_keys,
-                    s_idx,
+                    stage_base,
                 )
                 pos = pos + cutlass.Int32(1)
         else:
@@ -274,8 +282,7 @@ def filter_pass(
                             bar,
                             scale,
                             hist_base,
-                            s_keys,
-                            s_idx,
+                            stage_base,
                         )
                         pos = pos + cutlass.Int32(1)
         vbase = vbase + cutlass.Int32(per_iter)
@@ -289,7 +296,7 @@ def filter_pass(
         bits = elems.load_bits(row_ptr, idx)
         if not (elems.value(bits) <= bar):
             pos = shared_add(s_count, 1)
-            _stage(
-                elems, row_ptr, idx, pos, capacity, bar, scale, hist_base, s_keys, s_idx
+            _stage_bits(
+                elems, bits, idx, pos, capacity, bar, scale, hist_base, stage_base
             )
     cute.arch.barrier()

@@ -31,6 +31,7 @@ from ...device.atomics import shared_add
 from ...device.cluster import cluster_sync, peer_shared_address, peer_store_i32
 
 from .binning import survivor_bin
+from .filter_pass import stage_pair
 
 __all__ = ["emit_and_select", "emit_and_select_cluster"]
 
@@ -43,8 +44,7 @@ def emit_and_select(
     bar,
     scale,
     out_row,
-    s_keys,
-    s_idx,
+    s_stage,
     s_hist,
     s_tie_keys,
     s_tie_idx,
@@ -62,8 +62,9 @@ def emit_and_select(
     bin overflowed the tie stage (the caller then takes the exact fallback).
 
     Preconditions: ``k <= survivors <= capacity``; ``s_hist`` is the histogram the stage was
-    built with, under the same ``bar`` and ``scale``.  ``s_keys`` (>= 512 Int32) is dead after
-    the emit and is reused as the radix select's histogram.  ``s_cursor``: 256 Int32 scratch
+    built with, under the same ``bar`` and ``scale``.  ``s_stage``: the (bits, index) pair
+    stage of ``filter_pass`` (an Int32 array of >= 512 words, dead after the emit and reused as
+    the radix select's histogram).  ``s_cursor``: 256 Int32 scratch
     for the per-bin emit cursors (required unless ``scan_emit``).  ``s_result``: 8 Int32
     scratch; ``s_slots``: warps Int32.  Barriers: two, plus the radix select's when taken.
 
@@ -93,11 +94,13 @@ def emit_and_select(
     cut_bin = s_result[0]
     above = s_result[1]
     ties = cutlass.Int32(0)
+    stage_base = s_stage.toint()
     if cutlass.const_expr(scan_emit):
         # pass 1: this thread's winner and tie counts (packed: winners in the high half)
         mine = cutlass.Int32(0)
         for t in range(tidx, survivors, threads):
-            b = survivor_bin(elems.value(cutlass.Uint32(s_keys[t])), bar, scale)
+            bits, _idx = stage_pair(stage_base, t)
+            b = survivor_bin(elems.value(bits), bar, scale)
             if b > cut_bin:
                 mine = mine + cutlass.Int32(65536)
             else:
@@ -110,17 +113,17 @@ def emit_and_select(
         # pass 2: write at the scanned positions (the stage is 8 KB per thousand candidates:
         # the second read comes from shared memory)
         for t in range(tidx, survivors, threads):
-            bits = cutlass.Uint32(s_keys[t])
+            bits, idx = stage_pair(stage_base, t)
             b = survivor_bin(elems.value(bits), bar, scale)
             if b > cut_bin:
                 if wpos < cutlass.Int32(k):
-                    out_row[wpos] = s_idx[t]
+                    out_row[wpos] = idx
                 wpos = wpos + cutlass.Int32(1)
             else:
                 if b == cut_bin:
                     if tpos < cutlass.Int32(tie_capacity):
                         s_tie_keys[tpos] = elems.key(bits)
-                        s_tie_idx[tpos] = s_idx[t]
+                        s_tie_idx[tpos] = idx
                     tpos = tpos + cutlass.Int32(1)
         cute.arch.barrier()
     elif cutlass.const_expr(bin_cursors):
@@ -131,35 +134,35 @@ def emit_and_select(
         # the resolution cost 0.74 us per thousand candidates on the wide batches (B200,
         # 512 threads x 2 per SM; 2.55 us at k=2048 against 1.26 at k=512).
         for t in range(tidx, survivors, threads):
-            bits = cutlass.Uint32(s_keys[t])
+            bits, idx = stage_pair(stage_base, t)
             b = survivor_bin(elems.value(bits), bar, scale)
             if b >= cut_bin:
                 p = shared_add(s_cursor + b, 1)
                 if b > cut_bin:
-                    out_row[p] = s_idx[t]  # p < above <= k by construction
+                    out_row[p] = idx  # p < above <= k by construction
                 else:
                     e = p - above
                     if e < cutlass.Int32(tie_capacity):
                         s_tie_keys[e] = elems.key(bits)
-                        s_tie_idx[e] = s_idx[t]
+                        s_tie_idx[e] = idx
         cute.arch.barrier()
         ties = s_result[2]
     else:
         # one shared cursor each for winners and ties: the SM80 form (device fact
         # ``bin_cursors``; its shared atomic unit handles the same address better than 256)
         for t in range(tidx, survivors, threads):
-            bits = cutlass.Uint32(s_keys[t])
+            bits, idx = stage_pair(stage_base, t)
             b = survivor_bin(elems.value(bits), bar, scale)
             if b > cut_bin:
                 p = shared_add(s_result + 6, 1)
                 if p < cutlass.Int32(k):
-                    out_row[p] = s_idx[t]
+                    out_row[p] = idx
             else:
                 if b == cut_bin:
                     e = shared_add(s_result + 7, 1)
                     if e < cutlass.Int32(tie_capacity):
                         s_tie_keys[e] = elems.key(bits)
-                        s_tie_idx[e] = s_idx[t]
+                        s_tie_idx[e] = idx
         cute.arch.barrier()
         ties = s_result[7]
     return _select_ties(
@@ -168,7 +171,7 @@ def emit_and_select(
         above,
         ties,
         out_row,
-        s_keys,
+        s_stage,
         s_tie_keys,
         s_tie_idx,
         tie_capacity,
@@ -243,8 +246,7 @@ def emit_and_select_cluster(
     bar,
     scale,
     out_row,
-    s_keys,
-    s_idx,
+    s_stage,
     s_hist,
     s_merged,
     s_tie_keys,
@@ -301,13 +303,14 @@ def emit_and_select_cluster(
     tie_keys_root = peer_shared_address(s_tie_keys.toint(), root)
     tie_idx_root = peer_shared_address(s_tie_idx.toint(), root)
     local = s_count[0]
+    stage_base = s_stage.toint()
     for t in range(tidx, local, threads):
-        bits = cutlass.Uint32(s_keys[t])
+        bits, idx = stage_pair(stage_base, t)
         b = survivor_bin(elems.value(bits), bar, scale)
         if b >= cut_bin:
             p = shared_add(s_merged + b, 1)
             if b > cut_bin:
-                out_row[p] = s_idx[t]  # p < above <= k by construction
+                out_row[p] = idx  # p < above <= k by construction
             else:
                 e = (
                     p - above
@@ -316,7 +319,7 @@ def emit_and_select_cluster(
                     peer_store_i32(
                         tie_keys_root + e * 4, elems.key(bits).bitcast(cutlass.Int32)
                     )
-                    peer_store_i32(tie_idx_root + e * 4, s_idx[t])
+                    peer_store_i32(tie_idx_root + e * 4, idx)
     cluster_sync()  # every CTA's winners and ties are in; peers may stop touching rank 0 now
     ok = cutlass.Int32(1)
     if rank == 0:
@@ -326,7 +329,7 @@ def emit_and_select_cluster(
             above,
             s_result[2],
             out_row,
-            s_keys,
+            s_stage,
             s_tie_keys,
             s_tie_idx,
             tie_capacity,

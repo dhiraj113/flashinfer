@@ -95,6 +95,7 @@ class StreamingConfig:
     span_ext: float = 1.5
     sample_vectors: int = 1  # adjacent 16-byte vectors per thread in the sample (1, 2 or 4): the survivor spread shrinks with the square root
     sample_bins: int = 256  # equal-width bins of the sample histogram (256, 512, 1024, 2048); above 256 they live in the dead stage
+    reprobe_below: float = 0.0  # a row shorter than this fraction of the buffer re-samples at length-derived positions (full sample count) instead of masking the buffer probe; 0: never
     # stage
     stage: int = 8192
     tie_capacity: int = 2048
@@ -151,6 +152,8 @@ class StreamingConfig:
             or not 1.0 <= self.aim_z <= 6.0
         ):
             raise ValueError("aim margins in [0, 2] and aim_z in [1, 6]")
+        if not 0.0 <= self.reprobe_below <= 1.0:
+            raise ValueError("reprobe_below is a fraction of the row buffer in [0, 1]")
         if self.stage < 2048 or self.stage % 256:
             raise ValueError(
                 "stage must be a multiple of 256 and at least 2048 (the census histogram aliases both stage halves)"
@@ -441,8 +444,11 @@ class StreamingTopK:
         telemetry = cutlass.const_expr(cfg.telemetry)
 
         smem = SmemAllocator()
-        # one allocation for both stage halves: the exact fallback's 4096-bin census and the
-        # slab merge's scratch alias the dead stage from s_keys and may run into s_idx
+        # the survivor stage: (bits, index) pairs, 8 bytes per slot (filter_pass.stage_pair;
+        # v0.1.31, one 64-bit shared access per survivor instead of two 32-bit ones into a key
+        # array and an index array).  The exact fallback's 4096-bin census, the register arm's
+        # bins, the lpt classes and the slab merge's scratch alias the dead stage as Int32:
+        # s_keys is its first half, s_idx its second (the names survive from the split layout)
         s_stage = smem.allocate_array(
             cutlass.Int32, 2 * (cfg.stage + 4), byte_alignment=128
         )
@@ -575,6 +581,12 @@ class StreamingTopK:
         length = effective_length(
             lengths, row, n_cols, self.next_n, self.compress_ratio
         )
+        if cutlass.const_expr(cfg.reprobe_below > 0.0):
+            # a row much shorter than its buffer keeps too few of the buffer probe's vectors
+            # (the masked sample shrinks with the length: v0.1.24); below the threshold it pays
+            # the dependent round trip of a fresh probe over its own length instead
+            if length < cutlass.Int32(int(cfg.reprobe_below * n_cols)):
+                probe_stale = cutlass.Int32(1)
         emitter = cutlass.Int32(
             0
         )  # 1 on the CTA that wrote this row's indices (for the values gather)
@@ -739,8 +751,7 @@ class StreamingTopK:
                         cfg.stage,
                         s_count,
                         s_hist,
-                        s_keys,
-                        s_idx,
+                        s_stage,
                         tidx,
                         threads,
                         cfg.unroll,
@@ -776,8 +787,7 @@ class StreamingTopK:
                         scale,
                         cfg.stage,
                         s_count,
-                        s_keys,
-                        s_idx,
+                        s_stage,
                         s_hist,
                         s_merged,
                         s_result,
@@ -839,8 +849,7 @@ class StreamingTopK:
                             splits,
                             s_count,
                             s_hist,
-                            s_keys,
-                            s_idx,
+                            s_stage,
                             s_result,
                             tidx,
                             threads,
@@ -864,8 +873,7 @@ class StreamingTopK:
                             cfg.overflow_offset,
                             s_count,
                             s_hist,
-                            s_keys,
-                            s_idx,
+                            s_stage,
                             s_result,
                             tidx,
                             threads,
@@ -886,8 +894,7 @@ class StreamingTopK:
                                 bar,
                                 scale,
                                 out_row,
-                                s_keys,
-                                s_idx,
+                                s_stage,
                                 s_hist,
                                 s_merged,
                                 s_tie_keys,
@@ -908,8 +915,7 @@ class StreamingTopK:
                                 bar,
                                 scale,
                                 out_row,
-                                s_keys,
-                                s_idx,
+                                s_stage,
                                 s_hist,
                                 s_tie_keys,
                                 s_tie_idx,
