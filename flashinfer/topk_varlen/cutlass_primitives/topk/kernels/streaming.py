@@ -103,6 +103,7 @@ class StreamingConfig:
     # epilogue
     ballot_limit: int = 128
     scan_emit: bool = False  # output positions from a block scan instead of a shared cursor per candidate (phases/resolve.py)
+    bin_cursors: bool = True  # emit through a cursor per histogram bin (v0.1.29); False: one shared cursor for all winners, a device fact (SM80)
     # scheduling
     register_arm: bool = False  # rows that fit register_words per thread take the register-resident phases (whole-row configurations)
     register_words: int = (
@@ -919,7 +920,8 @@ class StreamingTopK:
                                 tidx,
                                 threads,
                                 cfg.scan_emit,
-                                s_merged,  # s_merged: idle without a cluster
+                                s_merged,
+                                cfg.bin_cursors,  # s_merged: idle without a cluster
                             )
                     else:
                         if cutlass.const_expr(clustered):

@@ -31,6 +31,7 @@ class DeviceFacts:
     supports_pdl: bool  # programmatic dependent launch (SM90+)
     packed_bf16_compare: bool  # setp.le.bf16x2 (SM90+); fp16x2 is available everywhere
     staggered_count: bool  # register kernels enter the histogram count warp by warp, not in a burst (see _facts)
+    bin_cursors: bool  # the streaming resolution emits through a cursor per histogram bin rather than one shared cursor (see _facts)
 
 
 @functools.cache
@@ -75,6 +76,13 @@ def _facts(index: int) -> DeviceFacts:
         # of conversions with the load tail instead: B200 5.73 -> 5.92, Rubin 4.25 -> 4.42,
         # H100 8.98 -> 9.09.
         staggered_count=cc[0] in (8, 12),
+        # One shared cursor for every emitted winner serializes as same-address atomics when
+        # two 512-thread CTAs share an SM (B200 64K b=256 k=2048: 16.94 -> 16.40 us with a
+        # cursor per bin; RTX 5080 equal).  On the A100 the per-bin form measured 64K b=108
+        # k=2048 (one 1024-thread CTA per SM) 35.9 -> 36.4..38.4 us against the single cursor,
+        # and 256K b=64 k=1024 79.3 -> 78.5, in a session shared with other jobs; the single
+        # cursor reproduces v0.1.27 there exactly, so SM80 keeps it.
+        bin_cursors=cc[0] != 8,
     )
 
 
