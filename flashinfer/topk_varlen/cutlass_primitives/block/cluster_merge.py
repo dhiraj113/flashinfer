@@ -18,7 +18,12 @@ import cutlass.cute as cute
 from ..device.cluster import peer_load_16, peer_load_i32, peer_shared_address
 from ..device.memory import store_shared_16
 
-__all__ = ["cluster_sum_i32", "merge_histograms_256", "merge_histograms_wide"]
+__all__ = [
+    "cluster_sum_i32",
+    "merge_histograms_256",
+    "merge_histograms_256_ranked",
+    "merge_histograms_wide",
+]
 
 
 @cute.jit
@@ -62,6 +67,33 @@ def merge_histograms_wide(
             t2 = t2 + c
             t3 = t3 + d
         store_shared_16(s_merged.toint() + q * 16, t0, t1, t2, t3)
+
+
+@cute.jit
+def merge_histograms_256_ranked(
+    s_hist, s_merged, s_lower, rank, size: cutlass.Constexpr, tidx
+):
+    """``merge_histograms_256`` that also leaves, in ``s_lower[b]``, the sum over the CTAs of
+    lower rank than ``rank`` (zero on rank 0; ``s_lower`` is not written there).
+
+    With the merged histogram's "count above bin b" from the crossing, ``above[b] +
+    lower[b]`` is where this CTA's members of bin b start in the cluster-wide rank order: a
+    private per-bin cursor per CTA, so the clustered emit needs no atomic on a peer (the
+    single remote cursor cost every winner a DSMEM atomic; docs/kernels/streaming.md,
+    "Per-bin emit cursors").  Same loads as the plain merge; no barrier inside.
+    """
+    if tidx < 256:
+        addr = s_hist.toint() + tidx * 4
+        total = cutlass.Int32(0)
+        lower = cutlass.Int32(0)
+        for r in cutlass.range_constexpr(size):
+            v = peer_load_i32(peer_shared_address(addr, cutlass.Int32(r)))
+            total = total + v
+            if cutlass.Int32(r) < rank:
+                lower = lower + v
+        s_merged[tidx] = total
+        if rank != 0:
+            s_lower[tidx] = lower
 
 
 @cute.jit

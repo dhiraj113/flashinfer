@@ -919,6 +919,7 @@ class StreamingTopK:
                                 tidx,
                                 threads,
                                 cfg.scan_emit,
+                                s_merged,  # s_merged: idle without a cluster
                             )
                     else:
                         if cutlass.const_expr(clustered):

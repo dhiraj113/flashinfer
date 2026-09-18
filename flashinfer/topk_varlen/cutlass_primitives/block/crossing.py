@@ -57,6 +57,8 @@ def crossing_256_warp(
     lane,
     clear: cutlass.Constexpr,
     copies: cutlass.Constexpr = 1,
+    s_cursor=None,
+    cursors: cutlass.Constexpr = False,
 ):
     """Crossing bins of two target ranks over a 256-bin Int32 histogram, by one warp.
 
@@ -64,7 +66,11 @@ def crossing_256_warp(
     and complete (a barrier separates the last increment from this call).  With ``copies``
     above one the histogram is the sum of ``copies`` consecutive 256-bin arrays (a privatized
     histogram; the lanes sum them while loading).  With ``clear`` the histogram (every copy) is
-    zero on return (the caller's next barrier publishes the zeros).
+    zero on return (the caller's next barrier publishes the zeros).  With ``cursors``,
+    ``s_cursor[b]`` (256 Int32) receives the count in bins strictly above ``b`` for every bin:
+    the rank-ordered start of bin ``b``'s members, so an emit can place each candidate with an
+    atomic on its own bin's cursor instead of one cursor shared by every winner (the walk
+    already has the number; eight shared stores per lane).
     Returns ``(bin_a, above_a, count_a, bin_b, above_b, count_b)`` on every lane.
     Cost: two 16-byte shared loads per copy, one warp scan, 8 steps of compares, three shuffles.
     """
@@ -90,6 +96,8 @@ def crossing_256_warp(
     for j in cutlass.range_constexpr(7, -1, -1):
         c = _bin_word(v0, v1, v2, v3, v4, v5, v6, v7, j).to(cutlass.Int32)
         b = base_bin + j
+        if cutlass.const_expr(cursors):
+            s_cursor[b] = above
         if above < target_a:
             if (above + c >= target_a) | (b == 0):
                 hit_a = b

@@ -6,25 +6,29 @@ the crossing are winners outright, the crossing bin holds the ties for the last
 shared cursor and copies the ties with their exact keys to the tie stage; then the tie select
 (ballot for small sets, byte radix otherwise) fills the remainder.
 
-Measured and kept as is: the plain same-address shared atomic per emitted candidate.  Two
-warp-aggregated forms (shuffle scan; ballot + popcount) were both slower here (1.1 -> 2.0 and
-1.5 us at 64K, k=2048).  The hardware coalesces these atomics well enough.
+Emit positions come from a cursor per histogram bin (v0.1.29): the crossing warp writes the
+count above each bin into a 256-word array and a candidate of bin b takes ``cursor[b]++``, so
+winners land in bin order within [0, above) and the crossing bin's members fill the tie stage.
+Before that every winner took one shared cursor: at one 1024-thread CTA per SM the hardware
+coalesced those same-address atomics well enough (two warp-aggregated forms, shuffle scan and
+ballot + popcount, were slower: 1.1 -> 2.0 and 1.5 us at 64K, k=2048), but with two
+512-thread CTAs sharing an SM's atomic unit they serialized (the resolution cost 0.74 us per
+thousand candidates).  Per-bin cursors: B200 wide batches 3% (64K b=256 k=2048 16.94 -> 16.40
+us, k=512 12.72 -> 12.39, 16K b=256 7.17 -> 6.97), one-CTA-per-SM rows 1% (docs/kernels/
+streaming.md).  The cluster form gets a private cursor array per CTA from the merged
+histogram's "above" plus the lower-ranked peers' counts (``merge_histograms_256_ranked``), so
+its emit does no remote atomic at all.
 """
 
 import cutlass
 import cutlass.cute as cute
 
-from ...block.cluster_merge import merge_histograms_256
+from ...block.cluster_merge import merge_histograms_256_ranked
 from ...block.crossing import crossing_256_warp
 from ...block.reduce import block_exclusive_scan_i32
 from ...block.tie_select import tie_select_ballot, tie_select_radix
 from ...device.atomics import shared_add
-from ...device.cluster import (
-    cluster_sync,
-    peer_add_i32,
-    peer_shared_address,
-    peer_store_i32,
-)
+from ...device.cluster import cluster_sync, peer_shared_address, peer_store_i32
 
 from .binning import survivor_bin
 
@@ -51,14 +55,16 @@ def emit_and_select(
     tidx,
     threads: cutlass.Constexpr,
     scan_emit: cutlass.Constexpr = False,
+    s_cursor=None,
 ):
     """Write the k winners of a usable stage to ``out_row``; return 1, or 0 if the crossing
     bin overflowed the tie stage (the caller then takes the exact fallback).
 
     Preconditions: ``k <= survivors <= capacity``; ``s_hist`` is the histogram the stage was
     built with, under the same ``bar`` and ``scale``.  ``s_keys`` (>= 512 Int32) is dead after
-    the emit and is reused as the radix select's histogram.  ``s_result``: 8 Int32 scratch;
-    ``s_slots``: warps Int32.  Barriers: two, plus the radix select's when taken.
+    the emit and is reused as the radix select's histogram.  ``s_cursor``: 256 Int32 scratch
+    for the per-bin emit cursors (required unless ``scan_emit``).  ``s_result``: 8 Int32
+    scratch; ``s_slots``: warps Int32.  Barriers: two, plus the radix select's when taken.
 
     ``scan_emit``: positions from one block scan of per-thread (winner, tie) counts packed in
     one word, instead of a same-address shared atomic per candidate.  The atomic form won at
@@ -67,14 +73,19 @@ def emit_and_select(
     grows 2.7 us per thousand staged survivors), so the wide-batch policy selects the scan.
     """
     if tidx < 32:
-        b, above, _c, _b2, _a2, _c2 = crossing_256_warp(
-            s_hist, cutlass.Int32(k), cutlass.Int32(k), tidx, False
+        b, above, c, _b2, _a2, _c2 = crossing_256_warp(
+            s_hist,
+            cutlass.Int32(k),
+            cutlass.Int32(k),
+            tidx,
+            False,
+            s_cursor=s_cursor,
+            cursors=not scan_emit,
         )
         if tidx == 0:
             s_result[0] = b
             s_result[1] = above
-            s_result[6] = cutlass.Int32(0)  # winner cursor
-            s_result[7] = cutlass.Int32(0)  # tie cursor
+            s_result[2] = c  # members of the crossing bin: the tie count
     cute.arch.barrier()
     cut_bin = s_result[0]
     above = s_result[1]
@@ -110,21 +121,26 @@ def emit_and_select(
                     tpos = tpos + cutlass.Int32(1)
         cute.arch.barrier()
     else:
+        # per-bin cursors (v0.1.29): candidate in bin b takes position cursor[b]++, where the
+        # cursor starts at the count above b (the crossing wrote it), so winners land in
+        # rank order of their bins within [0, above) and the ties at [above, above + ties).
+        # One shared cursor for all winners was 2048 same-address atomics per row at k=2048:
+        # the resolution cost 0.74 us per thousand candidates on the wide batches (B200,
+        # 512 threads x 2 per SM; 2.55 us at k=2048 against 1.26 at k=512).
         for t in range(tidx, survivors, threads):
             bits = cutlass.Uint32(s_keys[t])
             b = survivor_bin(elems.value(bits), bar, scale)
-            if b > cut_bin:
-                p = shared_add(s_result + 6, 1)
-                if p < cutlass.Int32(k):
-                    out_row[p] = s_idx[t]
-            else:
-                if b == cut_bin:
-                    e = shared_add(s_result + 7, 1)
+            if b >= cut_bin:
+                p = shared_add(s_cursor + b, 1)
+                if b > cut_bin:
+                    out_row[p] = s_idx[t]  # p < above <= k by construction
+                else:
+                    e = p - above
                     if e < cutlass.Int32(tie_capacity):
                         s_tie_keys[e] = elems.key(bits)
                         s_tie_idx[e] = s_idx[t]
         cute.arch.barrier()
-        ties = s_result[7]
+        ties = s_result[2]
     return _select_ties(
         elems,
         k,
@@ -222,42 +238,59 @@ def emit_and_select_cluster(
 ):
     """Cluster form of the resolution: the row's stage is spread over ``splits`` CTAs.
 
-    Every CTA merges the peers' survivor histograms over DSMEM (identical result everywhere),
-    finds the rank-k crossing, and classifies its own stage: winners go straight to the output
-    at a cursor living in rank 0's shared memory, ties are pushed into rank 0's tie stage.
-    After the cluster barrier rank 0 alone selects the ties.  Returns ``ok`` (meaningful on
-    rank 0; other ranks return 1 and must not run the fallback).  Preconditions: the verdict's
-    cluster barrier has passed (every peer's histogram is complete) and every CTA zeroed its
-    cursors (``s_result[6..7]``) before that barrier.  Two cluster barriers, two block barriers.
+    Every CTA merges the peers' survivor histograms over DSMEM (identical result everywhere)
+    and, alongside, the sum over the lower-ranked peers; the rank-k crossing over the merged
+    histogram gives every bin its start in rank order, and ``above[b] + lower[b]`` is where
+    this CTA's members of bin b begin: a private per-bin cursor array per CTA (v0.1.29; before,
+    every winner took a DSMEM atomic on one cursor in rank 0).  Each CTA classifies its own
+    stage: winners go straight to the output at their cursor, ties are stored into rank 0's
+    tie stage at theirs.  After the cluster barrier rank 0 alone selects the ties.  Returns
+    ``ok`` (meaningful on rank 0; other ranks return 1 and must not run the fallback).
+    Preconditions: the verdict's cluster barrier has passed (every peer's histogram is
+    complete).  Peers use their own idle tie-index stage as the lower-sum scratch (rank 0's
+    is the cluster's tie stage and rank 0's lower sum is zero).  Two cluster barriers, three
+    block barriers.
     """
-    merge_histograms_256(s_hist, s_merged, splits, tidx)
+    merge_histograms_256_ranked(s_hist, s_merged, s_tie_idx, rank, splits, tidx)
     cute.arch.barrier()
     if tidx < 32:
-        b, above, _c, _b2, _a2, _c2 = crossing_256_warp(
-            s_merged, cutlass.Int32(k), cutlass.Int32(k), tidx, False
+        b, above, c, _b2, _a2, _c2 = crossing_256_warp(
+            s_merged,
+            cutlass.Int32(k),
+            cutlass.Int32(k),
+            tidx,
+            False,
+            s_cursor=s_merged,
+            cursors=True,
         )
         if tidx == 0:
             s_result[0] = b
             s_result[1] = above
+            s_result[2] = (
+                c  # the crossing bin's members across the cluster: the tie count
+            )
+    cute.arch.barrier()
+    if tidx < 256:  # cursor[b] = above[b] + this CTA's lower-rank sum of bin b
+        if rank != 0:
+            s_merged[tidx] = s_merged[tidx] + s_tie_idx[tidx]
     cute.arch.barrier()
     cut_bin = s_result[0]
     above = s_result[1]
     root = cutlass.Int32(0)
-    winner_cursor = peer_shared_address((s_result + 6).toint(), root)
-    tie_cursor = peer_shared_address((s_result + 7).toint(), root)
     tie_keys_root = peer_shared_address(s_tie_keys.toint(), root)
     tie_idx_root = peer_shared_address(s_tie_idx.toint(), root)
     local = s_count[0]
     for t in range(tidx, local, threads):
         bits = cutlass.Uint32(s_keys[t])
         b = survivor_bin(elems.value(bits), bar, scale)
-        if b > cut_bin:
-            p = peer_add_i32(winner_cursor, cutlass.Int32(1))
-            if p < cutlass.Int32(k):
-                out_row[p] = s_idx[t]
-        else:
-            if b == cut_bin:
-                e = peer_add_i32(tie_cursor, cutlass.Int32(1))
+        if b >= cut_bin:
+            p = shared_add(s_merged + b, 1)
+            if b > cut_bin:
+                out_row[p] = s_idx[t]  # p < above <= k by construction
+            else:
+                e = (
+                    p - above
+                )  # this tie's index in the cluster-wide tie stage on rank 0
                 if e < cutlass.Int32(tie_capacity):
                     peer_store_i32(
                         tie_keys_root + e * 4, elems.key(bits).bitcast(cutlass.Int32)
@@ -270,7 +303,7 @@ def emit_and_select_cluster(
             elems,
             k,
             above,
-            s_result[7],
+            s_result[2],
             out_row,
             s_keys,
             s_tie_keys,
